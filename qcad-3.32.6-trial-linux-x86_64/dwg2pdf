@@ -1,0 +1,6 @@
+#!/bin/bash
+
+DIR=${BASH_SOURCE%/*}
+binary="$DIR/qcad"
+
+"$binary" -no-dock-icon -no-gui -allow-multiple-instances -autostart "scripts/Pro/Tools/Dwg2Pdf/Dwg2Pdf.js" "$0" "$@"

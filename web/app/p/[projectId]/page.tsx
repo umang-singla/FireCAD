@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { use, useEffect, useMemo, useState } from "react";
 import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
 
 const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
@@ -42,8 +42,8 @@ function pixelToWorld(m: Mapping, px: number, py: number) {
   return { x: xmin + u*(xmax-xmin), y: ymax - v*(ymax-ymin) };
 }
 
-export default function ProjectPage({ params }: { params: { projectId: string } }) {
-  const projectId = params.projectId;
+export default function ProjectPage({ params }: { params: Promise<{ projectId: string }> }) {
+  const { projectId } = use(params);
   const [project, setProject] = useState<Project | null>(null);
   const [detectors, setDetectors] = useState<Detector[]>([]);
   const [mapping, setMapping] = useState<Mapping | null>(null);

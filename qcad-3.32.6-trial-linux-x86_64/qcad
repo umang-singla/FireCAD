@@ -1,0 +1,31 @@
+#!/bin/bash
+#
+# QCAD startup script
+#
+
+DIR=${BASH_SOURCE%/*}
+
+test -L "$0" && DIR=$(dirname $(readlink -f $0))
+
+binary="$DIR/qcad-bin"
+
+# set to 1 if QCAD renders with very small icons / menus on a high resolution screen:
+QT_AUTO_SCREEN_SCALE_FACTOR=0 LD_LIBRARY_PATH="$DIR" "$binary" "$@"
+
+ret=$?
+
+if [ $ret -ne 0 ]
+then
+    echo ""
+    echo "QCAD has unexpectedly quit."
+    echo ""
+    echo "Please use the offscreen or minimal platform plugin for headless systems"
+    echo "(without a running X11 server):"
+    echo "$0 -platform offscreen"
+    echo ""
+    echo "In addition, you might have to override the default Qt style"
+    echo "to prevent the loading of a native desktop style (such as GTK):"
+    echo "$0 -style plastique"
+fi
+
+exit $ret
