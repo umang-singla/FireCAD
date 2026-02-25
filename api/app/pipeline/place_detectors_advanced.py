@@ -1,21 +1,92 @@
-"""Advanced detector placement (ported from your Colab notebook cell 12).
-
-This module focuses on *placement logic* and returns detector points in WORLD coords.
-
-Assumptions:
-- Input room polygons are already in world coordinates (DXF modelspace units).
-- `world_to_m` converts DXF units -> meters (mm => 0.001, inches => 0.0254, feet => 0.3048, meters => 1.0).
-"""
-
+import os
+import json
 import math
-from typing import List, Tuple, Dict
-
+from typing import Dict, List, Tuple
 import numpy as np
-from shapely.geometry import Polygon, Point, LinearRing
+import cv2
+from shapely.geometry import Polygon, LineString, Point, LinearRing
 from shapely.validation import make_valid
 from shapely.affinity import rotate
 from shapely.ops import split
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
+ROOMS_JSON = "data\\projects\\1d4d4a6e-983f-47b4-805c-8ab106455ce2\\rooms_from_image.json"       # Input JSON
+MAPPING_JSON = "data\\projects\\1d4d4a6e-983f-47b4-805c-8ab106455ce2\\mapping.json"
+EXISTING_DXF = "data\\projects\\1d4d4a6e-983f-47b4-805c-8ab106455ce2\\out_fix\\input.dxf"
+OUTPUT_DXF = "data\\projects\\1d4d4a6e-983f-47b4-805c-8ab106455ce2\\detectors_overlay.dxf"
+OUTPUT_IMAGE = "data\\projects\\1d4d4a6e-983f-47b4-805c-8ab106455ce2\\detectors_symmetric.png"
+
+# Scaling (assumes DXF units are mm, so 0.001 m/mm)
+WORLD_TO_M = 0.001
+DETECTOR_SPACING_M = 5
+
+# Wall Splitting & Geometry Sensitivity
+MIN_REGION_AREA_M2 = 2.5
+NOISE_TOLERANCE_M = 0.15  # Filters out spikes/wobbles smaller than 15cm
+
+# Ignore corners if the walls forming them are shorter than this (e.g., 0.5 meters)
+MIN_WALL_LENGTH_M = 0.05
+
+# Wall Buffer (Minimum distance a detector must be from any wall)
+WALL_BUFFER_M = 0.5
+
+# Post-Placement Global Line Alignment Setting
+ALIGNMENT_TOLERANCE_M = 2  # Max distance (meters) to snap a point to a global horizontal/vertical line
+
+# DXF Settings
+DXF_LAYER_SMOKE = "AI_SMOKE_DETECTORS"
+DXF_SYMBOL_RADIUS = 15.0*0.001/WORLD_TO_M
+DXF_TEXT_HEIGHT = 15.0
+DXF_TEXT_OFFSET = 200.0
+
+# DXF Export check
+try:
+    import ezdxf
+    EZDXF_OK = True
+except ImportError:
+    EZDXF_OK = False
+    print("Warning: 'ezdxf' not found. DXF export will be skipped.")
+
+
+# ============================================================
+# COORDINATE MAPPING
+# ============================================================
+
+class CoordinateMapper:
+    def __init__(self, mapping_path):
+        with open(mapping_path, 'r') as f:
+            data = json.load(f)
+
+        self.W = float(data['width_px'])
+        self.H = float(data['height_px'])
+        self.bbox = data['world_bbox']
+
+        self.xmin = float(self.bbox['xmin'])
+        self.xmax = float(self.bbox['xmax'])
+        self.ymin = float(self.bbox['ymin'])
+        self.ymax = float(self.bbox['ymax'])
+
+        self.x_range = self.xmax - self.xmin
+        self.y_range = self.ymax - self.ymin
+
+    def pixel_to_world(self, u, v):
+        """Pixel (u,v) -> World (x,y)"""
+        x = self.xmin + (float(u) * self.x_range / self.W)
+        y = self.ymax - (float(v) * self.y_range / self.H)
+        return x, y
+
+    def world_to_pixel(self, x, y):
+        """World (x,y) -> Pixel (u,v)"""
+        u = (float(x) - self.xmin) * self.W / self.x_range
+        v = (self.ymax - float(y)) * self.H / self.y_range
+        return u, v
+
+
+# ============================================================
+# GEOMETRY HELPERS
+# ============================================================
 
 def parse_polygon(poly_coords):
     if not poly_coords or len(poly_coords) < 3:
@@ -43,7 +114,7 @@ def parse_polygon(poly_coords):
     return poly
 
 
-def get_longest_wall_angle(poly: Polygon):
+def get_longest_wall_angle(poly):
     coords = list(poly.exterior.coords)
     max_len = 0.0
     best_angle = 0.0
@@ -61,179 +132,463 @@ def get_longest_wall_angle(poly: Polygon):
     return best_angle, poly.centroid.coords[0]
 
 
-def densify_ring(coords, step_dist):
-    ring = []
-    for i in range(len(coords) - 1):
-        x1, y1 = coords[i]
-        x2, y2 = coords[i + 1]
-        dx = x2 - x1
-        dy = y2 - y1
-        seg_len = (dx * dx + dy * dy) ** 0.5
-        if seg_len <= 1e-9:
-            continue
-        steps = max(1, int(seg_len / step_dist))
-        for s in range(steps):
-            t = s / steps
-            ring.append((x1 + t * dx, y1 + t * dy))
-    ring.append(coords[-1])
-    return ring
+# ============================================================
+# REFLEX VERTEX (VULNERABLE POINT) SPLITTING LOGIC
+# ============================================================
 
-
-def smooth_ring(coords, noise_tol):
-    """Remove tiny spikes by skipping points that create very short segments."""
-    if len(coords) <= 4:
-        return coords
-
-    out = [coords[0]]
-    for i in range(1, len(coords) - 1):
-        x0, y0 = out[-1]
-        x1, y1 = coords[i]
-        x2, y2 = coords[i + 1]
-        d1 = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
-        d2 = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
-        if d1 < noise_tol and d2 < noise_tol:
-            continue
-        out.append(coords[i])
-    out.append(coords[-1])
-    return out
-
-
-def polygon_wall_lengths(poly: Polygon):
+def get_reflex_vertices(poly):
     coords = list(poly.exterior.coords)
-    lengths = []
-    for i in range(len(coords) - 1):
-        x1, y1 = coords[i]
-        x2, y2 = coords[i + 1]
-        lengths.append(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5)
-    return lengths
+
+    if LinearRing(coords).is_ccw:
+        coords = coords[::-1]
+
+    reflex_data = []
+    n = len(coords) - 1
+
+    min_len_world = MIN_WALL_LENGTH_M / WORLD_TO_M
+
+    for i in range(n):
+        p_prev = coords[i - 1]
+        p_curr = coords[i]
+        p_next = coords[(i + 1) % n]
+
+        v1_x, v1_y = p_curr[0] - p_prev[0], p_curr[1] - p_prev[1]
+        v2_x, v2_y = p_next[0] - p_curr[0], p_next[1] - p_curr[1]
+
+        len1 = math.hypot(v1_x, v1_y)
+        len2 = math.hypot(v2_x, v2_y)
+
+        if len1 < min_len_world or len2 < min_len_world:
+            continue
+
+        cross_product = (v1_x * v2_y) - (v1_y * v2_x)
+
+        if cross_product > 1e-4:
+            reflex_data.append((p_curr, p_prev, p_next))
+
+    return reflex_data
 
 
-def buffered_interior(poly: Polygon, wall_buffer_world: float):
-    """Shrink polygon inward by wall buffer. If it collapses, return None."""
-    try:
-        inner = poly.buffer(-wall_buffer_world)
-        if inner.is_empty:
-            return None
-        if inner.geom_type == 'MultiPolygon':
-            inner = max(inner.geoms, key=lambda p: p.area)
-        return inner
-    except Exception:
-        return None
+def split_at_reflex_vertex(poly, reflex_data):
+    B, A, C = reflex_data
+    x, y = B
 
+    v1_x, v1_y = B[0] - A[0], B[1] - A[1]
+    v2_x, v2_y = B[0] - C[0], B[1] - C[1]
 
-def grid_points_in_polygon(poly: Polygon, spacing_world: float):
+    directions = []
+
+    for vx, vy in [(v1_x, v1_y), (v2_x, v2_y)]:
+        if abs(vx) > abs(vy):
+            directions.append((math.copysign(1.0, vx), 0.0))
+        else:
+            directions.append((0.0, math.copysign(1.0, vy)))
+
     minx, miny, maxx, maxy = poly.bounds
-    pts = []
-    x = minx
-    while x <= maxx:
-        y = miny
-        while y <= maxy:
-            p = Point(x, y)
-            if poly.contains(p):
-                pts.append((x, y))
-            y += spacing_world
-        x += spacing_world
-    return pts
+    max_dist = max(maxx - minx, maxy - miny) + 1.0
+
+    best_cut = None
+    min_dist = float('inf')
+    boundary = poly.boundary
+
+    for dx, dy in directions:
+        ray = LineString([(x, y), (x + dx * max_dist, y + dy * max_dist)])
+        intersection = boundary.intersection(ray)
+
+        if intersection.is_empty:
+            continue
+
+        points = []
+        if intersection.geom_type == 'Point':
+            points.append(intersection)
+        elif intersection.geom_type == 'MultiPoint':
+            points.extend(intersection.geoms)
+        elif intersection.geom_type == 'GeometryCollection':
+            for geom in intersection.geoms:
+                if geom.geom_type == 'Point':
+                    points.append(geom)
+        elif intersection.geom_type in ['LineString', 'MultiLineString']:
+            continue
+
+        closest_pt = None
+        closest_dist = float('inf')
+
+        for pt in points:
+            dist = Point(B).distance(pt)
+            if 1e-3 < dist < closest_dist:
+                closest_dist = dist
+                closest_pt = pt
+
+        if closest_pt is not None:
+            cut_line = LineString([B, (closest_pt.x, closest_pt.y)])
+
+            if poly.contains(cut_line.centroid):
+                if closest_dist < min_dist:
+                    min_dist = closest_dist
+
+                    ext_x = closest_pt.x + dx * 0.1
+                    ext_y = closest_pt.y + dy * 0.1
+                    ext_start_x = x - dx * 0.1
+                    ext_start_y = y - dy * 0.1
+                    best_cut = LineString([(ext_start_x, ext_start_y), (ext_x, ext_y)])
+
+    if best_cut is not None:
+        try:
+            res = split(poly, best_cut)
+            polys = [g for g in res.geoms if g.geom_type in ('Polygon', 'MultiPolygon')]
+            if len(polys) > 1:
+                return polys
+        except Exception:
+            pass
+
+    return [poly]
 
 
-def farthest_point_sampling(points: List[Tuple[float, float]], k: int):
-    if not points or k <= 0:
+def decompose_recursive(poly):
+    if poly.area < (MIN_REGION_AREA_M2 / (WORLD_TO_M ** 2)):
+        return [poly]
+
+    reflex_data_list = get_reflex_vertices(poly)
+
+    if not reflex_data_list:
+        return [poly]
+
+    for r_data in reflex_data_list:
+        parts = split_at_reflex_vertex(poly, r_data)
+        if len(parts) > 1:
+            out = []
+            for p in parts:
+                out.extend(decompose_recursive(p))
+            return out
+
+    return [poly]
+
+
+# ============================================================
+# SYMMETRIC PLACEMENT LOGIC
+# ============================================================
+
+def get_symmetric_grid_detectors(poly):
+    angle_rad, (cx, cy) = get_longest_wall_angle(poly)
+    angle_deg = math.degrees(angle_rad)
+
+    rot_poly = rotate(poly, -angle_deg, origin=(cx, cy))
+    minx, miny, maxx, maxy = rot_poly.bounds
+
+    width = maxx - minx
+    height = maxy - miny
+
+    spacing_world = DETECTOR_SPACING_M / WORLD_TO_M
+
+    nx = max(1, math.ceil(width / spacing_world))
+    ny = max(1, math.ceil(height / spacing_world))
+
+    step_x = width / nx
+    step_y = height / ny
+
+    detectors = []
+    for i in range(nx):
+        for j in range(ny):
+            lx = minx + (i * step_x) + (step_x / 2)
+            ly = miny + (j * step_y) + (step_y / 2)
+
+            p = Point(lx, ly)
+            if rot_poly.contains(p):
+                world_p = rotate(p, angle_deg, origin=(cx, cy))
+                detectors.append((world_p.x, world_p.y))  # WORLD COORDS
+
+    return detectors
+
+
+def process_room(room_poly):
+    detectors = []
+    regions = []
+
+    tolerance_world = NOISE_TOLERANCE_M / WORLD_TO_M
+    clean_poly = room_poly.simplify(tolerance_world, preserve_topology=True)
+
+    if not clean_poly.is_valid:
+        clean_poly = make_valid(clean_poly)
+        if clean_poly.geom_type == 'GeometryCollection':
+            polys = [g for g in clean_poly.geoms if g.geom_type in ['Polygon', 'MultiPolygon']]
+            if polys:
+                clean_poly = max(polys, key=lambda p: p.area)
+
+    sub_polys = decompose_recursive(clean_poly)
+    min_area_world = MIN_REGION_AREA_M2 / (WORLD_TO_M ** 2)
+
+    for poly in sub_polys:
+        if poly.area < min_area_world:
+            continue
+
+        regions.append(poly)
+        grid_points = get_symmetric_grid_detectors(poly)
+
+        if not grid_points:
+            p = poly.representative_point()
+            grid_points = [(p.x, p.y)]
+
+        detectors.extend(grid_points)
+
+    return detectors, regions
+
+
+# ============================================================
+# FINAL ALIGNMENT: 2D GLOBAL GRID & WALL BUFFER
+# ============================================================
+
+def align_to_global_lines(detectors, regions, tolerance_m):
+    """
+    Forces detectors to snap to both horizontal and vertical global grid lines,
+    while strictly refusing to place them closer than WALL_BUFFER_M to any wall.
+    """
+    if not detectors:
         return []
-    pts = np.array(points, dtype=np.float64)
-    # start at centroid-ish
-    idx = np.random.randint(0, len(points))
-    chosen = [idx]
-    dist = np.full(len(points), np.inf, dtype=np.float64)
 
-    for _ in range(1, k):
-        last = pts[chosen[-1]]
-        d = np.sum((pts - last) ** 2, axis=1)
-        dist = np.minimum(dist, d)
-        idx = int(np.argmax(dist))
-        chosen.append(idx)
+    tolerance_world = tolerance_m / WORLD_TO_M
+    wall_buffer_world = WALL_BUFFER_M / WORLD_TO_M  # Strict wall buffer
 
-    return [tuple(pts[i]) for i in chosen]
+    # 1. Group coordinates into shared global grid lines
+    def extract_global_lines(coords):
+        sorted_coords = sorted(coords)
+        if not sorted_coords:
+            return []
 
+        lines = []
+        current_group = [sorted_coords[0]]
 
-def snap_to_grid(points: List[Tuple[float, float]], tol_world: float):
-    """Snap points that are almost aligned to shared x or y lines."""
-    if not points:
-        return points
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
+        for val in sorted_coords[1:]:
+            if val - current_group[0] <= tolerance_world:
+                current_group.append(val)
+            else:
+                lines.append(sum(current_group) / len(current_group))
+                current_group = [val]
 
-    snapped = []
-    for x,y in points:
-        # snap x to any common x within tol
-        bestx = x
-        for gx in xs:
-            if abs(gx - x) <= tol_world:
-                bestx = gx
+        lines.append(sum(current_group) / len(current_group))
+        return lines
+
+    global_x_lines = extract_global_lines([d[0] for d in detectors])
+    global_y_lines = extract_global_lines([d[1] for d in detectors])
+
+    aligned_detectors = []
+
+    # 2. Process and snap each detector
+    for x, y in detectors:
+        pt = Point(x, y)
+
+        # Find parent region
+        parent_region = None
+        for r in regions:
+            if r.contains(pt) or r.distance(pt) < 1e-3:
+                parent_region = r
                 break
-        besty = y
-        for gy in ys:
-            if abs(gy - y) <= tol_world:
-                besty = gy
-                break
-        snapped.append((bestx, besty))
-    return snapped
+
+        if not parent_region:
+            aligned_detectors.append((x, y))
+            continue
+
+        # Enforce strict WALL_BUFFER_M distance
+        safe_zone = parent_region.buffer(-wall_buffer_world)
+
+        # If the room itself is so narrow that the buffer consumes it, we slightly relax
+        # it just for this specific tiny room, but keep it as buffered as geometrically possible.
+        if safe_zone.is_empty or safe_zone.area <= 0:
+            safe_zone = parent_region.buffer(-0.1 / WORLD_TO_M)
+            if safe_zone.is_empty:
+                safe_zone = parent_region
+
+        # Find ALL nearby grid lines within the tolerance
+        valid_x = sorted([gx for gx in global_x_lines if abs(gx - x) <= tolerance_world], key=lambda gx: abs(gx - x))
+        valid_y = sorted([gy for gy in global_y_lines if abs(gy - y) <= tolerance_world], key=lambda gy: abs(gy - y))
+
+        if not valid_x: valid_x = [x]
+        if not valid_y: valid_y = [y]
+
+        best_pt = None
+
+        # TRY: Ensure BOTH Vertical and Horizontal alignment
+        for gx in valid_x:
+            for gy in valid_y:
+                if safe_zone.contains(Point(gx, gy)):
+                    best_pt = (gx, gy)
+                    break
+            if best_pt: break
+
+        # FALLBACK: If we can't align both axes without hitting a wall, try aligning at least one axis
+        if not best_pt:
+            for gx in valid_x:
+                if safe_zone.contains(Point(gx, y)):
+                    best_pt = (gx, y)
+                    break
+
+        if not best_pt:
+            for gy in valid_y:
+                if safe_zone.contains(Point(x, gy)):
+                    best_pt = (x, gy)
+                    break
+
+        if best_pt:
+            aligned_detectors.append(best_pt)
+        else:
+            # Absolute fallback if it's completely boxed in
+            aligned_detectors.append((x, y))
+
+    return aligned_detectors
+
+
+# ============================================================
+# DXF EXPORT
+# ============================================================
+
+def _looks_like_pixels(detectors, mapper: CoordinateMapper):
+    if not detectors:
+        return False
+    W, H = mapper.W, mapper.H
+    inside = 0
+    for x, y in detectors:
+        if 0 <= x <= W and 0 <= y <= H:
+            inside += 1
+    return (inside / max(1, len(detectors))) > 0.8
+
+
+def export_dxf_overlay(detectors_xy, mapping_json, input_dxf_path, output_dxf_path):
+    if not EZDXF_OK:
+        return
+
+    if not os.path.exists(mapping_json):
+        print(f"Error: Mapping file not found at {mapping_json}")
+        return
+    mapper = CoordinateMapper(mapping_json)
+
+    print(f"Loading DXF: {input_dxf_path}...")
+    if os.path.exists(input_dxf_path):
+        try:
+            doc = ezdxf.readfile(input_dxf_path)
+        except Exception as e:
+            print(f"Failed to read DXF, creating new. Error: {e}")
+            doc = ezdxf.new()
+    else:
+        doc = ezdxf.new()
+
+    msp = doc.modelspace()
+
+    if DXF_LAYER_SMOKE not in doc.layers:
+        doc.layers.new(name=DXF_LAYER_SMOKE, dxfattribs={'color': 1})
+
+    treat_as_pixels = _looks_like_pixels(detectors_xy, mapper)
+    print(f"Export mode: {'PIXEL->WORLD (mapped)' if treat_as_pixels else 'WORLD (direct)'}")
+    print(f"Placing {len(detectors_xy)} detectors...")
+
+    for i, (a, b) in enumerate(detectors_xy):
+        if treat_as_pixels:
+            wx, wy = mapper.pixel_to_world(a, b)
+        else:
+            wx, wy = float(a), float(b)
+
+        msp.add_circle((wx, wy), radius=DXF_SYMBOL_RADIUS, dxfattribs={'layer': DXF_LAYER_SMOKE})
+
+        label = f"SD-{i+1}"
+        try:
+            txt = msp.add_text(
+                label,
+                dxfattribs={
+                    'layer': DXF_LAYER_SMOKE,
+                    'height': DXF_TEXT_HEIGHT
+                }
+            )
+            txt.set_placement((wx + DXF_TEXT_OFFSET, wy + DXF_TEXT_OFFSET))
+        except Exception:
+            pass
+
+    doc.saveas(output_dxf_path)
+    print(f"DXF saved to: {output_dxf_path}")
+
+
+# ============================================================
+# VISUALIZATION (WORLD SPACE DRAW)
+# ============================================================
+
+def visualize_results(all_regions, all_detectors, output_path):
+    if not all_regions:
+        return
+
+    minx = min(p.bounds[0] for p in all_regions)
+    miny = min(p.bounds[1] for p in all_regions)
+    maxx = max(p.bounds[2] for p in all_regions)
+    maxy = max(p.bounds[3] for p in all_regions)
+
+    target_w = 2200
+    world_w = max(1.0, (maxx - minx))
+    scale = target_w / world_w
+
+    margin_px = 80
+    w_px = int((maxx - minx) * scale) + 2 * margin_px
+    h_px = int((maxy - miny) * scale) + 2 * margin_px
+    w_px = max(400, min(w_px, 4000))
+    h_px = max(400, min(h_px, 4000))
+
+    img = np.zeros((h_px, w_px, 3), dtype=np.uint8)
+
+    def to_px(wx, wy):
+        px = int((wx - minx) * scale) + margin_px
+        py = int((maxy - wy) * scale) + margin_px
+        return (px, py)
+
+    for reg in all_regions:
+        pts = np.array([to_px(x, y) for (x, y) in reg.exterior.coords], dtype=np.int32)
+        color = np.random.randint(50, 150, 3).tolist()
+        overlay = img.copy()
+        cv2.fillPoly(overlay, [pts], color)
+        cv2.addWeighted(overlay, 0.5, img, 0.5, 0, img)
+        cv2.polylines(img, [pts], True, (200, 200, 200), 1)
+
+    for (dx, dy) in all_detectors:
+        px, py = to_px(dx, dy)
+        if 0 <= px < w_px and 0 <= py < h_px:
+            cv2.circle(img, (px, py), 6, (0, 0, 255), -1)
+            cv2.circle(img, (px, py), 8, (255, 255, 255), 2)
+
+    cv2.imwrite(output_path, img)
+    print(f"Visualization saved: {output_path}")
+
+
+# ============================================================
+# PIPELINE ADAPTERS
+# ============================================================
+
+def _set_runtime_config(spacing_m: float, wall_buffer_m: float, world_to_m: float):
+    global DETECTOR_SPACING_M, WALL_BUFFER_M, WORLD_TO_M
+    DETECTOR_SPACING_M = float(spacing_m)
+    WALL_BUFFER_M = float(wall_buffer_m)
+    WORLD_TO_M = float(world_to_m)
 
 
 def place_detectors_for_room(poly_world: Polygon, spacing_m: float, wall_buffer_m: float, world_to_m: float):
-    spacing_world = spacing_m / world_to_m
-    wall_buffer_world = wall_buffer_m / world_to_m
-
-    # Smooth noisy outlines
-    coords = list(poly_world.exterior.coords)
-    coords = smooth_ring(coords, noise_tol=0.15 / world_to_m)
-    poly_world = Polygon(coords)
-    if not poly_world.is_valid:
-        poly_world = make_valid(poly_world)
-        if poly_world.geom_type == "MultiPolygon":
-            poly_world = max(poly_world.geoms, key=lambda p: p.area)
-
-    inner = buffered_interior(poly_world, wall_buffer_world)
-    if inner is None:
-        # fallback: centroid if any
-        c = poly_world.centroid
-        return [(float(c.x), float(c.y))], [poly_world]
-
-    # Decide how many detectors: area coverage heuristic
-    area_m2 = inner.area * (world_to_m ** 2)
-    if area_m2 <= 0:
-        c = poly_world.centroid
-        return [(float(c.x), float(c.y))], [poly_world]
-
-    # Each detector covers roughly spacing^2 area (very rough). Ensure at least 1.
-    k = max(1, int(math.ceil(area_m2 / max(1e-6, (spacing_m * spacing_m)))))
-
-    # Candidate points on grid
-    candidates = grid_points_in_polygon(inner, spacing_world)
-    if len(candidates) == 0:
-        c = inner.centroid
-        return [(float(c.x), float(c.y))], [inner]
-
-    # If too many candidates, sample
-    k = min(k, max(1, len(candidates)))
-    chosen = farthest_point_sampling(candidates, k)
-
-    # Snap a little for aesthetics
-    chosen = snap_to_grid(chosen, tol_world=(2.0 / world_to_m))
-
-    return chosen, [inner]
+    _set_runtime_config(spacing_m=spacing_m, wall_buffer_m=wall_buffer_m, world_to_m=world_to_m)
+    detectors, regions = process_room(poly_world)
+    detectors = align_to_global_lines(detectors, regions, ALIGNMENT_TOLERANCE_M)
+    return detectors, regions
 
 
-def place_detectors_from_rooms_json(rooms: List[Dict], spacing_m: float, wall_buffer_m: float, world_to_m: float):
-    all_detectors = []
-    all_regions = []
-    for r in rooms:
-        poly = parse_polygon(r.get("polygon_world"))
+def place_detectors_from_rooms_json(
+    rooms: List[Dict],
+    spacing_m: float,
+    wall_buffer_m: float,
+    world_to_m: float,
+) -> Tuple[List[Tuple[float, float]], List[Polygon]]:
+    _set_runtime_config(spacing_m=spacing_m, wall_buffer_m=wall_buffer_m, world_to_m=world_to_m)
+
+    all_detectors_world: List[Tuple[float, float]] = []
+    all_regions: List[Polygon] = []
+
+    for room in rooms:
+        poly = parse_polygon(room.get("polygon_world"))
         if poly is None:
             continue
-        dets, regs = place_detectors_for_room(poly, spacing_m, wall_buffer_m, world_to_m)
-        all_detectors.extend(dets)
+
+        dets, regs = process_room(poly)
+        all_detectors_world.extend(dets)
         all_regions.extend(regs)
 
-    # Global align
-    all_detectors = snap_to_grid(all_detectors, tol_world=(2.0 / world_to_m))
-    return all_detectors, all_regions
+    all_detectors_world = align_to_global_lines(all_detectors_world, all_regions, ALIGNMENT_TOLERANCE_M)
+    return all_detectors_world, all_regions
