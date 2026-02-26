@@ -1,18 +1,26 @@
 import os
 import json
-import shutil
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
 from app.db import db, now
 from app.storage import new_id, project_dir, relpath
 from app.schemas import ProjectCreate, ProjectOut, ProjectUpdateSettings
 from app.pipeline.run_pipeline import run_pipeline_for_project, PipelineOptions
+from app.pipeline.dxf_export import write_detectors_to_dxf
 
 router = APIRouter(tags=["projects"])
+
+@router.get("/projects", response_model=list[ProjectOut])
+def list_projects():
+    with db() as con:
+        rows = con.execute("SELECT * FROM projects ORDER BY updated_at DESC, created_at DESC").fetchall()
+    return [_project_row_to_out(r) for r in rows]
 
 def _project_row_to_out(r) -> ProjectOut:
     files = {}
     def add(k, p):
         files[k] = f"/files/{relpath(p)}" if p else None
+
+    preview_mapping_path = os.path.join(project_dir(r["id"]), "detectors_preview_mapping.json")
 
     add("input", r["input_path"])
     add("dxf", r["dxf_path"])
@@ -24,6 +32,7 @@ def _project_row_to_out(r) -> ProjectOut:
     add("rooms_json", r["rooms_json_path"])
     add("output_dxf", r["output_dxf_path"])
     add("output_preview_png", r["output_preview_png_path"])
+    add("output_preview_mapping", preview_mapping_path if os.path.exists(preview_mapping_path) else None)
 
     return ProjectOut(
         id=r["id"],
@@ -36,7 +45,7 @@ def _project_row_to_out(r) -> ProjectOut:
 @router.post("/projects", response_model=ProjectOut)
 def create_project(payload: ProjectCreate):
     pid = new_id()
-    pdir = project_dir(pid)
+    project_dir(pid)
     with db() as con:
         con.execute(
             """INSERT INTO projects
@@ -130,4 +139,43 @@ def reset_detectors(project_id: str):
         con.execute("DELETE FROM detectors WHERE project_id=?", (project_id,))
         con.execute("UPDATE projects SET updated_at=? WHERE id=?", (now(), project_id))
         r2 = con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+    return _project_row_to_out(r2)
+
+@router.post("/projects/{project_id}/save", response_model=ProjectOut)
+def save_project_layout(project_id: str):
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+
+        dxf_path = r["dxf_path"]
+        if not dxf_path or not os.path.exists(dxf_path):
+            raise HTTPException(400, "base DXF not available")
+
+        det_rows = con.execute(
+            "SELECT id, x, y, z, dtype, locked FROM detectors WHERE project_id=? ORDER BY created_at ASC",
+            (project_id,),
+        ).fetchall()
+
+        dets = [
+            {
+                "id": row["id"],
+                "x": float(row["x"]),
+                "y": float(row["y"]),
+                "z": float(row["z"]),
+                "dtype": row["dtype"],
+                "locked": bool(row["locked"]),
+            }
+            for row in det_rows
+        ]
+
+        out_dxf = os.path.join(project_dir(project_id), "detectors_overlay.dxf")
+        write_detectors_to_dxf(dxf_path, out_dxf, dets, symbol_radius_world=150.0, text_height_world=150.0)
+
+        con.execute(
+            "UPDATE projects SET output_dxf_path=?, status=?, error=NULL, updated_at=? WHERE id=?",
+            (out_dxf, "ready", now(), project_id),
+        )
+        r2 = con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+
     return _project_row_to_out(r2)
