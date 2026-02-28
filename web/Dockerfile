@@ -1,7 +1,8 @@
 FROM node:24-alpine
 WORKDIR /app
 COPY package.json /app/
-RUN npm install
+RUN npm install --include=dev
 COPY . /app
+RUN npm run build
 EXPOSE 3000
-CMD ["npm","run","dev"]
+CMD ["npm","run","start"]
