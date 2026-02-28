@@ -436,6 +436,208 @@ def align_to_global_lines(detectors, regions, tolerance_m):
     return aligned_detectors
 
 
+def visualize_global_snapping_debug(
+    all_regions,
+    detectors_before,
+    detectors_after,
+    output_path,
+    tolerance_m,
+):
+    if not all_regions:
+        return
+
+    minx = min(p.bounds[0] for p in all_regions)
+    miny = min(p.bounds[1] for p in all_regions)
+    maxx = max(p.bounds[2] for p in all_regions)
+    maxy = max(p.bounds[3] for p in all_regions)
+
+    target_w = 2200
+    world_w = max(1.0, (maxx - minx))
+    scale = target_w / world_w
+
+    margin_px = 80
+    w_px = int((maxx - minx) * scale) + 2 * margin_px
+    h_px = int((maxy - miny) * scale) + 2 * margin_px
+    w_px = max(500, min(w_px, 5000))
+    h_px = max(500, min(h_px, 5000))
+
+    img = np.full((h_px, w_px, 3), 20, dtype=np.uint8)
+
+    def to_px(wx, wy):
+        px = int((wx - minx) * scale) + margin_px
+        py = int((maxy - wy) * scale) + margin_px
+        return px, py
+
+    for reg in all_regions:
+        pts = np.array([to_px(x, y) for (x, y) in reg.exterior.coords], dtype=np.int32)
+        overlay = img.copy()
+        cv2.fillPoly(overlay, [pts], (42, 46, 62))
+        cv2.addWeighted(overlay, 0.35, img, 0.65, 0, img)
+        cv2.polylines(img, [pts], True, (90, 110, 130), 1)
+
+    if detectors_before:
+        tolerance_world = tolerance_m / WORLD_TO_M
+
+        def extract_global_lines(coords):
+            sorted_coords = sorted(coords)
+            if not sorted_coords:
+                return []
+            lines = []
+            current_group = [sorted_coords[0]]
+            for val in sorted_coords[1:]:
+                if val - current_group[0] <= tolerance_world:
+                    current_group.append(val)
+                else:
+                    lines.append(sum(current_group) / len(current_group))
+                    current_group = [val]
+            lines.append(sum(current_group) / len(current_group))
+            return lines
+
+        global_x_lines = extract_global_lines([d[0] for d in detectors_before])
+        global_y_lines = extract_global_lines([d[1] for d in detectors_before])
+
+        for gx in global_x_lines:
+            p1 = to_px(gx, miny)
+            p2 = to_px(gx, maxy)
+            cv2.line(img, p1, p2, (235, 185, 60), 1, cv2.LINE_AA)
+
+        for gy in global_y_lines:
+            p1 = to_px(minx, gy)
+            p2 = to_px(maxx, gy)
+            cv2.line(img, p1, p2, (60, 185, 235), 1, cv2.LINE_AA)
+
+    for (dx, dy) in detectors_before:
+        px, py = to_px(dx, dy)
+        if 0 <= px < w_px and 0 <= py < h_px:
+            cv2.circle(img, (px, py), 7, (0, 165, 255), 2, cv2.LINE_AA)
+
+    for (dx, dy) in detectors_after:
+        px, py = to_px(dx, dy)
+        if 0 <= px < w_px and 0 <= py < h_px:
+            cv2.circle(img, (px, py), 5, (0, 0, 255), -1, cv2.LINE_AA)
+            cv2.circle(img, (px, py), 7, (255, 255, 255), 1, cv2.LINE_AA)
+
+    cv2.putText(img, "Global snapping debug", (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (230, 230, 230), 2, cv2.LINE_AA)
+    cv2.putText(img, "orange ring = before snap, red dot = after snap", (20, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (210, 210, 210), 1, cv2.LINE_AA)
+    cv2.putText(img, "yellow vertical / blue horizontal = inferred global snap lines", (20, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (210, 210, 210), 1, cv2.LINE_AA)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    cv2.imwrite(output_path, img)
+
+
+def _world_to_pixel_from_mapping(x, y, mapping):
+    bbox = mapping["world_bbox"]
+    xmin, xmax = float(bbox["xmin"]), float(bbox["xmax"])
+    ymin, ymax = float(bbox["ymin"]), float(bbox["ymax"])
+    pixel_fit = mapping.get("pixel_fit")
+    if pixel_fit and float(pixel_fit.get("scale", 0.0)) > 0.0:
+        scale = float(pixel_fit["scale"])
+        offset_x = float(pixel_fit.get("offset_x", 0.0))
+        offset_y = float(pixel_fit.get("offset_y", 0.0))
+        px = offset_x + (float(x) - xmin) * scale
+        py = offset_y + (ymax - float(y)) * scale
+        return px, py
+
+    width_px = float(mapping["width_px"])
+    height_px = float(mapping["height_px"])
+    u = (float(x) - xmin) / max(1e-9, (xmax - xmin))
+    v = (ymax - float(y)) / max(1e-9, (ymax - ymin))
+    return u * width_px, v * height_px
+
+
+def visualize_global_snapping_overlay(
+    base_png_path,
+    mapping_json_path,
+    all_regions,
+    detectors_before,
+    detectors_after,
+    tolerance_m,
+    output_path,
+):
+    if not os.path.exists(base_png_path) or not os.path.exists(mapping_json_path):
+        return
+
+    base = cv2.imread(base_png_path)
+    if base is None:
+        return
+
+    with open(mapping_json_path, "r", encoding="utf-8") as f:
+        mapping = json.load(f)
+
+    img = base.copy()
+    room_overlay = img.copy()
+    bbox = mapping["world_bbox"]
+    xmin, xmax = float(bbox["xmin"]), float(bbox["xmax"])
+    ymin, ymax = float(bbox["ymin"]), float(bbox["ymax"])
+
+    palette = [
+        (66, 135, 245),
+        (52, 211, 153),
+        (245, 158, 11),
+        (239, 68, 68),
+        (168, 85, 247),
+        (14, 165, 233),
+        (250, 204, 21),
+    ]
+
+    for idx, reg in enumerate(all_regions):
+        pts = []
+        for wx, wy in reg.exterior.coords:
+            px, py = _world_to_pixel_from_mapping(wx, wy, mapping)
+            pts.append([int(round(px)), int(round(py))])
+        if len(pts) >= 3:
+            poly = np.array(pts, dtype=np.int32)
+            color = palette[idx % len(palette)]
+            cv2.fillPoly(room_overlay, [poly], color)
+            cv2.polylines(room_overlay, [poly], True, (255, 255, 255), 1, cv2.LINE_AA)
+
+    cv2.addWeighted(room_overlay, 0.32, img, 0.68, 0, img)
+
+    tolerance_world = tolerance_m / WORLD_TO_M
+
+    def extract_global_lines(coords):
+        sorted_coords = sorted(coords)
+        if not sorted_coords:
+            return []
+        lines = []
+        current_group = [sorted_coords[0]]
+        for val in sorted_coords[1:]:
+            if val - current_group[0] <= tolerance_world:
+                current_group.append(val)
+            else:
+                lines.append(sum(current_group) / len(current_group))
+                current_group = [val]
+        lines.append(sum(current_group) / len(current_group))
+        return lines
+
+    global_x_lines = extract_global_lines([d[0] for d in detectors_before])
+    global_y_lines = extract_global_lines([d[1] for d in detectors_before])
+
+    for gx in global_x_lines:
+        x1, y1 = _world_to_pixel_from_mapping(gx, ymin, mapping)
+        x2, y2 = _world_to_pixel_from_mapping(gx, ymax, mapping)
+        cv2.line(img, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), (235, 185, 60), 1, cv2.LINE_AA)
+
+    for gy in global_y_lines:
+        x1, y1 = _world_to_pixel_from_mapping(xmin, gy, mapping)
+        x2, y2 = _world_to_pixel_from_mapping(xmax, gy, mapping)
+        cv2.line(img, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), (60, 185, 235), 1, cv2.LINE_AA)
+
+    for (x, y) in detectors_before:
+        px, py = _world_to_pixel_from_mapping(x, y, mapping)
+        cv2.circle(img, (int(round(px)), int(round(py))), 7, (0, 165, 255), 2, cv2.LINE_AA)
+
+    for (x, y) in detectors_after:
+        px, py = _world_to_pixel_from_mapping(x, y, mapping)
+        cv2.circle(img, (int(round(px)), int(round(py))), 5, (0, 0, 255), -1, cv2.LINE_AA)
+        cv2.circle(img, (int(round(px)), int(round(py))), 7, (255, 255, 255), 1, cv2.LINE_AA)
+
+    cv2.putText(img, "Global snapping overlay", (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (30, 30, 30), 2, cv2.LINE_AA)
+    cv2.putText(img, "orange ring=before, red dot=after, yellow/blue=snap lines", (20, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (30, 30, 30), 1, cv2.LINE_AA)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    cv2.imwrite(output_path, img)
+
+
 # ============================================================
 # DXF EXPORT
 # ============================================================
@@ -575,6 +777,10 @@ def place_detectors_from_rooms_json(
     spacing_m: float,
     wall_buffer_m: float,
     world_to_m: float,
+    debug_png_path: str | None = None,
+    debug_overlay_png_path: str | None = None,
+    mapping_json_path: str | None = None,
+    base_png_path: str | None = None,
 ) -> Tuple[List[Tuple[float, float]], List[Polygon]]:
     _set_runtime_config(spacing_m=spacing_m, wall_buffer_m=wall_buffer_m, world_to_m=world_to_m)
 
@@ -590,5 +796,27 @@ def place_detectors_from_rooms_json(
         all_detectors_world.extend(dets)
         all_regions.extend(regs)
 
+    detectors_before_snap = list(all_detectors_world)
     all_detectors_world = align_to_global_lines(all_detectors_world, all_regions, ALIGNMENT_TOLERANCE_M)
+
+    if debug_png_path:
+        visualize_global_snapping_debug(
+            all_regions=all_regions,
+            detectors_before=detectors_before_snap,
+            detectors_after=all_detectors_world,
+            output_path=debug_png_path,
+            tolerance_m=ALIGNMENT_TOLERANCE_M,
+        )
+
+    if debug_overlay_png_path and mapping_json_path and base_png_path:
+        visualize_global_snapping_overlay(
+            base_png_path=base_png_path,
+            mapping_json_path=mapping_json_path,
+            all_regions=all_regions,
+            detectors_before=detectors_before_snap,
+            detectors_after=all_detectors_world,
+            tolerance_m=ALIGNMENT_TOLERANCE_M,
+            output_path=debug_overlay_png_path,
+        )
+
     return all_detectors_world, all_regions

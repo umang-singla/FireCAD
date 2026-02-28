@@ -8,7 +8,6 @@ from app.storage import project_dir
 from app.pipeline.options import PipelineOptions
 from app.pipeline.convert import dwg_to_dxf
 from app.pipeline.render import (
-    render_dxf_to_png_and_mapping,
     render_dwg_to_png_with_qcad,
     write_mapping_from_dxf_and_png,
 )
@@ -88,12 +87,29 @@ def _run_post_alignment_steps(
     # 7) Autoplace detectors
     stage_ts = time.perf_counter()
     stage_start("place_detectors")
-    placed, _regions = place_detectors_from_rooms_json(rooms, opts.detector_spacing_m, opts.wall_buffer_m, opts.world_to_m)
+    detectors_debug_png = os.path.join(pdir, "detectors_global_snapping_debug.png")
+    detectors_overlay_debug_png = os.path.join(pdir, "detectors_global_snapping_overlay.png")
+    placed, _regions = place_detectors_from_rooms_json(
+        rooms,
+        opts.detector_spacing_m,
+        opts.wall_buffer_m,
+        opts.world_to_m,
+        debug_png_path=detectors_debug_png,
+        debug_overlay_png_path=detectors_overlay_debug_png,
+        mapping_json_path=mapping_json,
+        base_png_path=os.path.join(pdir, "render.png"),
+    )
     import uuid
     dets = [{"id": str(uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0, "dtype": "smoke", "locked": 0} for (x,y) in placed]
     with db() as con:
         _replace_detectors(con, project_id, dets)
-    stage_done("place_detectors", stage_ts, detectors=len(dets))
+    stage_done(
+        "place_detectors",
+        stage_ts,
+        detectors=len(dets),
+        debug=detectors_debug_png,
+        overlay=detectors_overlay_debug_png,
+    )
 
     # 8) Export DXF with detectors
     stage_ts = time.perf_counter()
@@ -107,44 +123,20 @@ def _run_post_alignment_steps(
     stage_start("render_output_preview")
     out_png = os.path.join(pdir, "detectors_preview.png")
     out_map = os.path.join(pdir, "detectors_preview_mapping.json")
-    used_qcad_preview = False
-    qcad_enabled = os.getenv("USE_QCAD_DWG2BMP", "1").strip().lower() not in ("0", "false", "no")
-    qcad_exe = os.getenv("QCAD_DWG2BMP", "/opt/qcad/dwg2bmp")
-    qcad_available = os.path.exists(qcad_exe)
-    if qcad_enabled and qcad_available:
-        try:
-            render_dwg_to_png_with_qcad(
-                dwg_path=out_dxf,
-                out_png=out_png,
-                background="white",
-            )
-            write_mapping_from_dxf_and_png(
-                dxf_path=out_dxf,
-                png_path=out_png,
-                out_json=out_map,
-                pad_frac=opts.pad_frac,
-            )
-            used_qcad_preview = True
-        except Exception:
-            logger.exception("pipeline project=%s stage=render_output_preview renderer=qcad status=failed fallback=ezdxf", project_id)
-    elif qcad_enabled and not qcad_available:
-        logger.info(
-            "pipeline project=%s stage=render_output_preview renderer=qcad status=skipped reason=missing_binary path=%s fallback=ezdxf",
-            project_id,
-            qcad_exe,
-        )
+    render_dwg_to_png_with_qcad(
+        dwg_path=out_dxf,
+        out_png=out_png,
+        target_long_side_px=min(opts.target_long_side_px, 8000),
+        background="white",
+    )
+    write_mapping_from_dxf_and_png(
+        dxf_path=out_dxf,
+        png_path=out_png,
+        out_json=out_map,
+        pad_frac=opts.pad_frac,
+    )
 
-    if not used_qcad_preview:
-        render_dxf_to_png_and_mapping(
-            dxf_path=out_dxf,
-            out_png=out_png,
-            out_json=out_map,
-            target_long_side_px=min(opts.target_long_side_px, 8000),
-            dpi=opts.dpi,
-            pad_frac=opts.pad_frac,
-        )
-
-    stage_done("render_output_preview", stage_ts, out_png=out_png, renderer=("qcad" if used_qcad_preview else "ezdxf"))
+    stage_done("render_output_preview", stage_ts, out_png=out_png, renderer="qcad")
 
     with db() as con:
         _set_project(con, project_id,
@@ -207,49 +199,25 @@ def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
         stage_start("render_input")
         render_png = os.path.join(pdir, "render.png")
         mapping_json = os.path.join(pdir, "mapping.json")
-        used_qcad = False
-        qcad_enabled = os.getenv("USE_QCAD_DWG2BMP", "1").strip().lower() not in ("0", "false", "no")
-        qcad_exe = os.getenv("QCAD_DWG2BMP", "/opt/qcad/dwg2bmp")
-        qcad_available = os.path.exists(qcad_exe)
-        if ext == ".dwg" and qcad_enabled and qcad_available:
-            try:
-                render_dwg_to_png_with_qcad(
-                    dwg_path=in_path,
-                    out_png=render_png,
-                    background="white",
-                )
-                write_mapping_from_dxf_and_png(
-                    dxf_path=dxf_path,
-                    png_path=render_png,
-                    out_json=mapping_json,
-                    pad_frac=opts.pad_frac,
-                )
-                used_qcad = True
-            except Exception:
-                logger.exception("pipeline project=%s stage=render_input renderer=qcad status=failed fallback=ezdxf", project_id)
-        elif ext == ".dwg" and qcad_enabled and not qcad_available:
-            logger.info(
-                "pipeline project=%s stage=render_input renderer=qcad status=skipped reason=missing_binary path=%s fallback=ezdxf",
-                project_id,
-                qcad_exe,
-            )
-
-        if not used_qcad:
-            render_dxf_to_png_and_mapping(
-                dxf_path=dxf_path,
-                out_png=render_png,
-                out_json=mapping_json,
-                target_long_side_px=opts.target_long_side_px,
-                dpi=opts.dpi,
-                pad_frac=opts.pad_frac,
-            )
+        render_dwg_to_png_with_qcad(
+            dwg_path=dxf_path,
+            out_png=render_png,
+            target_long_side_px=opts.target_long_side_px,
+            background="white",
+        )
+        write_mapping_from_dxf_and_png(
+            dxf_path=dxf_path,
+            png_path=render_png,
+            out_json=mapping_json,
+            pad_frac=opts.pad_frac,
+        )
 
         stage_done(
             "render_input",
             stage_ts,
             render=render_png,
             mapping=mapping_json,
-            renderer=("qcad" if used_qcad else "ezdxf"),
+            renderer="qcad",
         )
 
         # Save project pointers

@@ -15,6 +15,31 @@ from PIL import Image
 logger = logging.getLogger("firecad.pipeline.render")
 
 
+def _build_mapping(width_px: int, height_px: int, xmin_p: float, ymin_p: float, xmax_p: float, ymax_p: float):
+    span_x = max(1e-9, float(xmax_p - xmin_p))
+    span_y = max(1e-9, float(ymax_p - ymin_p))
+    scale = min(float(width_px) / span_x, float(height_px) / span_y)
+    draw_w = span_x * scale
+    draw_h = span_y * scale
+    offset_x = (float(width_px) - draw_w) * 0.5
+    offset_y = (float(height_px) - draw_h) * 0.5
+
+    return {
+        "width_px": int(width_px),
+        "height_px": int(height_px),
+        "world_bbox": {"xmin": xmin_p, "xmax": xmax_p, "ymin": ymin_p, "ymax": ymax_p},
+        "pixel_fit": {
+            "mode": "contain",
+            "scale": float(scale),
+            "offset_x": float(offset_x),
+            "offset_y": float(offset_y),
+            "draw_width": float(draw_w),
+            "draw_height": float(draw_h),
+        },
+        "conversion": "px=offset_x+(x-xmin)*scale; py=offset_y+(ymax-y)*scale; inverse with same scale/offset",
+    }
+
+
 def _padded_bbox_from_msp(msp, pad_frac: float):
     cache = bbox.Cache()
     bb = bbox.extents(msp, cache=cache)
@@ -253,12 +278,14 @@ def write_mapping_from_dxf_and_png(
     with Image.open(png_path) as im:
         width_px, height_px = im.size
 
-    mapping = {
-        "width_px": int(width_px),
-        "height_px": int(height_px),
-        "world_bbox": {"xmin": xmin_p, "xmax": xmax_p, "ymin": ymin_p, "ymax": ymax_p},
-        "conversion": "u=(x-xmin)/(xmax-xmin); v=(ymax-y)/(ymax-ymin); px=u*W; py=v*H"
-    }
+    mapping = _build_mapping(
+        width_px=int(width_px),
+        height_px=int(height_px),
+        xmin_p=xmin_p,
+        ymin_p=ymin_p,
+        xmax_p=xmax_p,
+        ymax_p=ymax_p,
+    )
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(mapping, f, indent=2)
     return mapping
@@ -359,12 +386,14 @@ def render_dxf_to_png_and_mapping(
 
     logger.info("render done png=%s size=%sx%s", out_png, W_px, H_px)
 
-    mapping = {
-        "width_px": int(W_px),
-        "height_px": int(H_px),
-        "world_bbox": {"xmin": xmin_p, "xmax": xmax_p, "ymin": ymin_p, "ymax": ymax_p},
-        "conversion": "u=(x-xmin)/(xmax-xmin); v=(ymax-y)/(ymax-ymin); px=u*W; py=v*H"
-    }
+    mapping = _build_mapping(
+        width_px=int(W_px),
+        height_px=int(H_px),
+        xmin_p=xmin_p,
+        ymin_p=ymin_p,
+        xmax_p=xmax_p,
+        ymax_p=ymax_p,
+    )
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(mapping, f, indent=2)
 

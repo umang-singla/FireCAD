@@ -15,14 +15,23 @@ MIN_AREA_PX = 500
 EPSILON_TIGHT = 1.5
 EPSILON_FINAL = 4.0
 
-def load_mapping_bbox(mapping_path: str):
+def load_mapping(mapping_path: str):
     with open(mapping_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return data["world_bbox"], int(data["width_px"]), int(data["height_px"])
+    return data
 
-def pixel_to_world(px, py, img_w, img_h, bbox):
+def pixel_to_world(px, py, img_w, img_h, bbox, pixel_fit=None):
     xmin, xmax = bbox["xmin"], bbox["xmax"]
     ymin, ymax = bbox["ymin"], bbox["ymax"]
+
+    if pixel_fit and float(pixel_fit.get("scale", 0.0)) > 0.0:
+        scale = float(pixel_fit["scale"])
+        offset_x = float(pixel_fit.get("offset_x", 0.0))
+        offset_y = float(pixel_fit.get("offset_y", 0.0))
+        wx = xmin + (float(px) - offset_x) / scale
+        wy = ymax - (float(py) - offset_y) / scale
+        return [wx, wy]
+
     u = px / img_w
     v = py / img_h
     wx = xmin + u * (xmax - xmin)
@@ -47,7 +56,11 @@ def extract_rooms(mask_bgr_path: str, mapping_json_path: str, out_json_path: str
 
     cnts, _ = cv2.findContours(green_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    bbox, W, H = load_mapping_bbox(mapping_json_path)
+    mapping = load_mapping(mapping_json_path)
+    bbox = mapping["world_bbox"]
+    W = int(mapping["width_px"])
+    H = int(mapping["height_px"])
+    pixel_fit = mapping.get("pixel_fit")
 
     rooms = []
     dbg = img.copy()
@@ -62,7 +75,7 @@ def extract_rooms(mask_bgr_path: str, mapping_json_path: str, out_json_path: str
 
         # Convert to world coords
         pts_px = approx.reshape(-1,2).tolist()
-        pts_w = [pixel_to_world(p[0], p[1], W, H, bbox) for p in pts_px]
+        pts_w = [pixel_to_world(p[0], p[1], W, H, bbox, pixel_fit=pixel_fit) for p in pts_px]
 
         rooms.append({
             "id": f"room_{i}",

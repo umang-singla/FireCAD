@@ -6,7 +6,7 @@ from app.storage import new_id, project_dir, relpath
 from app.schemas import ProjectCreate, ProjectOut, ProjectUpdateSettings
 from app.pipeline.run_pipeline import run_pipeline_for_project, continue_pipeline_after_alignment, PipelineOptions
 from app.pipeline.dxf_export import write_detectors_to_dxf
-from app.pipeline.render import render_dxf_to_png_and_mapping, render_dwg_to_png_with_qcad, write_mapping_from_dxf_and_png
+from app.pipeline.render import render_dwg_to_png_with_qcad, write_mapping_from_dxf_and_png
 from app.routers.auth import get_current_user
 
 router = APIRouter(tags=["projects"])
@@ -26,6 +26,8 @@ def _project_row_to_out(r) -> ProjectOut:
         files[k] = f"/files/{relpath(p)}" if p else None
 
     preview_mapping_path = os.path.join(project_dir(r["id"]), "detectors_preview_mapping.json")
+    detectors_debug_path = os.path.join(project_dir(r["id"]), "detectors_global_snapping_debug.png")
+    detectors_overlay_debug_path = os.path.join(project_dir(r["id"]), "detectors_global_snapping_overlay.png")
 
     add("input", r["input_path"])
     add("dxf", r["dxf_path"])
@@ -38,6 +40,8 @@ def _project_row_to_out(r) -> ProjectOut:
     add("output_dxf", r["output_dxf_path"])
     add("output_preview_png", r["output_preview_png_path"])
     add("output_preview_mapping", preview_mapping_path if os.path.exists(preview_mapping_path) else None)
+    add("detectors_global_snap_debug", detectors_debug_path if os.path.exists(detectors_debug_path) else None)
+    add("detectors_global_snap_overlay", detectors_overlay_debug_path if os.path.exists(detectors_overlay_debug_path) else None)
 
     return ProjectOut(
         id=r["id"],
@@ -237,33 +241,18 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
         settings = json.loads(r["settings_json"] or "{}")
         opts = PipelineOptions.from_env().merge_settings(settings)
 
-        used_qcad_preview = False
-        if os.getenv("USE_QCAD_DWG2BMP", "1").strip().lower() not in ("0", "false", "no"):
-            try:
-                render_dwg_to_png_with_qcad(
-                    dwg_path=out_dxf,
-                    out_png=out_png,
-                    background="white",
-                )
-                write_mapping_from_dxf_and_png(
-                    dxf_path=out_dxf,
-                    png_path=out_png,
-                    out_json=out_map,
-                    pad_frac=opts.pad_frac,
-                )
-                used_qcad_preview = True
-            except Exception:
-                used_qcad_preview = False
-
-        if not used_qcad_preview:
-            render_dxf_to_png_and_mapping(
-                dxf_path=out_dxf,
-                out_png=out_png,
-                out_json=out_map,
-                target_long_side_px=min(opts.target_long_side_px, 8000),
-                dpi=opts.dpi,
-                pad_frac=opts.pad_frac,
-            )
+        render_dwg_to_png_with_qcad(
+            dwg_path=out_dxf,
+            out_png=out_png,
+            target_long_side_px=min(opts.target_long_side_px, 8000),
+            background="white",
+        )
+        write_mapping_from_dxf_and_png(
+            dxf_path=out_dxf,
+            png_path=out_png,
+            out_json=out_map,
+            pad_frac=opts.pad_frac,
+        )
 
         con.execute(
             "UPDATE projects SET output_dxf_path=?, output_preview_png_path=?, status=?, error=NULL, updated_at=? WHERE id=?",

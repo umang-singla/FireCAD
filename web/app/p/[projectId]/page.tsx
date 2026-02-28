@@ -66,16 +66,38 @@ type Mapping = {
   width_px: number;
   height_px: number;
   world_bbox: { xmin:number; xmax:number; ymin:number; ymax:number };
+  pixel_fit?: {
+    mode?: string;
+    scale: number;
+    offset_x: number;
+    offset_y: number;
+    draw_width?: number;
+    draw_height?: number;
+  };
 };
 
 function worldToPixel(m: Mapping, x: number, y: number) {
   const { xmin, xmax, ymin, ymax } = m.world_bbox;
+  const fit = m.pixel_fit;
+  if (fit && Number.isFinite(fit.scale) && fit.scale > 0) {
+    return {
+      px: fit.offset_x + (x - xmin) * fit.scale,
+      py: fit.offset_y + (ymax - y) * fit.scale,
+    };
+  }
   const u = (x - xmin) / (xmax - xmin);
   const v = (ymax - y) / (ymax - ymin);
   return { px: u * m.width_px, py: v * m.height_px };
 }
 function pixelToWorld(m: Mapping, px: number, py: number) {
   const { xmin, xmax, ymin, ymax } = m.world_bbox;
+  const fit = m.pixel_fit;
+  if (fit && Number.isFinite(fit.scale) && fit.scale > 0) {
+    return {
+      x: xmin + (px - fit.offset_x) / fit.scale,
+      y: ymax - (py - fit.offset_y) / fit.scale,
+    };
+  }
   const u = px / m.width_px;
   const v = py / m.height_px;
   return { x: xmin + u*(xmax-xmin), y: ymax - v*(ymax-ymin) };
@@ -105,7 +127,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     const d: Detector[] = await (await authFetch(`/api/projects/${projectId}/detectors`)).json();
     setDetectors(d);
 
-    const mappingUrl = p.files?.output_preview_mapping || p.files?.mapping_json;
+    const mappingUrl = p.files?.mapping_json || p.files?.output_preview_mapping;
     if (mappingUrl) {
       const mj: Mapping = await (await fetch(apiUrl(mappingUrl))).json();
       setMapping(mj);
