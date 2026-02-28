@@ -34,7 +34,9 @@ RUN set -eux; \
 # Bundle QCAD binaries for DWG preview rendering in cloud environments
 COPY qcad-3.32.6-trial-linux-x86_64 /opt/qcad
 RUN set -eux; \
-		chmod +x /opt/qcad/dwg2bmp /opt/qcad/qcad-bin /opt/qcad/qcad
+		chmod +x /opt/qcad/dwg2bmp /opt/qcad/qcad-bin /opt/qcad/qcad; \
+		cp /opt/qcad/*.so* /usr/lib/; \
+		ldconfig
 
 WORKDIR /app
 COPY api/requirements.txt /app/
@@ -46,6 +48,7 @@ ENV PYTHONUNBUFFERED=1
 ENV ODA_PATH=/opt/oda/ODAFileConverter
 ENV QCAD_DWG2BMP=/opt/qcad/dwg2bmp
 ENV USE_QCAD_DWG2BMP=1
+ENV LD_LIBRARY_PATH=/opt/qcad
 
 EXPOSE 8000
 CMD ["python", "-m", "app.server"]
