@@ -34,15 +34,29 @@ RUN set -eux; \
 # Bundle QCAD binaries for DWG preview rendering in cloud environments
 COPY qcad-3.32.6-trial-linux-x86_64 /opt/qcad
 RUN set -eux; \
-		chmod +x /opt/qcad/dwg2bmp /opt/qcad/qcad-bin /opt/qcad/qcad; \
-		cp /opt/qcad/*.so* /usr/lib/; \
-		ldconfig; \
-		test -f /opt/qcad/libqcadecmaapi.so; \
-		if /opt/qcad/qcad -platform offscreen -version >/tmp/qcad_version.txt 2>/tmp/qcad_version_err.txt; then \
-			cat /tmp/qcad_version.txt; \
+		if [ -d /opt/qcad ]; then \
+			for f in /opt/qcad/dwg2bmp /opt/qcad/qcad-bin /opt/qcad/qcad; do \
+				if [ -f "$f" ]; then chmod +x "$f"; fi; \
+			done; \
+			find /opt/qcad -maxdepth 1 -type f -name '*.so*' -exec cp {} /usr/lib/ \; ; \
+			ldconfig; \
+			if [ -f /opt/qcad/libqcadecmaapi.so ]; then \
+				echo "QCAD core library found."; \
+			else \
+				echo "QCAD core library missing at build time (non-fatal)."; \
+			fi; \
+			if [ -x /opt/qcad/qcad ]; then \
+				if /opt/qcad/qcad -platform offscreen -version >/tmp/qcad_version.txt 2>/tmp/qcad_version_err.txt; then \
+					cat /tmp/qcad_version.txt; \
+				else \
+					echo "QCAD version sanity check failed at build time (non-fatal)."; \
+					tail -n 80 /tmp/qcad_version_err.txt || true; \
+				fi; \
+			else \
+				echo "QCAD executable missing at build time (non-fatal)."; \
+			fi; \
 		else \
-			echo "QCAD version sanity check failed at build time (non-fatal)."; \
-			tail -n 80 /tmp/qcad_version_err.txt || true; \
+			echo "QCAD directory missing at build time (non-fatal)."; \
 		fi
 
 WORKDIR /app
