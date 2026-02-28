@@ -49,6 +49,28 @@ def init_db():
     )
     """)
 
+    # ✅ auth tables
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL UNIQUE,
+        pw_salt TEXT NOT NULL,
+        pw_hash TEXT NOT NULL,
+        created_at REAL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        expires_at REAL NOT NULL,
+        created_at REAL,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )
+    """)
+
     con.commit()
     con.close()
 
