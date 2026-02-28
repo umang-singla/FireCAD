@@ -194,9 +194,20 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
 
         <div style={{ marginTop: 12, display:"flex", gap: 8 }}>
           {project?.files?.output_dxf ? (
-            <a href={`${API}${project.files.output_dxf}`} style={{ ...btn(true), textDecoration:"none", display:"inline-flex", alignItems:"center", justifyContent:"center" }}>
-              Download output DXF
-            </a>
+            <>
+              <a
+                href={`${API}/api/projects/${projectId}/download?artifact=output&format=dxf`}
+                style={{ ...btn(true), textDecoration:"none", display:"inline-flex", alignItems:"center", justifyContent:"center" }}
+              >
+                Download output DXF
+              </a>
+              <a
+                href={`/p/${projectId}/reports`}
+                style={{ ...btn(false), textDecoration:"none", display:"inline-flex", alignItems:"center", justifyContent:"center" }}
+              >
+                Reports
+              </a>
+            </>
           ) : null}
         </div>
 
@@ -647,6 +658,30 @@ function Editor({
                   {isSaving ? "Saving..." : "Save"}
                 </button>
               ) : null}
+
+              <button
+                onClick={() => {
+                  window.location.href = `/p/${projectId}/reports`;
+                }}
+                style={toolBtn(false)}
+                title="Open the Reports / Downloads page"
+              >
+                Reports
+              </button>
+
+              <a
+                href={`${API}/api/projects/${projectId}/download?artifact=output&format=dxf`}
+                style={{
+                  ...toolBtn(false),
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  textDecoration: "none",
+                }}
+                title="Download Output DXF"
+              >
+                DXF
+              </a>
             </div>
 
             <div
