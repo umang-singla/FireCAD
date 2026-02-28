@@ -67,10 +67,6 @@ ENV ODA_PATH=/opt/oda/ODAFileConverter
 ENV QCAD_DWG2BMP=/opt/qcad/dwg2bmp
 ENV USE_QCAD_DWG2BMP=1
 ENV LD_LIBRARY_PATH=/opt/qcad
-ENV QT_PLUGIN_PATH=/opt/qcad
-ENV QT_QPA_PLATFORM_PLUGIN_PATH=/opt/qcad/platforms
-ENV QT_QPA_PLATFORM=offscreen
-ENV QT_STYLE_OVERRIDE=plastique
 
 EXPOSE 8000
 CMD ["python", "-m", "app.server"]

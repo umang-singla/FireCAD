@@ -59,9 +59,20 @@ def dwg_to_dxf(dwg_path: str, out_dir: str) -> str:
         cmd = ["xvfb-run", "-a", *base_cmd]
     logger.info("convert stage=launch status=start cmd=%s", cmd)
 
+    oda_env = os.environ.copy()
+    qt_env_removed = [
+        "QT_PLUGIN_PATH",
+        "QT_QPA_PLATFORM_PLUGIN_PATH",
+        "QT_QPA_PLATFORM",
+        "QT_STYLE_OVERRIDE",
+        "LD_PRELOAD",
+    ]
+    for key in qt_env_removed:
+        oda_env.pop(key, None)
+
     stage_ts = time.perf_counter()
     try:
-        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True, env=oda_env)
         logger.info(
             "convert stage=launch status=done code=%s elapsed=%.2fs stdout_tail=%s stderr_tail=%s",
             proc.returncode,
@@ -79,7 +90,9 @@ def dwg_to_dxf(dwg_path: str, out_dir: str) -> str:
         )
         raise RuntimeError(
             "ODA conversion failed. "
-            f"cmd={cmd}\nstdout={e.stdout}\nstderr={e.stderr}"
+            f"cmd={cmd}\n"
+            f"qt_env_removed={qt_env_removed}\n"
+            f"stdout={e.stdout}\nstderr={e.stderr}"
         ) from e
 
     # Find produced DXF
