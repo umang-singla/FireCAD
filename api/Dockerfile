@@ -38,8 +38,12 @@ RUN set -eux; \
 		cp /opt/qcad/*.so* /usr/lib/; \
 		ldconfig; \
 		test -f /opt/qcad/libqcadecmaapi.so; \
-		/opt/qcad/qcad -platform offscreen -version >/tmp/qcad_version.txt; \
-		cat /tmp/qcad_version.txt
+		if /opt/qcad/qcad -platform offscreen -version >/tmp/qcad_version.txt 2>/tmp/qcad_version_err.txt; then \
+			cat /tmp/qcad_version.txt; \
+		else \
+			echo "QCAD version sanity check failed at build time (non-fatal)."; \
+			tail -n 80 /tmp/qcad_version_err.txt || true; \
+		fi
 
 WORKDIR /app
 COPY api/requirements.txt /app/

@@ -112,12 +112,23 @@ def render_dwg_to_png_with_qcad(
     run_env = os.environ.copy()
     ld_prev = run_env.get("LD_LIBRARY_PATH", "").strip()
     run_env["LD_LIBRARY_PATH"] = f"{qcad_dir}:{ld_prev}" if ld_prev else qcad_dir
+    qcad_lib = os.path.join(qcad_dir, "libqcadecmaapi.so")
+    if os.path.exists(qcad_lib):
+        preload_prev = run_env.get("LD_PRELOAD", "").strip()
+        run_env["LD_PRELOAD"] = f"{qcad_lib}:{preload_prev}" if preload_prev else qcad_lib
     run_env.setdefault("QT_PLUGIN_PATH", os.path.join(qcad_dir, "plugins"))
     run_env.setdefault("QT_QPA_PLATFORM", "offscreen")
     run_env.setdefault("QT_STYLE_OVERRIDE", "plastique")
 
+    inline_env = []
+    if run_env.get("LD_LIBRARY_PATH"):
+        inline_env.append(f"LD_LIBRARY_PATH={run_env['LD_LIBRARY_PATH']}")
+    if run_env.get("LD_PRELOAD"):
+        inline_env.append(f"LD_PRELOAD={run_env['LD_PRELOAD']}")
+    exec_cmd = ["/usr/bin/env", *inline_env, *cmd]
+
     proc = subprocess.run(
-        cmd,
+        exec_cmd,
         check=False,
         capture_output=True,
         text=True,
@@ -142,12 +153,13 @@ def render_dwg_to_png_with_qcad(
             ]
             logger.warning(
                 "render_qcad launcher_failed retrying_direct_qcad cmd=%s rc=%s stderr_tail=%s",
-                cmd,
+                exec_cmd,
                 proc.returncode,
                 (proc.stderr or "")[-500:],
             )
+            fallback_exec_cmd = ["/usr/bin/env", *inline_env, *fallback_cmd]
             proc2 = subprocess.run(
-                fallback_cmd,
+                fallback_exec_cmd,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -159,8 +171,8 @@ def render_dwg_to_png_with_qcad(
             else:
                 raise RuntimeError(
                     "QCAD dwg2bmp failed (launcher + direct). "
-                    f"cmd={cmd}\nstdout={proc.stdout}\nstderr={proc.stderr}\n"
-                    f"fallback_cmd={fallback_cmd}\n"
+                    f"cmd={exec_cmd}\nstdout={proc.stdout}\nstderr={proc.stderr}\n"
+                    f"fallback_cmd={fallback_exec_cmd}\n"
                     f"fallback_stdout={proc2.stdout}\n"
                     f"fallback_stderr={proc2.stderr}"
                 )
@@ -168,7 +180,7 @@ def render_dwg_to_png_with_qcad(
     if proc.returncode != 0 or not os.path.exists(out_png):
         raise RuntimeError(
             "QCAD dwg2bmp failed. "
-            f"cmd={cmd}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+            f"cmd={exec_cmd}\nstdout={proc.stdout}\nstderr={proc.stderr}"
         )
 
     Image.MAX_IMAGE_PIXELS = None
