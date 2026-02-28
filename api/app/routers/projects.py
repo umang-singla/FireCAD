@@ -6,6 +6,7 @@ from app.storage import new_id, project_dir, relpath
 from app.schemas import ProjectCreate, ProjectOut, ProjectUpdateSettings
 from app.pipeline.run_pipeline import run_pipeline_for_project, continue_pipeline_after_alignment, PipelineOptions
 from app.pipeline.dxf_export import write_detectors_to_dxf
+from app.pipeline.render import render_dxf_to_png_and_mapping, render_dwg_to_png_with_qcad, write_mapping_from_dxf_and_png
 from app.routers.auth import get_current_user
 
 router = APIRouter(tags=["projects"])
@@ -230,9 +231,43 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
         out_dxf = os.path.join(project_dir(project_id), "detectors_overlay.dxf")
         write_detectors_to_dxf(dxf_path, out_dxf, dets, symbol_radius_world=150.0, text_height_world=150.0)
 
+        out_png = os.path.join(project_dir(project_id), "detectors_preview.png")
+        out_map = os.path.join(project_dir(project_id), "detectors_preview_mapping.json")
+
+        settings = json.loads(r["settings_json"] or "{}")
+        opts = PipelineOptions.from_env().merge_settings(settings)
+
+        used_qcad_preview = False
+        if os.getenv("USE_QCAD_DWG2BMP", "1").strip().lower() not in ("0", "false", "no"):
+            try:
+                render_dwg_to_png_with_qcad(
+                    dwg_path=out_dxf,
+                    out_png=out_png,
+                    background="white",
+                )
+                write_mapping_from_dxf_and_png(
+                    dxf_path=out_dxf,
+                    png_path=out_png,
+                    out_json=out_map,
+                    pad_frac=opts.pad_frac,
+                )
+                used_qcad_preview = True
+            except Exception:
+                used_qcad_preview = False
+
+        if not used_qcad_preview:
+            render_dxf_to_png_and_mapping(
+                dxf_path=out_dxf,
+                out_png=out_png,
+                out_json=out_map,
+                target_long_side_px=min(opts.target_long_side_px, 8000),
+                dpi=opts.dpi,
+                pad_frac=opts.pad_frac,
+            )
+
         con.execute(
-            "UPDATE projects SET output_dxf_path=?, status=?, error=NULL, updated_at=? WHERE id=?",
-            (out_dxf, "ready", now(), project_id),
+            "UPDATE projects SET output_dxf_path=?, output_preview_png_path=?, status=?, error=NULL, updated_at=? WHERE id=?",
+            (out_dxf, out_png, "ready", now(), project_id),
         )
         r2 = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
 

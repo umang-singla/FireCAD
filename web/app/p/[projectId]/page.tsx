@@ -293,6 +293,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
             detectors={detectors}
             projectId={projectId}
             isReady={isReady}
+            exportDxfUrl={project?.files?.output_dxf ? `${API}${project.files.output_dxf}` : null}
+            exportPngUrl={project?.files?.output_preview_png ? `${API}${project.files.output_preview_png}` : null}
             onSave={saveLayout}
             onChanged={refresh}
           />
@@ -874,13 +876,15 @@ async function uploadFile(projectId: string, e: any, refresh: ()=>void) {
 }
 
 function Editor({
-  renderUrl, mapping, detectors, projectId, isReady, onSave, onChanged
+  renderUrl, mapping, detectors, projectId, isReady, exportDxfUrl, exportPngUrl, onSave, onChanged
 }: {
   renderUrl: string;
   mapping: Mapping;
   detectors: Detector[];
   projectId: string;
   isReady: boolean;
+  exportDxfUrl: string | null;
+  exportPngUrl: string | null;
   onSave: ()=>void;
   onChanged: ()=>void;
 }) {
@@ -898,6 +902,7 @@ function Editor({
   const [hoverPoint, setHoverPoint] = useState<{px:number; py:number} | null>(null);
   const [transformState, setTransformState] = useState({ scale: 0.18, positionX: 0, positionY: 0 });
   const [isSaving, setIsSaving] = useState(false);
+  const [isExporting, setIsExporting] = useState<null | "dxf" | "png">(null);
 
   function onImageLoad(e: any) {
     const img = e.target as HTMLImageElement;
@@ -919,6 +924,80 @@ function Editor({
     } finally {
       setIsSaving(false);
     }
+  }
+
+  async function downloadFresh(url: string, filename: string) {
+    const sep = url.includes("?") ? "&" : "?";
+    const res = await fetch(`${url}${sep}ts=${Date.now()}`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`Download failed (${res.status})`);
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objectUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(objectUrl);
+  }
+
+  async function exportLatest(kind: "dxf" | "png") {
+    setIsExporting(kind);
+    try {
+      if (kind === "png") {
+        if (!imgDims) return;
+        await exportPngFromCanvas();
+        return;
+      }
+
+      const url = exportDxfUrl;
+      if (!url) return;
+      await saveEdits();
+      await downloadFresh(url, `project_${projectId}_${Date.now()}.dxf`);
+    } finally {
+      setIsExporting(null);
+    }
+  }
+
+  async function exportPngFromCanvas() {
+    if (!imgDims) return;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = imgDims.w;
+    canvas.height = imgDims.h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const sep = renderUrl.includes("?") ? "&" : "?";
+    const baseRes = await fetch(`${renderUrl}${sep}ts=${Date.now()}`, { cache: "no-store" });
+    if (!baseRes.ok) throw new Error(`Base image fetch failed (${baseRes.status})`);
+    const baseBlob = await baseRes.blob();
+    const baseBitmap = await createImageBitmap(baseBlob);
+
+    ctx.drawImage(baseBitmap, 0, 0, imgDims.w, imgDims.h);
+    baseBitmap.close();
+
+    for (const d of detectors) {
+      const p = worldToPixel(mapping, d.x, d.y);
+      drawPlacedObjectOnCanvas(ctx, d.dtype, p.px, p.py);
+      ctx.beginPath();
+      ctx.arc(p.px, p.py, 11, 0, Math.PI * 2);
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+    if (!blob) throw new Error("PNG generation failed");
+
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objectUrl;
+    a.download = `project_${projectId}_${Date.now()}.png`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(objectUrl);
   }
 
 
@@ -1072,9 +1151,29 @@ function Editor({
                 <button onClick={() => setSelectedIds([])} style={toolBtn(false)}>Clear</button>
               ) : null}
               {isReady ? (
-                <button onClick={saveEdits} style={toolBtn(true)} disabled={isSaving}>
-                  {isSaving ? "Saving..." : "Save"}
-                </button>
+                <>
+                  <button onClick={saveEdits} style={toolBtn(true)} disabled={isSaving}>
+                    {isSaving ? "Saving..." : "Save"}
+                  </button>
+                  {exportDxfUrl ? (
+                    <button
+                      onClick={() => exportLatest("dxf")}
+                      disabled={isSaving || isExporting !== null}
+                      style={{ ...toolBtn(false), textDecoration: "none", display: "inline-flex", alignItems: "center", justifyContent: "center" }}
+                    >
+                      {isExporting === "dxf" ? "Exporting DXF..." : "Export DXF"}
+                    </button>
+                  ) : null}
+                  {exportPngUrl ? (
+                    <button
+                      onClick={() => exportLatest("png")}
+                      disabled={isSaving || isExporting !== null}
+                      style={{ ...toolBtn(false), textDecoration: "none", display: "inline-flex", alignItems: "center", justifyContent: "center" }}
+                    >
+                      {isExporting === "png" ? "Exporting PNG..." : "Export PNG"}
+                    </button>
+                  ) : null}
+                </>
               ) : null}
             </div>
 
@@ -1330,6 +1429,60 @@ function renderPlacedObject(dtype: string, cx: number, cy: number) {
   }
 
   return <circle cx={cx} cy={cy} r={9} fill="#ff5a7e" opacity={0.96} />;
+}
+
+function drawPlacedObjectOnCanvas(ctx: CanvasRenderingContext2D, dtype: string, cx: number, cy: number) {
+  const key = (dtype || "").toLowerCase();
+
+  if (key === "panel") {
+    ctx.fillStyle = "#ffd166";
+    ctx.fillRect(cx - 9, cy - 9, 18, 18);
+    ctx.fillStyle = "#e8b347";
+    ctx.fillRect(cx - 5.5, cy - 5.5, 11, 11);
+    ctx.beginPath();
+    ctx.arc(cx, cy, 2, 0, Math.PI * 2);
+    ctx.fillStyle = "#7a5300";
+    ctx.fill();
+    return;
+  }
+
+  if (key === "hooter") {
+    ctx.beginPath();
+    ctx.moveTo(cx - 7, cy + 1);
+    ctx.lineTo(cx - 1, cy - 3);
+    ctx.lineTo(cx - 1, cy + 5);
+    ctx.closePath();
+    ctx.fillStyle = "#c77dff";
+    ctx.fill();
+
+    ctx.strokeStyle = "#f3e7ff";
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.quadraticCurveTo(cx + 6, cy, cx + 1, cy + 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx + 3, cy - 4);
+    ctx.quadraticCurveTo(cx + 10, cy, cx + 3, cy + 4);
+    ctx.stroke();
+    return;
+  }
+
+  if (key === "mcb") {
+    ctx.fillStyle = "#4ecdc4";
+    ctx.fillRect(cx - 8, cy - 9, 16, 18);
+    ctx.fillStyle = "#0f4f4a";
+    ctx.fillRect(cx - 3.5, cy - 5.5, 7, 11);
+    ctx.beginPath();
+    ctx.arc(cx, cy + 3.5, 1.2, 0, Math.PI * 2);
+    ctx.fillStyle = "#9ff3eb";
+    ctx.fill();
+    return;
+  }
+
+  ctx.beginPath();
+  ctx.arc(cx, cy, 9, 0, Math.PI * 2);
+  ctx.fillStyle = "#ff5a7e";
+  ctx.fill();
 }
 
 function objectLabel(dtype: ObjectType): string {
