@@ -126,15 +126,16 @@ def render_dwg_to_png_with_qcad(
         "/usr/lib/x86_64-linux-gnu/libqcadecmaapi.so",
     ]
     qcad_lib = next((p for p in qcad_lib_candidates if os.path.exists(p)), None)
-    if qcad_lib:
-        preload_prev = run_env.get("LD_PRELOAD", "").strip()
-        run_env["LD_PRELOAD"] = f"{qcad_lib}:{preload_prev}" if preload_prev else qcad_lib
-    else:
+    if not qcad_lib:
         logger.warning(
             "render_qcad shared library not found candidates=%s qcad_dir=%s",
             qcad_lib_candidates,
             qcad_dir,
         )
+    force_preload = os.getenv("QCAD_FORCE_PRELOAD", "0").strip().lower() in ("1", "true", "yes")
+    if qcad_lib and force_preload:
+        preload_prev = run_env.get("LD_PRELOAD", "").strip()
+        run_env["LD_PRELOAD"] = f"{qcad_lib}:{preload_prev}" if preload_prev else qcad_lib
     run_env.setdefault("QT_PLUGIN_PATH", qcad_dir)
     run_env.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", os.path.join(qcad_dir, "platforms"))
     run_env.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -145,7 +146,25 @@ def render_dwg_to_png_with_qcad(
         inline_env.append(f"LD_LIBRARY_PATH={run_env['LD_LIBRARY_PATH']}")
     if run_env.get("LD_PRELOAD"):
         inline_env.append(f"LD_PRELOAD={run_env['LD_PRELOAD']}")
-    exec_cmd = ["/usr/bin/env", *inline_env, *cmd]
+    qcad_bin = os.path.join(qcad_dir, "qcad-bin")
+    dwg2bmp_js = os.path.join(qcad_dir, "scripts", "Pro", "Tools", "Dwg2Bmp", "Dwg2Bmp.js")
+
+    using_direct_qcad = os.path.exists(qcad_bin) and os.path.exists(dwg2bmp_js)
+    if using_direct_qcad:
+        primary_cmd = [
+            qcad_bin,
+            "-no-dock-icon",
+            "-no-gui",
+            "-allow-multiple-instances",
+            "-autostart",
+            dwg2bmp_js,
+            exe,
+            *cmd[1:],
+        ]
+    else:
+        primary_cmd = cmd
+
+    exec_cmd = ["/usr/bin/env", *inline_env, *primary_cmd]
 
     proc = subprocess.run(
         exec_cmd,
@@ -157,10 +176,10 @@ def render_dwg_to_png_with_qcad(
     )
 
     if proc.returncode != 0 or not os.path.exists(out_png):
-        # Fallback: bypass shell launchers and invoke qcad-bin directly.
-        qcad_bin = os.path.join(qcad_dir, "qcad-bin")
-        dwg2bmp_js = os.path.join(qcad_dir, "scripts", "Pro", "Tools", "Dwg2Bmp", "Dwg2Bmp.js")
-        if os.path.exists(qcad_bin) and os.path.exists(dwg2bmp_js):
+        # Fallback: switch launch strategy between direct qcad-bin and wrapper.
+        if using_direct_qcad:
+            fallback_cmd = cmd
+        elif os.path.exists(qcad_bin) and os.path.exists(dwg2bmp_js):
             fallback_cmd = [
                 qcad_bin,
                 "-no-dock-icon",
@@ -171,6 +190,10 @@ def render_dwg_to_png_with_qcad(
                 exe,
                 *cmd[1:],
             ]
+        else:
+            fallback_cmd = None
+
+        if fallback_cmd is not None:
             logger.warning(
                 "render_qcad launcher_failed retrying_direct_qcad cmd=%s rc=%s stderr_tail=%s",
                 exec_cmd,
