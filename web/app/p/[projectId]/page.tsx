@@ -1,6 +1,6 @@
 "use client";
 
-import { use, useEffect, useState } from "react";
+import { use, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
 
@@ -23,6 +23,15 @@ type Detector = {
   dtype: string;
   locked: boolean;
 };
+
+type UndoAction =
+  | { kind: "add"; detectorId: string }
+  | { kind: "delete"; detector: Detector }
+  | {
+      kind: "move";
+      before: Record<string, { x: number; y: number; z: number }>;
+      after: Record<string, { x: number; y: number; z: number }>;
+    };
 
 type ObjectType = "smoke" | "panel" | "hooter" | "mcb";
 
@@ -479,20 +488,70 @@ function Editor({
   const [transformState, setTransformState] = useState({ scale: 0.18, positionX: 0, positionY: 0 });
   const [isSaving, setIsSaving] = useState(false);
 
+const [undoStack, setUndoStack] = useState<UndoAction[]>([]);
+const undoStackRef = useRef<UndoAction[]>([]);
+const [isUndoing, setIsUndoing] = useState(false);
+
+useEffect(() => {
+  undoStackRef.current = undoStack;
+}, [undoStack]);
+
+function pushUndo(action: UndoAction) {
+  const MAX_UNDO = 100;
+  setUndoStack((prev) => {
+    const next = [...prev, action];
+    return next.length > MAX_UNDO ? next.slice(next.length - MAX_UNDO) : next;
+  });
+}
+
+function remapUndoStack(stack: UndoAction[], oldId: string, newId: string): UndoAction[] {
+  const renameRecord = (rec: Record<string, { x: number; y: number; z: number }>) => {
+    const out: Record<string, { x: number; y: number; z: number }> = {};
+    for (const [k, v] of Object.entries(rec)) {
+      out[k === oldId ? newId : k] = v;
+    }
+    return out;
+  };
+
+  return stack.map((a) => {
+    if (a.kind === "add") {
+      return a.detectorId === oldId ? { ...a, detectorId: newId } : a;
+    }
+    if (a.kind === "delete") {
+      return a.detector?.id === oldId ? { ...a, detector: { ...a.detector, id: newId } } : a;
+    }
+    if (a.kind === "move") {
+      return {
+        ...a,
+        before: renameRecord(a.before),
+        after: renameRecord(a.after),
+      };
+    }
+    return a;
+  });
+}
+
+
   function onImageLoad(e: any) {
     const img = e.target as HTMLImageElement;
     setImgDims({ w: img.naturalWidth, h: img.naturalHeight });
   }
 
   async function addDetectorAt(px: number, py: number) {
-    const w = pixelToWorld(mapping, px, py);
-    await fetch(`${API}/api/projects/${projectId}/detectors`, {
-      method:"POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ x: w.x, y: w.y, z: 0, dtype:addType })
-    });
-    onChanged();
+  const w = pixelToWorld(mapping, px, py);
+  const res = await fetch(`${API}/api/projects/${projectId}/detectors`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ x: w.x, y: w.y, z: 0, dtype: addType }),
+  });
+  const created: Detector = await res.json();
+  if (created?.id) {
+    pushUndo({ kind: "add", detectorId: created.id });
+    setSelectedIds([created.id]);
   }
+  onChanged();
+}
+
   async function saveEdits() {
     setIsSaving(true);
     try {
@@ -503,31 +562,153 @@ function Editor({
   }
 
 
-  async function patchDetectorTo(detId: string, px: number, py: number) {
-    const w = pixelToWorld(mapping, px, py);
-    await fetch(`${API}/api/detectors/${detId}`, {
-      method:"PATCH",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ x: w.x, y: w.y, z: 0 })
-    });
-  }
+  async function patchDetectorWorld(
+  detId: string,
+  x: number,
+  y: number,
+  z: number = 0,
+  extra?: { dtype?: string; locked?: boolean }
+) {
+  const payload: any = { x, y, z };
+  if (extra?.dtype !== undefined) payload.dtype = extra.dtype;
+  if (extra?.locked !== undefined) payload.locked = extra.locked;
+
+  await fetch(`${API}/api/detectors/${detId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+async function patchDetectorTo(detId: string, px: number, py: number) {
+  const w = pixelToWorld(mapping, px, py);
+  await patchDetectorWorld(detId, w.x, w.y, 0);
+}
+
+
 
   async function moveDetectorTo(detId: string, px: number, py: number) {
     await patchDetectorTo(detId, px, py);
     onChanged();
   }
 
-  async function moveDetectorsToMany(nextPxById: Record<string, {px:number; py:number}>) {
-    const entries = Object.entries(nextPxById);
-    if (!entries.length) return;
-    await Promise.all(entries.map(([detId, pt]) => patchDetectorTo(detId, pt.px, pt.py)));
-    onChanged();
+  async function moveDetectorsToMany(nextPxById: Record<string, { px: number; py: number }>) {
+  const entries = Object.entries(nextPxById);
+  if (!entries.length) return;
+
+  const before: Record<string, { x: number; y: number; z: number }> = {};
+  const after: Record<string, { x: number; y: number; z: number }> = {};
+
+  for (const [detId, pt] of entries) {
+    const existing = detectors.find((d) => d.id === detId);
+    if (existing) {
+      before[detId] = { x: existing.x, y: existing.y, z: existing.z };
+    }
+    const w = pixelToWorld(mapping, pt.px, pt.py);
+    after[detId] = { x: w.x, y: w.y, z: 0 };
   }
 
-  async function deleteDetector(detId: string) {
-    await fetch(`${API}/api/detectors/${detId}`, { method:"DELETE" });
-    onChanged();
+  await Promise.all(entries.map(([detId, pt]) => patchDetectorTo(detId, pt.px, pt.py)));
+  if (Object.keys(before).length) {
+    pushUndo({ kind: "move", before, after });
   }
+  onChanged();
+}
+
+
+  async function deleteDetector(detId: string) {
+  const existing = detectors.find((d) => d.id === detId) || null;
+  await fetch(`${API}/api/detectors/${detId}`, { method: "DELETE" });
+  if (existing) {
+    pushUndo({ kind: "delete", detector: existing });
+  }
+  setSelectedIds((prev) => prev.filter((id) => id !== detId));
+  onChanged();
+}
+
+async function undoLast() {
+  if (isUndoing) return;
+
+  // If user is mid-gesture (marquee/drag), treat undo as "cancel gesture" first.
+  if (marquee || groupDrag || groupPreview) {
+    setMarquee(null);
+    setGroupDrag(null);
+    setGroupPreview(null);
+    return;
+  }
+
+  const stack = undoStackRef.current;
+  if (!stack.length) return;
+
+  const action = stack[stack.length - 1];
+  let remaining = stack.slice(0, -1);
+
+  setIsUndoing(true);
+  try {
+    if (action.kind === "add") {
+      await fetch(`${API}/api/detectors/${action.detectorId}`, { method: "DELETE" });
+      setSelectedIds((prev) => prev.filter((id) => id !== action.detectorId));
+    } else if (action.kind === "delete") {
+      const det = action.detector;
+      const res = await fetch(`${API}/api/projects/${projectId}/detectors`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ x: det.x, y: det.y, z: det.z ?? 0, dtype: det.dtype }),
+      });
+      const created: Detector = await res.json();
+
+      if (created?.id) {
+        // Remap older undo actions so chains like "move -> delete -> undo delete -> undo move" still work.
+        remaining = remapUndoStack(remaining, det.id, created.id);
+
+        // Preserve locked flag if needed (create doesn't accept locked).
+        if (det.locked) {
+          await patchDetectorWorld(created.id, det.x, det.y, det.z ?? 0, { locked: true, dtype: det.dtype });
+        }
+
+        setSelectedIds([created.id]);
+      }
+    } else if (action.kind === "move") {
+      const entries = Object.entries(action.before);
+      if (entries.length) {
+        await Promise.all(entries.map(([detId, pos]) => patchDetectorWorld(detId, pos.x, pos.y, pos.z ?? 0)));
+      }
+    }
+
+    onChanged();
+  } catch (err) {
+    console.error("Undo failed:", err);
+  } finally {
+    setUndoStack(remaining);
+    setIsUndoing(false);
+  }
+}
+
+useEffect(() => {
+  function onKeyDown(e: KeyboardEvent) {
+    const isZ = e.key === "z" || e.key === "Z";
+    const mod = e.metaKey || e.ctrlKey;
+    if (!isZ || !mod || e.shiftKey) return;
+
+    const target = e.target as HTMLElement | null;
+    const tag = (target?.tagName || "").toLowerCase();
+    const isTyping =
+      tag === "input" ||
+      tag === "textarea" ||
+      tag === "select" ||
+      Boolean((target as any)?.isContentEditable);
+
+    if (isTyping) return;
+
+    e.preventDefault();
+    undoLast();
+  }
+
+  window.addEventListener("keydown", onKeyDown);
+  return () => window.removeEventListener("keydown", onKeyDown);
+}, [undoStack, isUndoing, marquee, groupDrag, groupPreview]);
+
+
 
   function toImagePoint(e: any): { px: number; py: number } | null {
     if (!imgDims) return null;
@@ -587,6 +768,8 @@ function Editor({
     return null;
   }
 
+  const canUndo = undoStack.length > 0;
+
   return (
     <div style={{ position:"absolute", inset: 0, padding: "10px" }}>
       <TransformWrapper
@@ -624,6 +807,14 @@ function Editor({
                 backdropFilter: "blur(8px)"
               }}
             >
+              <button
+  onClick={undoLast}
+  style={{ ...toolBtn(false, !canUndo || isUndoing), minWidth: 38 }}
+  disabled={!canUndo || isUndoing}
+  title="Undo (Ctrl+Z / ⌘Z)"
+>
+  ↶
+</button>
               <button onClick={() => setTool("select")} style={toolBtn(tool === "select")}>Select</button>
               <button onClick={() => setTool("add")} style={toolBtn(tool === "add")}>Add</button>
               <button onClick={() => setTool("erase")} style={toolBtn(tool === "erase")}>Erase</button>
@@ -654,7 +845,7 @@ function Editor({
                 <button onClick={() => setSelectedIds([])} style={toolBtn(false)}>Clear</button>
               ) : null}
               {isReady ? (
-                <button onClick={saveEdits} style={toolBtn(true)} disabled={isSaving}>
+                <button onClick={saveEdits} style={toolBtn(true, isSaving)} disabled={isSaving}>
                   {isSaving ? "Saving..." : "Save"}
                 </button>
               ) : null}
@@ -879,20 +1070,26 @@ const zoomBtn: CSSProperties = {
   fontWeight: 600
 };
 
-function toolBtn(active: boolean): CSSProperties {
+function toolBtn(active: boolean, disabled = false): CSSProperties {
   return {
     borderRadius: 10,
-    border: active ? "1px solid rgba(127, 148, 255, 0.82)" : "1px solid rgba(255,255,255,0.2)",
-    background: active ? "linear-gradient(180deg, #697bff 0%, #5668f1 100%)" : "rgba(18, 24, 44, 0.9)",
+    border: active
+      ? "1px solid rgba(127, 148, 255, 0.82)"
+      : "1px solid rgba(255,255,255,0.2)",
+    background: active
+      ? "linear-gradient(180deg, #697bff 0%, #5668f1 100%)"
+      : "rgba(18, 24, 44, 0.9)",
     color: "#f4f7ff",
     height: 30,
     minWidth: 56,
     padding: "0 10px",
-    cursor: "pointer",
+    cursor: disabled ? "not-allowed" : "pointer",
+    opacity: disabled ? 0.55 : 1,
     fontSize: 12,
-    fontWeight: 600
+    fontWeight: 600,
   };
 }
+
 
 function objectFill(dtype: string): string {
   const key = (dtype || "").toLowerCase();
