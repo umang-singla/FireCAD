@@ -5,7 +5,20 @@ import type { CSSProperties } from "react";
 import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
 import { getToken } from "../../lib/auth";
 
-const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
+
+function resolveApiBase() {
+  if (API_BASE) return API_BASE;
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    if (host === "localhost" || host === "127.0.0.1") {
+      return "http://localhost:8000";
+    }
+  }
+  return "";
+}
+
+const apiUrl = (path: string) => `${resolveApiBase()}${path}`;
 
 async function authFetch(path: string, init?: RequestInit) {
   const token = getToken();
@@ -19,7 +32,7 @@ async function authFetch(path: string, init?: RequestInit) {
   }
   if (token) headers.Authorization = `Bearer ${token}`;
 
-  const res = await fetch(`${API}${path}`, { ...init, headers });
+  const res = await fetch(apiUrl(path), { ...init, headers });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `Request failed (${res.status})`);
@@ -94,7 +107,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
 
     const mappingUrl = p.files?.output_preview_mapping || p.files?.mapping_json;
     if (mappingUrl) {
-      const mj: Mapping = await (await fetch(`${API}${mappingUrl}`)).json();
+      const mj: Mapping = await (await fetch(apiUrl(mappingUrl))).json();
       setMapping(mj);
     } else {
       setMapping(null);
@@ -252,7 +265,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
 
             <div style={{ marginTop: 12, display:"flex", gap: 8 }}>
               {project?.files?.output_dxf ? (
-                <a href={`${API}${project.files.output_dxf}`} style={{ ...btn(true), textDecoration:"none", display:"inline-flex", alignItems:"center", justifyContent:"center" }}>
+                <a href={apiUrl(project.files.output_dxf)} style={{ ...btn(true), textDecoration:"none", display:"inline-flex", alignItems:"center", justifyContent:"center" }}>
                   Download output DXF
                 </a>
               ) : null}
@@ -271,8 +284,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
         {isAwaitingAlignmentReview ? (
           project?.files?.aligned_mask && project?.files?.render_png ? (
             <AlignmentReview
-              originalUrl={`${API}${project.files.render_png}`}
-              alignedUrl={`${API}${project.files.aligned_mask}`}
+              originalUrl={apiUrl(project.files.render_png)}
+              alignedUrl={apiUrl(project.files.aligned_mask)}
               onContinue={continuePipelineAfterAlignment}
             />
           ) : (
@@ -288,13 +301,13 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           </div>
         ) : (
           <Editor
-            renderUrl={`${API}${project.files.render_png}`}
+            renderUrl={apiUrl(project.files.render_png)}
             mapping={mapping}
             detectors={detectors}
             projectId={projectId}
             isReady={isReady}
-            exportDxfUrl={project?.files?.output_dxf ? `${API}${project.files.output_dxf}` : null}
-            exportPngUrl={project?.files?.output_preview_png ? `${API}${project.files.output_preview_png}` : null}
+            exportDxfUrl={project?.files?.output_dxf ? apiUrl(project.files.output_dxf) : null}
+            exportPngUrl={project?.files?.output_preview_png ? apiUrl(project.files.output_preview_png) : null}
             onSave={saveLayout}
             onChanged={refresh}
           />

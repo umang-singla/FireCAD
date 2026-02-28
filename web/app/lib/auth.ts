@@ -1,4 +1,17 @@
-const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
+
+function resolveApiBase() {
+  if (API_BASE) return API_BASE;
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    if (host === "localhost" || host === "127.0.0.1") {
+      return "http://localhost:8000";
+    }
+  }
+  return "";
+}
+
+const apiUrl = (path: string) => `${resolveApiBase()}${path}`;
 
 const TOKEN_KEY = "firecad_token";
 const NAME_KEY = "firecad_name";
@@ -64,7 +77,7 @@ async function apiJson(path: string, init?: RequestInit) {
   };
   if (token) headers.Authorization = `Bearer ${token}`;
 
-  const res = await fetch(`${API}${path}`, { ...init, headers });
+  const res = await fetch(apiUrl(path), { ...init, headers });
 
   const text = await res.text();
   let json: any = null;
