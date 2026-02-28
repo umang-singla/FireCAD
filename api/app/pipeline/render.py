@@ -110,12 +110,31 @@ def render_dwg_to_png_with_qcad(
         resolution or "auto",
     )
     run_env = os.environ.copy()
+    ld_parts = [qcad_dir, "/usr/lib", "/usr/lib/x86_64-linux-gnu"]
     ld_prev = run_env.get("LD_LIBRARY_PATH", "").strip()
-    run_env["LD_LIBRARY_PATH"] = f"{qcad_dir}:{ld_prev}" if ld_prev else qcad_dir
-    qcad_lib = os.path.join(qcad_dir, "libqcadecmaapi.so")
-    if os.path.exists(qcad_lib):
+    if ld_prev:
+        ld_parts.extend([p for p in ld_prev.split(":") if p])
+    dedup_ld_parts = []
+    for part in ld_parts:
+        if part and part not in dedup_ld_parts:
+            dedup_ld_parts.append(part)
+    run_env["LD_LIBRARY_PATH"] = ":".join(dedup_ld_parts)
+
+    qcad_lib_candidates = [
+        os.path.join(qcad_dir, "libqcadecmaapi.so"),
+        "/usr/lib/libqcadecmaapi.so",
+        "/usr/lib/x86_64-linux-gnu/libqcadecmaapi.so",
+    ]
+    qcad_lib = next((p for p in qcad_lib_candidates if os.path.exists(p)), None)
+    if qcad_lib:
         preload_prev = run_env.get("LD_PRELOAD", "").strip()
         run_env["LD_PRELOAD"] = f"{qcad_lib}:{preload_prev}" if preload_prev else qcad_lib
+    else:
+        logger.warning(
+            "render_qcad shared library not found candidates=%s qcad_dir=%s",
+            qcad_lib_candidates,
+            qcad_dir,
+        )
     run_env.setdefault("QT_PLUGIN_PATH", os.path.join(qcad_dir, "plugins"))
     run_env.setdefault("QT_QPA_PLATFORM", "offscreen")
     run_env.setdefault("QT_STYLE_OVERRIDE", "plastique")
@@ -180,7 +199,10 @@ def render_dwg_to_png_with_qcad(
     if proc.returncode != 0 or not os.path.exists(out_png):
         raise RuntimeError(
             "QCAD dwg2bmp failed. "
-            f"cmd={exec_cmd}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+            f"cmd={exec_cmd}\n"
+            f"qcad_lib_candidates={qcad_lib_candidates}\n"
+            f"qcad_lib_selected={qcad_lib}\n"
+            f"stdout={proc.stdout}\nstderr={proc.stderr}"
         )
 
     Image.MAX_IMAGE_PIXELS = None

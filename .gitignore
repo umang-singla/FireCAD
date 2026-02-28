@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 venv/
 .env
+!qcad-3.32.6-trial-linux-x86_64/*.so*
 
 # Node
 node_modules/

@@ -38,13 +38,10 @@ RUN set -eux; \
 			for f in /opt/qcad/dwg2bmp /opt/qcad/qcad-bin /opt/qcad/qcad; do \
 				if [ -f "$f" ]; then chmod +x "$f"; fi; \
 			done; \
+			test -f /opt/qcad/libqcadecmaapi.so || (echo "ERROR: /opt/qcad/libqcadecmaapi.so missing. Ensure QCAD .so files are committed to repository." >&2; exit 1); \
 			find /opt/qcad -maxdepth 1 -type f -name '*.so*' -exec cp {} /usr/lib/ \; ; \
 			ldconfig; \
-			if [ -f /opt/qcad/libqcadecmaapi.so ]; then \
-				echo "QCAD core library found."; \
-			else \
-				echo "QCAD core library missing at build time (non-fatal)."; \
-			fi; \
+			echo "QCAD core library found."; \
 			if [ -x /opt/qcad/qcad ]; then \
 				if /opt/qcad/qcad -platform offscreen -version >/tmp/qcad_version.txt 2>/tmp/qcad_version_err.txt; then \
 					cat /tmp/qcad_version.txt; \
