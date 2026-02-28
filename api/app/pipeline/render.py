@@ -135,7 +135,8 @@ def render_dwg_to_png_with_qcad(
             qcad_lib_candidates,
             qcad_dir,
         )
-    run_env.setdefault("QT_PLUGIN_PATH", os.path.join(qcad_dir, "plugins"))
+    run_env.setdefault("QT_PLUGIN_PATH", qcad_dir)
+    run_env.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", os.path.join(qcad_dir, "platforms"))
     run_env.setdefault("QT_QPA_PLATFORM", "offscreen")
     run_env.setdefault("QT_STYLE_OVERRIDE", "plastique")
 
