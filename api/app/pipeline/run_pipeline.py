@@ -108,7 +108,10 @@ def _run_post_alignment_steps(
     out_png = os.path.join(pdir, "detectors_preview.png")
     out_map = os.path.join(pdir, "detectors_preview_mapping.json")
     used_qcad_preview = False
-    if os.getenv("USE_QCAD_DWG2BMP", "1").strip().lower() not in ("0", "false", "no"):
+    qcad_enabled = os.getenv("USE_QCAD_DWG2BMP", "1").strip().lower() not in ("0", "false", "no")
+    qcad_exe = os.getenv("QCAD_DWG2BMP", "/opt/qcad/dwg2bmp")
+    qcad_available = os.path.exists(qcad_exe)
+    if qcad_enabled and qcad_available:
         try:
             render_dwg_to_png_with_qcad(
                 dwg_path=out_dxf,
@@ -124,6 +127,12 @@ def _run_post_alignment_steps(
             used_qcad_preview = True
         except Exception:
             logger.exception("pipeline project=%s stage=render_output_preview renderer=qcad status=failed fallback=ezdxf", project_id)
+    elif qcad_enabled and not qcad_available:
+        logger.info(
+            "pipeline project=%s stage=render_output_preview renderer=qcad status=skipped reason=missing_binary path=%s fallback=ezdxf",
+            project_id,
+            qcad_exe,
+        )
 
     if not used_qcad_preview:
         render_dxf_to_png_and_mapping(
@@ -199,7 +208,10 @@ def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
         render_png = os.path.join(pdir, "render.png")
         mapping_json = os.path.join(pdir, "mapping.json")
         used_qcad = False
-        if ext == ".dwg" and os.getenv("USE_QCAD_DWG2BMP", "1").strip().lower() not in ("0", "false", "no"):
+        qcad_enabled = os.getenv("USE_QCAD_DWG2BMP", "1").strip().lower() not in ("0", "false", "no")
+        qcad_exe = os.getenv("QCAD_DWG2BMP", "/opt/qcad/dwg2bmp")
+        qcad_available = os.path.exists(qcad_exe)
+        if ext == ".dwg" and qcad_enabled and qcad_available:
             try:
                 render_dwg_to_png_with_qcad(
                     dwg_path=in_path,
@@ -215,6 +227,12 @@ def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
                 used_qcad = True
             except Exception:
                 logger.exception("pipeline project=%s stage=render_input renderer=qcad status=failed fallback=ezdxf", project_id)
+        elif ext == ".dwg" and qcad_enabled and not qcad_available:
+            logger.info(
+                "pipeline project=%s stage=render_input renderer=qcad status=skipped reason=missing_binary path=%s fallback=ezdxf",
+                project_id,
+                qcad_exe,
+            )
 
         if not used_qcad:
             render_dxf_to_png_and_mapping(
