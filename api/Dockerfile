@@ -36,7 +36,10 @@ COPY qcad-3.32.6-trial-linux-x86_64 /opt/qcad
 RUN set -eux; \
 		chmod +x /opt/qcad/dwg2bmp /opt/qcad/qcad-bin /opt/qcad/qcad; \
 		cp /opt/qcad/*.so* /usr/lib/; \
-		ldconfig
+		ldconfig; \
+		test -f /opt/qcad/libqcadecmaapi.so; \
+		/opt/qcad/qcad -platform offscreen -version >/tmp/qcad_version.txt; \
+		cat /tmp/qcad_version.txt
 
 WORKDIR /app
 COPY api/requirements.txt /app/
