@@ -56,6 +56,94 @@ def _centroid(poly_world: list[list[float]]):
     xs = [p[0] for p in poly_world]; ys = [p[1] for p in poly_world]
     return (sum(xs)/len(xs), sum(ys)/len(ys))
 
+def _run_post_alignment_steps(
+    project_id: str,
+    opts: PipelineOptions,
+    pdir: str,
+    dxf_path: str,
+    mapping_json: str,
+    aligned_mask_path: str,
+    stage_start,
+    stage_done,
+):
+    # 5) Fix/solidify walls
+    stage_ts = time.perf_counter()
+    stage_start("fix_walls")
+    fixed = os.path.join(pdir, "ultimate_fixed_wall.png")
+    fix_walls(aligned_mask_path, fixed, thickness=2)
+    stage_done("fix_walls", stage_ts, fixed=fixed)
+    with db() as con:
+        _set_project(con, project_id, fixed_wall_path=fixed, status="walls_fixed")
+
+    # 6) Extract rooms
+    stage_ts = time.perf_counter()
+    stage_start("extract_rooms")
+    rooms_json = os.path.join(pdir, "rooms_from_image.json")
+    debug_rooms = os.path.join(pdir, "rooms_debug.png")
+    rooms = extract_rooms(fixed, mapping_json, rooms_json, debug_png_path=debug_rooms)
+    stage_done("extract_rooms", stage_ts, rooms=len(rooms), rooms_json=rooms_json)
+    with db() as con:
+        _set_project(con, project_id, rooms_json_path=rooms_json, status="rooms_extracted")
+
+    # 7) Autoplace detectors
+    stage_ts = time.perf_counter()
+    stage_start("place_detectors")
+    placed, _regions = place_detectors_from_rooms_json(rooms, opts.detector_spacing_m, opts.wall_buffer_m, opts.world_to_m)
+    import uuid
+    dets = [{"id": str(uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0, "dtype": "smoke", "locked": 0} for (x,y) in placed]
+    with db() as con:
+        _replace_detectors(con, project_id, dets)
+    stage_done("place_detectors", stage_ts, detectors=len(dets))
+
+    # 8) Export DXF with detectors
+    stage_ts = time.perf_counter()
+    stage_start("export_dxf")
+    out_dxf = os.path.join(pdir, "detectors_overlay.dxf")
+    write_detectors_to_dxf(dxf_path, out_dxf, dets, symbol_radius_world=150.0, text_height_world=150.0)
+    stage_done("export_dxf", stage_ts, out_dxf=out_dxf)
+
+    # 9) Render output preview PNG
+    stage_ts = time.perf_counter()
+    stage_start("render_output_preview")
+    out_png = os.path.join(pdir, "detectors_preview.png")
+    out_map = os.path.join(pdir, "detectors_preview_mapping.json")
+    used_qcad_preview = False
+    if os.getenv("USE_QCAD_DWG2BMP", "1").strip().lower() not in ("0", "false", "no"):
+        try:
+            render_dwg_to_png_with_qcad(
+                dwg_path=out_dxf,
+                out_png=out_png,
+                background="white",
+            )
+            write_mapping_from_dxf_and_png(
+                dxf_path=out_dxf,
+                png_path=out_png,
+                out_json=out_map,
+                pad_frac=opts.pad_frac,
+            )
+            used_qcad_preview = True
+        except Exception:
+            logger.exception("pipeline project=%s stage=render_output_preview renderer=qcad status=failed fallback=ezdxf", project_id)
+
+    if not used_qcad_preview:
+        render_dxf_to_png_and_mapping(
+            dxf_path=out_dxf,
+            out_png=out_png,
+            out_json=out_map,
+            target_long_side_px=min(opts.target_long_side_px, 8000),
+            dpi=opts.dpi,
+            pad_frac=opts.pad_frac,
+        )
+
+    stage_done("render_output_preview", stage_ts, out_png=out_png, renderer=("qcad" if used_qcad_preview else "ezdxf"))
+
+    with db() as con:
+        _set_project(con, project_id,
+                     status="ready",
+                     output_dxf_path=out_dxf,
+                     output_preview_png_path=out_png,
+                     error=None)
+
 def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
     start_ts = time.perf_counter()
 
@@ -187,85 +275,10 @@ def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
         with db() as con:
             _set_project(con, project_id, aligned_mask_path=aligned, status="aligned")
 
-        # 5) Fix/solidify walls
-        stage_ts = time.perf_counter()
-        stage_start("fix_walls")
-        fixed = os.path.join(pdir, "ultimate_fixed_wall.png")
-        fix_walls(aligned, fixed, thickness=2)
-        stage_done("fix_walls", stage_ts, fixed=fixed)
         with db() as con:
-            _set_project(con, project_id, fixed_wall_path=fixed, status="walls_fixed")
-
-        # 6) Extract rooms
-        stage_ts = time.perf_counter()
-        stage_start("extract_rooms")
-        rooms_json = os.path.join(pdir, "rooms_from_image.json")
-        debug_rooms = os.path.join(pdir, "rooms_debug.png")
-        rooms = extract_rooms(fixed, mapping_json, rooms_json, debug_png_path=debug_rooms)
-        stage_done("extract_rooms", stage_ts, rooms=len(rooms), rooms_json=rooms_json)
-        with db() as con:
-            _set_project(con, project_id, rooms_json_path=rooms_json, status="rooms_extracted")
-
-        # 7) Autoplace detectors (MVP centroid-based; plug your advanced logic here)
-        stage_ts = time.perf_counter()
-        stage_start("place_detectors")
-        placed, _regions = place_detectors_from_rooms_json(rooms, opts.detector_spacing_m, opts.wall_buffer_m, opts.world_to_m)
-        import uuid
-        dets = [{"id": str(uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0, "dtype": "smoke", "locked": 0} for (x,y) in placed]
-        with db() as con:
-            _replace_detectors(con, project_id, dets)
-        stage_done("place_detectors", stage_ts, detectors=len(dets))
-
-        # 8) Export DXF with detectors
-        stage_ts = time.perf_counter()
-        stage_start("export_dxf")
-        out_dxf = os.path.join(pdir, "detectors_overlay.dxf")
-        write_detectors_to_dxf(dxf_path, out_dxf, dets, symbol_radius_world=150.0, text_height_world=150.0)
-        stage_done("export_dxf", stage_ts, out_dxf=out_dxf)
-
-        # 9) Render output preview PNG
-        stage_ts = time.perf_counter()
-        stage_start("render_output_preview")
-        out_png = os.path.join(pdir, "detectors_preview.png")
-        out_map = os.path.join(pdir, "detectors_preview_mapping.json")
-        used_qcad_preview = False
-        if os.getenv("USE_QCAD_DWG2BMP", "1").strip().lower() not in ("0", "false", "no"):
-            try:
-                render_dwg_to_png_with_qcad(
-                    dwg_path=out_dxf,
-                    out_png=out_png,
-                    background="white",
-                )
-                write_mapping_from_dxf_and_png(
-                    dxf_path=out_dxf,
-                    png_path=out_png,
-                    out_json=out_map,
-                    pad_frac=opts.pad_frac,
-                )
-                used_qcad_preview = True
-            except Exception:
-                logger.exception("pipeline project=%s stage=render_output_preview renderer=qcad status=failed fallback=ezdxf", project_id)
-
-        if not used_qcad_preview:
-            render_dxf_to_png_and_mapping(
-                dxf_path=out_dxf,
-                out_png=out_png,
-                out_json=out_map,
-                target_long_side_px=min(opts.target_long_side_px, 8000),
-                dpi=opts.dpi,
-                pad_frac=opts.pad_frac,
-            )
-
-        stage_done("render_output_preview", stage_ts, out_png=out_png, renderer=("qcad" if used_qcad_preview else "ezdxf"))
-
-        with db() as con:
-            _set_project(con, project_id,
-                         status="ready",
-                         output_dxf_path=out_dxf,
-                         output_preview_png_path=out_png,
-                         error=None)
+            _set_project(con, project_id, status="awaiting_alignment_review", error=None)
         logger.info(
-            "pipeline project=%s status=ready total_elapsed=%.2fs",
+            "pipeline project=%s status=awaiting_alignment_review total_elapsed=%.2fs",
             project_id,
             time.perf_counter() - start_ts,
         )
@@ -273,5 +286,71 @@ def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
     except Exception as e:
         err = f"{e}\n\n{traceback.format_exc()}"
         logger.exception("pipeline project=%s status=failed", project_id)
+        with db() as con:
+            _set_project(con, project_id, status="failed", error=err)
+
+def continue_pipeline_after_alignment(project_id: str, opts: PipelineOptions):
+    start_ts = time.perf_counter()
+
+    def stage_start(name: str):
+        logger.info("pipeline-continue project=%s stage=%s status=start", project_id, name)
+
+    def stage_done(name: str, stage_ts: float, **extra):
+        suffix = " ".join(f"{k}={v}" for k, v in extra.items())
+        if suffix:
+            suffix = f" {suffix}"
+        logger.info(
+            "pipeline-continue project=%s stage=%s status=done elapsed=%.2fs%s",
+            project_id,
+            name,
+            time.perf_counter() - stage_ts,
+            suffix,
+        )
+
+    logger.info("pipeline-continue project=%s status=start", project_id)
+    try:
+        with db() as con:
+            p = _get_project(con, project_id)
+            if not p:
+                logger.warning("pipeline-continue project=%s status=aborted reason=project_not_found", project_id)
+                return
+
+            dxf_path = p["dxf_path"]
+            mapping_json = p["mapping_json_path"]
+            aligned = p["aligned_mask_path"]
+
+            if not dxf_path or not os.path.exists(dxf_path):
+                _set_project(con, project_id, status="failed", error="Base DXF not found for continue flow.")
+                logger.error("pipeline-continue project=%s status=failed reason=missing_dxf", project_id)
+                return
+            if not mapping_json or not os.path.exists(mapping_json):
+                _set_project(con, project_id, status="failed", error="Mapping JSON not found for continue flow.")
+                logger.error("pipeline-continue project=%s status=failed reason=missing_mapping", project_id)
+                return
+            if not aligned or not os.path.exists(aligned):
+                _set_project(con, project_id, status="failed", error="Aligned mask not found. Upload/alignment review required.")
+                logger.error("pipeline-continue project=%s status=failed reason=missing_aligned_mask", project_id)
+                return
+
+        pdir = project_dir(project_id)
+        _run_post_alignment_steps(
+            project_id=project_id,
+            opts=opts,
+            pdir=pdir,
+            dxf_path=dxf_path,
+            mapping_json=mapping_json,
+            aligned_mask_path=aligned,
+            stage_start=stage_start,
+            stage_done=stage_done,
+        )
+
+        logger.info(
+            "pipeline-continue project=%s status=ready total_elapsed=%.2fs",
+            project_id,
+            time.perf_counter() - start_ts,
+        )
+    except Exception as e:
+        err = f"{e}\n\n{traceback.format_exc()}"
+        logger.exception("pipeline-continue project=%s status=failed", project_id)
         with db() as con:
             _set_project(con, project_id, status="failed", error=err)

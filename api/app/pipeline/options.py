@@ -8,7 +8,7 @@ class PipelineOptions:
     pad_frac: float = 0.01
     detector_spacing_m: float = 5.0
     wall_buffer_m: float = 0.5
-    gemini_model: str = "gemini-2.5-flash-image"
+    gemini_model: str = "gemini-3.1-flash-image-preview"
     use_gemini: bool = False
     world_to_m: float = 0.001  # DXF units -> meters (default mm)
 
@@ -20,7 +20,7 @@ class PipelineOptions:
             pad_frac=float(os.getenv("PAD_FRAC", "0.01")),
             detector_spacing_m=float(os.getenv("DETECTOR_SPACING_M", "5.0")),
             wall_buffer_m=float(os.getenv("WALL_BUFFER_M", "0.5")),
-            gemini_model=os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image"),
+            gemini_model=os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image-preview"),
             use_gemini=bool(os.getenv("GEMINI_API_KEY", "").strip()),
             world_to_m=float(os.getenv("WORLD_TO_M", "0.001")),
         )

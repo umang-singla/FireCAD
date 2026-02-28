@@ -4,7 +4,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
 from app.db import db, now
 from app.storage import new_id, project_dir, relpath
 from app.schemas import ProjectCreate, ProjectOut, ProjectUpdateSettings
-from app.pipeline.run_pipeline import run_pipeline_for_project, PipelineOptions
+from app.pipeline.run_pipeline import run_pipeline_for_project, continue_pipeline_after_alignment, PipelineOptions
 from app.pipeline.dxf_export import write_detectors_to_dxf
 
 router = APIRouter(tags=["projects"])
@@ -125,6 +125,60 @@ def run_pipeline(project_id: str, bg: BackgroundTasks):
 
     opts = PipelineOptions.from_env().merge_settings(settings)
     bg.add_task(run_pipeline_for_project, project_id, opts)
+
+    with db() as con:
+        r2 = con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+    return _project_row_to_out(r2)
+
+@router.post("/projects/{project_id}/aligned_mask", response_model=ProjectOut)
+async def upload_aligned_mask(project_id: str, file: UploadFile = File(...)):
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+
+    filename = (file.filename or "aligned_mask").strip().lower()
+    ext = os.path.splitext(filename)[1]
+    if ext not in [".png", ".jpg", ".jpeg", ".webp"]:
+        raise HTTPException(400, "Upload aligned mask as .png/.jpg/.jpeg/.webp")
+
+    data = await file.read()
+    if len(data) < 100:
+        raise HTTPException(400, "File too small")
+
+    aligned_path = os.path.join(project_dir(project_id), "mask_aligned.png")
+    with open(aligned_path, "wb") as f:
+        f.write(data)
+
+    with db() as con:
+        con.execute(
+            "UPDATE projects SET aligned_mask_path=?, status=?, error=NULL, updated_at=? WHERE id=?",
+            (aligned_path, "awaiting_alignment_review", now(), project_id),
+        )
+        r2 = con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+
+    return _project_row_to_out(r2)
+
+@router.post("/projects/{project_id}/continue", response_model=ProjectOut)
+def continue_pipeline(project_id: str, bg: BackgroundTasks):
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+        if r["status"] in ("running",):
+            raise HTTPException(409, "pipeline already running")
+        if r["status"] not in ("awaiting_alignment_review", "aligned"):
+            raise HTTPException(409, "project is not awaiting alignment review")
+
+        con.execute("UPDATE projects SET status=?, error=NULL, updated_at=? WHERE id=?",
+                    ("running", now(), project_id))
+
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        settings = json.loads(r["settings_json"] or "{}")
+
+    opts = PipelineOptions.from_env().merge_settings(settings)
+    bg.add_task(continue_pipeline_after_alignment, project_id, opts)
 
     with db() as con:
         r2 = con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
