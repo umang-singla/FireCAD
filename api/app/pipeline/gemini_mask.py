@@ -47,7 +47,7 @@ def generate_mask_image(
     input_png: str,
     out_mask_png: str,
     prompt: str = DEFAULT_PROMPT,
-    model: str = "gemini-2.5-flash-image",
+    model: str = "gemini-3.1-flash-image-preview",
     max_side: int = 2048,
 ):
     api_key = os.getenv("GEMINI_API_KEY", "").strip()

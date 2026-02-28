@@ -1,10 +1,31 @@
 "use client";
 
-import { use, useEffect, useState } from "react";
+import { use, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
+import { getToken } from "../../lib/auth";
 
 const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+
+async function authFetch(path: string, init?: RequestInit) {
+  const token = getToken();
+  const headers: Record<string, string> = {
+    ...(init?.headers as Record<string, string> | undefined),
+  };
+
+  const isFormData = typeof FormData !== "undefined" && init?.body instanceof FormData;
+  if (!isFormData && !headers["Content-Type"]) {
+    headers["Content-Type"] = "application/json";
+  }
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const res = await fetch(`${API}${path}`, { ...init, headers });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Request failed (${res.status})`);
+  }
+  return res;
+}
 
 type Project = {
   id: string;
@@ -57,7 +78,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     detector_spacing_m: 5.0,
     wall_buffer_m: 0.5,
     target_long_side_px: 12000,
-    gemini_model: "gemini-2.5-flash-image",
+    gemini_model: "gemini-3.1-flash-image-preview",
     building_type: "residential",
     has_false_ceiling: false,
     units: "mm",
@@ -65,10 +86,10 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   });
 
   async function refresh() {
-    const p: Project = await (await fetch(`${API}/api/projects/${projectId}`)).json();
+    const p: Project = await (await authFetch(`/api/projects/${projectId}`)).json();
     setProject(p);
 
-    const d: Detector[] = await (await fetch(`${API}/api/projects/${projectId}/detectors`)).json();
+    const d: Detector[] = await (await authFetch(`/api/projects/${projectId}/detectors`)).json();
     setDetectors(d);
 
     const mappingUrl = p.files?.output_preview_mapping || p.files?.mapping_json;
@@ -83,9 +104,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   useEffect(() => { refresh(); }, []);
 
   async function saveSettings() {
-    await fetch(`${API}/api/projects/${projectId}/settings`, {
+    await authFetch(`/api/projects/${projectId}/settings`, {
       method:"POST",
-      headers: {"Content-Type":"application/json"},
       body: JSON.stringify({ settings })
     });
     await refresh();
@@ -93,14 +113,34 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
 
   async function runPipeline() {
     await saveSettings();
-    await fetch(`${API}/api/projects/${projectId}/run`, { method:"POST" });
+    await authFetch(`/api/projects/${projectId}/run`, { method:"POST" });
     await refresh();
   }
 
   const isReady = project?.status === "ready";
+  const isAwaitingAlignmentReview = project?.status === "awaiting_alignment_review";
 
   async function saveLayout() {
-    await fetch(`${API}/api/projects/${projectId}/save`, { method:"POST" });
+    await authFetch(`/api/projects/${projectId}/save`, { method:"POST" });
+    await refresh();
+  }
+
+  async function continuePipelineAfterAlignment(adjustedMaskBlob?: Blob) {
+    if (adjustedMaskBlob) {
+      const fd = new FormData();
+      fd.append("file", adjustedMaskBlob, "mask_aligned_adjusted.png");
+      await authFetch(`/api/projects/${projectId}/aligned_mask`, { method:"POST", body: fd });
+    }
+    await authFetch(`/api/projects/${projectId}/continue`, { method:"POST" });
+    await refresh();
+  }
+
+  async function uploadAlignedMaskFile(e: any) {
+    const f: File | undefined = e.target.files?.[0];
+    if (!f) return;
+    const fd = new FormData();
+    fd.append("file", f);
+    await authFetch(`/api/projects/${projectId}/aligned_mask`, { method:"POST", body: fd });
     await refresh();
   }
 
@@ -135,80 +175,113 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           </pre>
         ) : null}
 
-        <div style={styles.uploadSection}>
-          <label style={styles.fieldLabel}>Upload DWG/DXF</label>
-          <input type="file" accept=".dxf,.dwg" onChange={(e)=>uploadFile(projectId, e, refresh)} />
-        </div>
+        {isAwaitingAlignmentReview ? (
+          <>
+            <div style={styles.uploadSection}>
+              <label style={styles.fieldLabel}>Replace aligned mask (optional)</label>
+              <input type="file" accept=".png,.jpg,.jpeg,.webp" onChange={uploadAlignedMaskFile} />
+            </div>
 
-        <hr style={styles.divider} />
+            <div style={{ display:"flex", gap: 10, marginTop: 14 }}>
+              <button onClick={refresh} style={btn(false)}>Refresh</button>
+            </div>
 
-        <h4 style={styles.sectionTitle}>Project questions</h4>
+            <hr style={styles.divider} />
+            <div style={styles.helpText}>
+              <b>Alignment review:</b> verify mask alignment below. If required, upload a corrected aligned mask and then continue.
+            </div>
+          </>
+        ) : (
+          <>
+            <div style={styles.uploadSection}>
+              <label style={styles.fieldLabel}>Upload DWG/DXF</label>
+              <input type="file" accept=".dxf,.dwg" onChange={(e)=>uploadFile(projectId, e, refresh)} />
+            </div>
 
-        <Field label="Building type">
-          <select value={settings.building_type} onChange={(e)=>setSettings({...settings, building_type: e.target.value})}>
-            <option value="residential">Residential</option>
-            <option value="commercial">Commercial</option>
-            <option value="industrial">Industrial</option>
-            <option value="hospital">Hospital</option>
-            <option value="school">School</option>
-          </select>
-        </Field>
+            <hr style={styles.divider} />
 
-<Field label="Drawing units">
-  <select value={settings.units} onChange={(e)=>setSettings({...settings, units: e.target.value})}>
-    <option value="mm">mm</option>
-    <option value="cm">cm</option>
-    <option value="m">m</option>
-    <option value="inch">inch</option>
-    <option value="ft">ft</option>
-  </select>
-</Field>
+            <h4 style={styles.sectionTitle}>Project questions</h4>
 
-        <Field label="Detector spacing (meters)">
-          <input type="number" step="0.1" value={settings.detector_spacing_m}
-            onChange={(e)=>setSettings({...settings, detector_spacing_m: Number(e.target.value)})}/>
-        </Field>
+            <Field label="Building type">
+              <select value={settings.building_type} onChange={(e)=>setSettings({...settings, building_type: e.target.value})}>
+                <option value="residential">Residential</option>
+                <option value="commercial">Commercial</option>
+                <option value="industrial">Industrial</option>
+                <option value="hospital">Hospital</option>
+                <option value="school">School</option>
+              </select>
+            </Field>
 
-        <Field label="Min distance from wall (meters)">
-          <input type="number" step="0.1" value={settings.wall_buffer_m}
-            onChange={(e)=>setSettings({...settings, wall_buffer_m: Number(e.target.value)})}/>
-        </Field>
+            <Field label="Drawing units">
+              <select value={settings.units} onChange={(e)=>setSettings({...settings, units: e.target.value})}>
+                <option value="mm">mm</option>
+                <option value="cm">cm</option>
+                <option value="m">m</option>
+                <option value="inch">inch</option>
+                <option value="ft">ft</option>
+              </select>
+            </Field>
 
-        <Field label="Render long side (px)">
-          <input type="number" step="500" value={settings.target_long_side_px}
-            onChange={(e)=>setSettings({...settings, target_long_side_px: Number(e.target.value)})}/>
-        </Field>
+            <Field label="Detector spacing (meters)">
+              <input type="number" step="0.1" value={settings.detector_spacing_m}
+                onChange={(e)=>setSettings({...settings, detector_spacing_m: Number(e.target.value)})}/>
+            </Field>
 
-        <Field label="Gemini image model">
-          <input value={settings.gemini_model}
-            onChange={(e)=>setSettings({...settings, gemini_model: e.target.value})}/>
-          <div style={{ fontSize: 12, opacity:0.65, marginTop: 4 }}>
-            Requires GEMINI_API_KEY on server
-          </div>
-        </Field>
+            <Field label="Min distance from wall (meters)">
+              <input type="number" step="0.1" value={settings.wall_buffer_m}
+                onChange={(e)=>setSettings({...settings, wall_buffer_m: Number(e.target.value)})}/>
+            </Field>
 
-        <div style={{ display:"flex", gap: 10, marginTop: 14 }}>
-          <button onClick={saveSettings} style={btn()}>Save</button>
-          <button onClick={runPipeline} style={btn(true)}>Run Auto-Placement</button>
-        </div>
+            <Field label="Render long side (px)">
+              <input type="number" step="500" value={settings.target_long_side_px}
+                onChange={(e)=>setSettings({...settings, target_long_side_px: Number(e.target.value)})}/>
+            </Field>
 
-        <div style={{ marginTop: 12, display:"flex", gap: 8 }}>
-          {project?.files?.output_dxf ? (
-            <a href={`${API}${project.files.output_dxf}`} style={{ ...btn(true), textDecoration:"none", display:"inline-flex", alignItems:"center", justifyContent:"center" }}>
-              Download output DXF
-            </a>
-          ) : null}
-        </div>
+            <Field label="Gemini image model">
+              <input value={settings.gemini_model}
+                onChange={(e)=>setSettings({...settings, gemini_model: e.target.value})}/>
+              <div style={{ fontSize: 12, opacity:0.65, marginTop: 4 }}>
+                Requires GEMINI_API_KEY on server
+              </div>
+            </Field>
 
-        <hr style={styles.divider} />
-        <div style={styles.helpText}>
-          <b>Editing:</b> Select tool: drag box to multi-select, drag selected to move • Add tool: click to add • Erase tool: click to delete
-        </div>
+            <div style={{ display:"flex", gap: 10, marginTop: 14 }}>
+              <button onClick={saveSettings} style={btn()}>Save</button>
+              <button onClick={runPipeline} style={btn(true)}>Run Auto-Placement</button>
+            </div>
+
+            <div style={{ marginTop: 12, display:"flex", gap: 8 }}>
+              {project?.files?.output_dxf ? (
+                <a href={`${API}${project.files.output_dxf}`} style={{ ...btn(true), textDecoration:"none", display:"inline-flex", alignItems:"center", justifyContent:"center" }}>
+                  Download output DXF
+                </a>
+              ) : null}
+            </div>
+
+            <hr style={styles.divider} />
+            <div style={styles.helpText}>
+              <b>Editing:</b> Select tool: drag box to multi-select, drag selected to move • Add tool: click to add • Erase tool: click to delete
+            </div>
+          </>
+        )}
       </aside>
       ) : null}
 
       <section style={styles.canvasPanel}>
-        {!project?.files?.render_png || !mapping ? (
+        {isAwaitingAlignmentReview ? (
+          project?.files?.aligned_mask && project?.files?.render_png ? (
+            <AlignmentReview
+              originalUrl={`${API}${project.files.render_png}`}
+              alignedUrl={`${API}${project.files.aligned_mask}`}
+              onContinue={continuePipelineAfterAlignment}
+            />
+          ) : (
+            <div style={styles.emptyState}>
+              <h3 style={styles.emptyTitle}>Aligned mask not available</h3>
+              <p style={styles.emptySubtitle}>Upload an aligned mask from the sidebar to continue.</p>
+            </div>
+          )
+        ) : !project?.files?.render_png || !mapping ? (
           <div style={styles.emptyState}>
             <h3 style={styles.emptyTitle}>No preview yet</h3>
             <p style={styles.emptySubtitle}>Upload a DXF/DWG and run auto-placement to generate your interactive view.</p>
@@ -260,6 +333,364 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
         }
       `}</style>
     </main>
+  );
+}
+
+function AlignmentReview({
+  originalUrl,
+  alignedUrl,
+  onContinue,
+}: {
+  originalUrl: string;
+  alignedUrl: string;
+  onContinue: (adjustedMaskBlob: Blob) => Promise<void>;
+}) {
+  const [origDims, setOrigDims] = useState<{w:number; h:number} | null>(null);
+  const [maskDims, setMaskDims] = useState<{w:number; h:number} | null>(null);
+  const [offsetX, setOffsetX] = useState(0);
+  const [offsetY, setOffsetY] = useState(0);
+  const [scale, setScale] = useState(1);
+  const [viewZoom, setViewZoom] = useState(1);
+  const [boxScaleX, setBoxScaleX] = useState(1);
+  const [boxScaleY, setBoxScaleY] = useState(1);
+  const [opacity, setOpacity] = useState(55);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isResizing, setIsResizing] = useState(false);
+  const [isContinuing, setIsContinuing] = useState(false);
+  const dragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null);
+  const resizeRef = useRef<{
+    sx: number;
+    sy: number;
+    dir: "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw";
+    cx: number;
+    cy: number;
+    bw: number;
+    bh: number;
+  } | null>(null);
+
+  const displayedMaskWidth = maskDims ? Math.max(16, maskDims.w * scale * boxScaleX) : 0;
+  const displayedMaskHeight = maskDims ? Math.max(16, maskDims.h * scale * boxScaleY) : 0;
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (resizeRef.current && maskDims) {
+        const dx = (e.clientX - resizeRef.current.sx) / Math.max(0.1, viewZoom);
+        const dy = (e.clientY - resizeRef.current.sy) / Math.max(0.1, viewZoom);
+
+        const startLeft = resizeRef.current.cx - resizeRef.current.bw / 2;
+        const startRight = resizeRef.current.cx + resizeRef.current.bw / 2;
+        const startTop = resizeRef.current.cy - resizeRef.current.bh / 2;
+        const startBottom = resizeRef.current.cy + resizeRef.current.bh / 2;
+
+        let left = startLeft;
+        let right = startRight;
+        let top = startTop;
+        let bottom = startBottom;
+
+        const dir = resizeRef.current.dir;
+        if (dir.includes("e")) right = startRight + dx;
+        if (dir.includes("w")) left = startLeft + dx;
+        if (dir.includes("s")) bottom = startBottom + dy;
+        if (dir.includes("n")) top = startTop + dy;
+
+        const minW = 20;
+        const minH = 20;
+        if (right - left < minW) {
+          if (dir.includes("w")) left = right - minW;
+          else right = left + minW;
+        }
+        if (bottom - top < minH) {
+          if (dir.includes("n")) top = bottom - minH;
+          else bottom = top + minH;
+        }
+
+        const nextWidth = right - left;
+        const nextHeight = bottom - top;
+        const nextCx = (left + right) / 2;
+        const nextCy = (top + bottom) / 2;
+        const baseWidth = Math.max(1, maskDims.w * scale);
+        const baseHeight = Math.max(1, maskDims.h * scale);
+
+        setOffsetX(nextCx);
+        setOffsetY(nextCy);
+        setBoxScaleX(nextWidth / baseWidth);
+        setBoxScaleY(nextHeight / baseHeight);
+        return;
+      }
+      if (!dragRef.current) return;
+      const dx = (e.clientX - dragRef.current.sx) / Math.max(0.1, viewZoom);
+      const dy = (e.clientY - dragRef.current.sy) / Math.max(0.1, viewZoom);
+      setOffsetX(dragRef.current.ox + dx);
+      setOffsetY(dragRef.current.oy + dy);
+    };
+
+    const onUp = () => {
+      dragRef.current = null;
+      resizeRef.current = null;
+      setIsDragging(false);
+      setIsResizing(false);
+    };
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [maskDims, scale, viewZoom]);
+
+  function startResize(
+    e: React.MouseEvent<HTMLDivElement>,
+    dir: "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw"
+  ) {
+    e.stopPropagation();
+    resizeRef.current = {
+      sx: e.clientX,
+      sy: e.clientY,
+      dir,
+      cx: offsetX,
+      cy: offsetY,
+      bw: displayedMaskWidth,
+      bh: displayedMaskHeight,
+    };
+    setIsResizing(true);
+  }
+
+  async function continueWithAdjustedMask() {
+    if (!origDims || !maskDims) return;
+    setIsContinuing(true);
+    try {
+      const exportMaskWidth = Math.max(16, maskDims.w * boxScaleX);
+      const exportMaskHeight = Math.max(16, maskDims.h * boxScaleY);
+
+      const canvas = document.createElement("canvas");
+      canvas.width = origDims.w;
+      canvas.height = origDims.h;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, origDims.w, origDims.h);
+
+      const maskResp = await fetch(alignedUrl, { cache: "no-store" });
+      if (!maskResp.ok) throw new Error(`Failed to fetch aligned mask (${maskResp.status})`);
+      const maskBlob = await maskResp.blob();
+      const maskBitmap = await createImageBitmap(maskBlob);
+
+      ctx.save();
+      ctx.translate(origDims.w / 2 + offsetX, origDims.h / 2 + offsetY);
+      ctx.scale(scale, scale);
+      ctx.drawImage(maskBitmap, -exportMaskWidth / 2, -exportMaskHeight / 2, exportMaskWidth, exportMaskHeight);
+      ctx.restore();
+      maskBitmap.close();
+
+      const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (!blob) return;
+      await onContinue(blob);
+    } finally {
+      setIsContinuing(false);
+    }
+  }
+
+  return (
+    <div style={{ position:"absolute", inset: 0, padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          borderRadius: 12,
+          border: "1px solid rgba(255,255,255,0.14)",
+          background: "rgba(9, 14, 27, 0.78)",
+          padding: "10px 12px",
+          flexWrap: "wrap",
+        }}
+      >
+        <span style={{ fontSize: 12, color: "#dbe4ff" }}>Opacity</span>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          value={opacity}
+          onChange={(e) => setOpacity(Number(e.target.value))}
+          style={{ width: 120 }}
+        />
+        <span style={{ fontSize: 12, color: "#dbe4ff" }}>{opacity}%</span>
+
+        <span style={{ fontSize: 12, color: "#dbe4ff", marginLeft: 12 }}>Scale</span>
+        <input
+          type="range"
+          min={50}
+          max={200}
+          value={Math.round(scale * 100)}
+          onChange={(e) => setScale(Number(e.target.value) / 100)}
+          style={{ width: 120 }}
+        />
+        <span style={{ fontSize: 12, color: "#dbe4ff" }}>{Math.round(scale * 100)}%</span>
+
+        <span style={{ fontSize: 12, color: "#dbe4ff", marginLeft: 12 }}>View</span>
+        <button onClick={() => setViewZoom((v) => Math.max(0.25, v - 0.1))} style={zoomBtn}>−</button>
+        <input
+          type="range"
+          min={25}
+          max={300}
+          value={Math.round(viewZoom * 100)}
+          onChange={(e) => setViewZoom(Number(e.target.value) / 100)}
+          style={{ width: 120 }}
+        />
+        <button onClick={() => setViewZoom((v) => Math.min(3, v + 0.1))} style={zoomBtn}>+</button>
+        <span style={{ fontSize: 12, color: "#dbe4ff" }}>{Math.round(viewZoom * 100)}%</span>
+
+        <button onClick={() => { setOffsetX(0); setOffsetY(0); setScale(1); setViewZoom(1); setBoxScaleX(1); setBoxScaleY(1); }} style={toolBtn(false)}>Reset</button>
+        <button onClick={continueWithAdjustedMask} style={toolBtn(true)} disabled={isContinuing}>
+          {isContinuing ? "Continuing..." : "Continue Pipeline"}
+        </button>
+      </div>
+
+      <div
+        style={{
+          position:"relative",
+          flex: 1,
+          overflow: "auto",
+          borderRadius: 12,
+          border: "1px solid rgba(255,255,255,0.14)",
+          background: "rgba(4, 8, 18, 0.48)",
+          padding: 10,
+        }}
+      >
+        {origDims ? (
+          <div style={{ position: "relative", width: origDims.w * viewZoom, height: origDims.h * viewZoom }}>
+            <div
+              style={{
+                position: "absolute",
+                left: 0,
+                top: 0,
+                width: origDims.w,
+                height: origDims.h,
+                transform: `scale(${viewZoom})`,
+                transformOrigin: "top left",
+              }}
+            >
+            <img
+              src={originalUrl}
+              alt="Original render"
+              onLoad={(e) => {
+                const img = e.currentTarget;
+                setOrigDims({ w: img.naturalWidth, h: img.naturalHeight });
+              }}
+              style={{ position:"absolute", inset:0, width: origDims.w, height: origDims.h, display:"block" }}
+            />
+
+            <div
+              onMouseDown={(e) => {
+                dragRef.current = { sx: e.clientX, sy: e.clientY, ox: offsetX, oy: offsetY };
+                setIsDragging(true);
+              }}
+              style={{
+                position: "absolute",
+                left: "50%",
+                top: "50%",
+                transform: `translate(-50%, -50%) translate(${offsetX}px, ${offsetY}px)`,
+                width: displayedMaskWidth,
+                height: displayedMaskHeight,
+                cursor: isDragging ? "grabbing" : "grab",
+                userSelect: "none",
+                pointerEvents: "auto",
+              }}
+            >
+              <img
+                src={alignedUrl}
+                alt="Aligned mask overlay"
+                onLoad={(e) => {
+                  const img = e.currentTarget;
+                  setMaskDims({ w: img.naturalWidth, h: img.naturalHeight });
+                }}
+                draggable={false}
+                style={{
+                  width: "100%",
+                  height: "100%",
+                  opacity: opacity / 100,
+                  display: "block",
+                  pointerEvents: "none",
+                }}
+              />
+              <div
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  border: "2px dashed rgba(143, 210, 255, 0.8)",
+                  pointerEvents: "none",
+                  borderRadius: 4,
+                }}
+              />
+              <div
+                onMouseDown={(e) => startResize(e, "se")}
+                style={{
+                  position: "absolute",
+                  right: -7,
+                  bottom: -7,
+                  width: 14,
+                  height: 14,
+                  borderRadius: 3,
+                  border: "1px solid rgba(255,255,255,0.9)",
+                  background: isResizing ? "#8fd2ff" : "#5bb9ff",
+                  cursor: "nwse-resize",
+                  boxShadow: "0 2px 8px rgba(0,0,0,0.35)",
+                }}
+                title="Resize mask box"
+              />
+
+              <div
+                onMouseDown={(e) => startResize(e, "n")}
+                style={{ position: "absolute", left: "50%", top: -6, transform: "translateX(-50%)", width: 12, height: 12, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#5bb9ff", cursor: "ns-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
+                title="Resize top"
+              />
+              <div
+                onMouseDown={(e) => startResize(e, "s")}
+                style={{ position: "absolute", left: "50%", bottom: -6, transform: "translateX(-50%)", width: 12, height: 12, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#5bb9ff", cursor: "ns-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
+                title="Resize bottom"
+              />
+              <div
+                onMouseDown={(e) => startResize(e, "e")}
+                style={{ position: "absolute", right: -6, top: "50%", transform: "translateY(-50%)", width: 12, height: 12, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#5bb9ff", cursor: "ew-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
+                title="Resize right"
+              />
+              <div
+                onMouseDown={(e) => startResize(e, "w")}
+                style={{ position: "absolute", left: -6, top: "50%", transform: "translateY(-50%)", width: 12, height: 12, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#5bb9ff", cursor: "ew-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
+                title="Resize left"
+              />
+              <div
+                onMouseDown={(e) => startResize(e, "nw")}
+                style={{ position: "absolute", left: -7, top: -7, width: 14, height: 14, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#5bb9ff", cursor: "nwse-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
+                title="Resize top-left"
+              />
+              <div
+                onMouseDown={(e) => startResize(e, "ne")}
+                style={{ position: "absolute", right: -7, top: -7, width: 14, height: 14, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#5bb9ff", cursor: "nesw-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
+                title="Resize top-right"
+              />
+              <div
+                onMouseDown={(e) => startResize(e, "sw")}
+                style={{ position: "absolute", left: -7, bottom: -7, width: 14, height: 14, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#5bb9ff", cursor: "nesw-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
+                title="Resize bottom-left"
+              />
+            </div>
+            </div>
+          </div>
+        ) : (
+          <img
+            src={originalUrl}
+            alt="Original render"
+            onLoad={(e) => {
+              const img = e.currentTarget;
+              setOrigDims({ w: img.naturalWidth, h: img.naturalHeight });
+            }}
+            style={{ maxWidth: "100%", display: "block" }}
+          />
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -438,7 +869,7 @@ async function uploadFile(projectId: string, e: any, refresh: ()=>void) {
   if (!f) return;
   const fd = new FormData();
   fd.append("file", f);
-  await fetch(`${API}/api/projects/${projectId}/upload`, { method:"POST", body: fd });
+  await authFetch(`/api/projects/${projectId}/upload`, { method:"POST", body: fd });
   await refresh();
 }
 
@@ -475,9 +906,8 @@ function Editor({
 
   async function addDetectorAt(px: number, py: number) {
     const w = pixelToWorld(mapping, px, py);
-    await fetch(`${API}/api/projects/${projectId}/detectors`, {
+    await authFetch(`/api/projects/${projectId}/detectors`, {
       method:"POST",
-      headers: {"Content-Type":"application/json"},
       body: JSON.stringify({ x: w.x, y: w.y, z: 0, dtype:addType })
     });
     onChanged();
@@ -494,9 +924,8 @@ function Editor({
 
   async function patchDetectorTo(detId: string, px: number, py: number) {
     const w = pixelToWorld(mapping, px, py);
-    await fetch(`${API}/api/detectors/${detId}`, {
+    await authFetch(`/api/detectors/${detId}`, {
       method:"PATCH",
-      headers: {"Content-Type":"application/json"},
       body: JSON.stringify({ x: w.x, y: w.y, z: 0 })
     });
   }
@@ -514,7 +943,7 @@ function Editor({
   }
 
   async function deleteDetector(detId: string) {
-    await fetch(`${API}/api/detectors/${detId}`, { method:"DELETE" });
+    await authFetch(`/api/detectors/${detId}`, { method:"DELETE" });
     onChanged();
   }
 
