@@ -46,6 +46,7 @@ def render_dwg_to_png_with_qcad(
     exe = os.getenv("QCAD_DWG2BMP", "/opt/qcad/dwg2bmp")
     if not os.path.exists(exe):
         raise RuntimeError(f"QCAD dwg2bmp not found: {exe}")
+    qcad_dir = os.path.dirname(os.path.abspath(exe))
 
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     width_px = os.getenv("QCAD_WIDTH_PX", "").strip()
@@ -108,7 +109,21 @@ def render_dwg_to_png_with_qcad(
         margin_px,
         resolution or "auto",
     )
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    run_env = os.environ.copy()
+    ld_prev = run_env.get("LD_LIBRARY_PATH", "").strip()
+    run_env["LD_LIBRARY_PATH"] = f"{qcad_dir}:{ld_prev}" if ld_prev else qcad_dir
+    run_env.setdefault("QT_PLUGIN_PATH", os.path.join(qcad_dir, "plugins"))
+    run_env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    run_env.setdefault("QT_STYLE_OVERRIDE", "plastique")
+
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=qcad_dir,
+        env=run_env,
+    )
     if proc.returncode != 0 or not os.path.exists(out_png):
         raise RuntimeError(
             "QCAD dwg2bmp failed. "
