@@ -124,6 +124,47 @@ def render_dwg_to_png_with_qcad(
         cwd=qcad_dir,
         env=run_env,
     )
+
+    if proc.returncode != 0 or not os.path.exists(out_png):
+        # Fallback: bypass shell launchers and invoke qcad-bin directly.
+        qcad_bin = os.path.join(qcad_dir, "qcad-bin")
+        dwg2bmp_js = os.path.join(qcad_dir, "scripts", "Pro", "Tools", "Dwg2Bmp", "Dwg2Bmp.js")
+        if os.path.exists(qcad_bin) and os.path.exists(dwg2bmp_js):
+            fallback_cmd = [
+                qcad_bin,
+                "-no-dock-icon",
+                "-no-gui",
+                "-allow-multiple-instances",
+                "-autostart",
+                dwg2bmp_js,
+                exe,
+                *cmd[1:],
+            ]
+            logger.warning(
+                "render_qcad launcher_failed retrying_direct_qcad cmd=%s rc=%s stderr_tail=%s",
+                cmd,
+                proc.returncode,
+                (proc.stderr or "")[-500:],
+            )
+            proc2 = subprocess.run(
+                fallback_cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=qcad_dir,
+                env=run_env,
+            )
+            if proc2.returncode == 0 and os.path.exists(out_png):
+                proc = proc2
+            else:
+                raise RuntimeError(
+                    "QCAD dwg2bmp failed (launcher + direct). "
+                    f"cmd={cmd}\nstdout={proc.stdout}\nstderr={proc.stderr}\n"
+                    f"fallback_cmd={fallback_cmd}\n"
+                    f"fallback_stdout={proc2.stdout}\n"
+                    f"fallback_stderr={proc2.stderr}"
+                )
+
     if proc.returncode != 0 or not os.path.exists(out_png):
         raise RuntimeError(
             "QCAD dwg2bmp failed. "
