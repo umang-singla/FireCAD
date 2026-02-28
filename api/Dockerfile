@@ -3,7 +3,6 @@ FROM python:3.11-slim
 # System libs needed by OpenCV + PyMuPDF
 RUN apt-get update -qq && apt-get install -y -qq \
 		ca-certificates \
-		curl \
 	fontconfig \
 	libfreetype6 \
 		libgl1 \
@@ -22,8 +21,8 @@ RUN apt-get update -qq && apt-get install -y -qq \
 	&& rm -rf /var/lib/apt/lists/*
 
 # Install ODA File Converter (Linux) for DWG -> DXF conversion
+COPY ODA/ODAFileConverter_QT6_lnxX64_8.3dll_27.1.deb /tmp/oda.deb
 RUN set -eux; \
-		curl -fsSL "https://www.opendesign.com/guestfiles/get?filename=ODAFileConverter_QT6_lnxX64_8.3dll_26.12.deb" -o /tmp/oda.deb; \
 		apt-get update -qq; \
 		apt-get install -y -qq /tmp/oda.deb; \
 		rm -f /tmp/oda.deb; \
