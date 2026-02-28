@@ -14,6 +14,7 @@ def init_db():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
+        owner_id TEXT,
         name TEXT NOT NULL,
         status TEXT NOT NULL,
         error TEXT,
@@ -33,6 +34,12 @@ def init_db():
         updated_at REAL
     )
     """)
+
+    project_cols = {row[1] for row in cur.execute("PRAGMA table_info(projects)").fetchall()}
+    if "owner_id" not in project_cols:
+        cur.execute("ALTER TABLE projects ADD COLUMN owner_id TEXT")
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_projects_owner_id ON projects(owner_id)")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS detectors (

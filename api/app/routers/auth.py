@@ -65,6 +65,28 @@ def _get_token_from_request(req: Request) -> Optional[str]:
     return None
 
 
+def get_current_user(req: Request) -> dict:
+    token = _get_token_from_request(req)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    with db() as con:
+        row = con.execute(
+            """
+            SELECT u.id, u.name, u.email
+            FROM sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token = ? AND s.expires_at > ?
+            """,
+            (token, now()),
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid/expired token")
+
+    return {"id": row["id"], "name": row["name"], "email": row["email"]}
+
+
 @router.post("/register")
 def register(payload: RegisterIn):
     with db() as con:
@@ -105,25 +127,7 @@ def login(payload: LoginIn):
 
 @router.get("/me")
 def me(req: Request):
-    token = _get_token_from_request(req)
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing token")
-
-    with db() as con:
-        row = con.execute(
-            """
-            SELECT u.id, u.name, u.email
-            FROM sessions s
-            JOIN users u ON u.id = s.user_id
-            WHERE s.token = ? AND s.expires_at > ?
-            """,
-            (token, now()),
-        ).fetchone()
-
-    if not row:
-        raise HTTPException(status_code=401, detail="Invalid/expired token")
-
-    return {"id": row["id"], "name": row["name"], "email": row["email"]}
+    return get_current_user(req)
 
 
 @router.post("/logout")

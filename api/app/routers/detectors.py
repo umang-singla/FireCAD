@@ -1,8 +1,8 @@
-import json
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from app.db import db, now
 from app.storage import new_id
 from app.schemas import DetectorOut, DetectorCreate, DetectorUpdate
+from app.routers.auth import get_current_user
 
 router = APIRouter(tags=["detectors"])
 
@@ -18,17 +18,26 @@ def _row_to_out(r) -> DetectorOut:
     )
 
 @router.get("/projects/{project_id}/detectors", response_model=list[DetectorOut])
-def list_detectors(project_id: str):
+def list_detectors(project_id: str, user=Depends(get_current_user)):
     with db() as con:
-        rows = con.execute("SELECT * FROM detectors WHERE project_id=? ORDER BY created_at ASC", (project_id,)).fetchall()
+        rows = con.execute(
+            """
+            SELECT d.*
+            FROM detectors d
+            JOIN projects p ON p.id = d.project_id
+            WHERE d.project_id=? AND p.owner_id=?
+            ORDER BY d.created_at ASC
+            """,
+            (project_id, user["id"]),
+        ).fetchall()
     return [_row_to_out(r) for r in rows]
 
 @router.post("/projects/{project_id}/detectors", response_model=DetectorOut)
-def create_detector(project_id: str, payload: DetectorCreate):
+def create_detector(project_id: str, payload: DetectorCreate, user=Depends(get_current_user)):
     did = new_id()
     with db() as con:
         # Ensure project exists
-        p = con.execute("SELECT id FROM projects WHERE id=?", (project_id,)).fetchone()
+        p = con.execute("SELECT id FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
         if not p:
             raise HTTPException(404, "project not found")
         con.execute(
@@ -41,9 +50,17 @@ def create_detector(project_id: str, payload: DetectorCreate):
     return _row_to_out(r)
 
 @router.patch("/detectors/{detector_id}", response_model=DetectorOut)
-def update_detector(detector_id: str, payload: DetectorUpdate):
+def update_detector(detector_id: str, payload: DetectorUpdate, user=Depends(get_current_user)):
     with db() as con:
-        r = con.execute("SELECT * FROM detectors WHERE id=?", (detector_id,)).fetchone()
+        r = con.execute(
+            """
+            SELECT d.*
+            FROM detectors d
+            JOIN projects p ON p.id = d.project_id
+            WHERE d.id=? AND p.owner_id=?
+            """,
+            (detector_id, user["id"]),
+        ).fetchone()
         if not r:
             raise HTTPException(404, "detector not found")
 
@@ -58,7 +75,18 @@ def update_detector(detector_id: str, payload: DetectorUpdate):
     return _row_to_out(r2)
 
 @router.delete("/detectors/{detector_id}")
-def delete_detector(detector_id: str):
+def delete_detector(detector_id: str, user=Depends(get_current_user)):
     with db() as con:
+        row = con.execute(
+            """
+            SELECT d.id
+            FROM detectors d
+            JOIN projects p ON p.id = d.project_id
+            WHERE d.id=? AND p.owner_id=?
+            """,
+            (detector_id, user["id"]),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "detector not found")
         con.execute("DELETE FROM detectors WHERE id=?", (detector_id,))
     return {"ok": True}

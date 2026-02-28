@@ -3,8 +3,29 @@
 import { use, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
+import { getToken } from "../../lib/auth";
 
 const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+
+async function authFetch(path: string, init?: RequestInit) {
+  const token = getToken();
+  const headers: Record<string, string> = {
+    ...(init?.headers as Record<string, string> | undefined),
+  };
+
+  const isFormData = typeof FormData !== "undefined" && init?.body instanceof FormData;
+  if (!isFormData && !headers["Content-Type"]) {
+    headers["Content-Type"] = "application/json";
+  }
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const res = await fetch(`${API}${path}`, { ...init, headers });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Request failed (${res.status})`);
+  }
+  return res;
+}
 
 type Project = {
   id: string;
@@ -65,10 +86,10 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   });
 
   async function refresh() {
-    const p: Project = await (await fetch(`${API}/api/projects/${projectId}`)).json();
+    const p: Project = await (await authFetch(`/api/projects/${projectId}`)).json();
     setProject(p);
 
-    const d: Detector[] = await (await fetch(`${API}/api/projects/${projectId}/detectors`)).json();
+    const d: Detector[] = await (await authFetch(`/api/projects/${projectId}/detectors`)).json();
     setDetectors(d);
 
     const mappingUrl = p.files?.output_preview_mapping || p.files?.mapping_json;
@@ -83,9 +104,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   useEffect(() => { refresh(); }, []);
 
   async function saveSettings() {
-    await fetch(`${API}/api/projects/${projectId}/settings`, {
+    await authFetch(`/api/projects/${projectId}/settings`, {
       method:"POST",
-      headers: {"Content-Type":"application/json"},
       body: JSON.stringify({ settings })
     });
     await refresh();
@@ -93,7 +113,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
 
   async function runPipeline() {
     await saveSettings();
-    await fetch(`${API}/api/projects/${projectId}/run`, { method:"POST" });
+    await authFetch(`/api/projects/${projectId}/run`, { method:"POST" });
     await refresh();
   }
 
@@ -101,7 +121,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   const isAwaitingAlignmentReview = project?.status === "awaiting_alignment_review";
 
   async function saveLayout() {
-    await fetch(`${API}/api/projects/${projectId}/save`, { method:"POST" });
+    await authFetch(`/api/projects/${projectId}/save`, { method:"POST" });
     await refresh();
   }
 
@@ -109,9 +129,9 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     if (adjustedMaskBlob) {
       const fd = new FormData();
       fd.append("file", adjustedMaskBlob, "mask_aligned_adjusted.png");
-      await fetch(`${API}/api/projects/${projectId}/aligned_mask`, { method:"POST", body: fd });
+      await authFetch(`/api/projects/${projectId}/aligned_mask`, { method:"POST", body: fd });
     }
-    await fetch(`${API}/api/projects/${projectId}/continue`, { method:"POST" });
+    await authFetch(`/api/projects/${projectId}/continue`, { method:"POST" });
     await refresh();
   }
 
@@ -120,7 +140,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     if (!f) return;
     const fd = new FormData();
     fd.append("file", f);
-    await fetch(`${API}/api/projects/${projectId}/aligned_mask`, { method:"POST", body: fd });
+    await authFetch(`/api/projects/${projectId}/aligned_mask`, { method:"POST", body: fd });
     await refresh();
   }
 
@@ -849,7 +869,7 @@ async function uploadFile(projectId: string, e: any, refresh: ()=>void) {
   if (!f) return;
   const fd = new FormData();
   fd.append("file", f);
-  await fetch(`${API}/api/projects/${projectId}/upload`, { method:"POST", body: fd });
+  await authFetch(`/api/projects/${projectId}/upload`, { method:"POST", body: fd });
   await refresh();
 }
 
@@ -886,9 +906,8 @@ function Editor({
 
   async function addDetectorAt(px: number, py: number) {
     const w = pixelToWorld(mapping, px, py);
-    await fetch(`${API}/api/projects/${projectId}/detectors`, {
+    await authFetch(`/api/projects/${projectId}/detectors`, {
       method:"POST",
-      headers: {"Content-Type":"application/json"},
       body: JSON.stringify({ x: w.x, y: w.y, z: 0, dtype:addType })
     });
     onChanged();
@@ -905,9 +924,8 @@ function Editor({
 
   async function patchDetectorTo(detId: string, px: number, py: number) {
     const w = pixelToWorld(mapping, px, py);
-    await fetch(`${API}/api/detectors/${detId}`, {
+    await authFetch(`/api/detectors/${detId}`, {
       method:"PATCH",
-      headers: {"Content-Type":"application/json"},
       body: JSON.stringify({ x: w.x, y: w.y, z: 0 })
     });
   }
@@ -925,7 +943,7 @@ function Editor({
   }
 
   async function deleteDetector(detId: string) {
-    await fetch(`${API}/api/detectors/${detId}`, { method:"DELETE" });
+    await authFetch(`/api/detectors/${detId}`, { method:"DELETE" });
     onChanged();
   }
 
