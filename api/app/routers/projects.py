@@ -1,11 +1,17 @@
 import os
+import re
 import json
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Query
+from fastapi.responses import FileResponse
+from PIL import Image
+
 from app.db import db, now
 from app.storage import new_id, project_dir, relpath
 from app.schemas import ProjectCreate, ProjectOut, ProjectUpdateSettings
 from app.pipeline.run_pipeline import run_pipeline_for_project, PipelineOptions
 from app.pipeline.dxf_export import write_detectors_to_dxf
+from app.pipeline.convert import dxf_to_dwg, has_oda
+from app.pipeline.render import render_dxf_to_png_and_mapping
 
 router = APIRouter(tags=["projects"])
 
@@ -179,3 +185,127 @@ def save_project_layout(project_id: str):
         r2 = con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
 
     return _project_row_to_out(r2)
+
+
+def _safe_filename(name: str) -> str:
+    name = (name or "project").strip()
+    name = re.sub(r"[^a-zA-Z0-9._-]+", "_", name)
+    name = name.strip("._-") or "project"
+    return name[:80]
+
+
+@router.get("/projects/{project_id}/download")
+def download_project_file(
+    project_id: str,
+    format: str = Query("dxf", description="One of: dxf, dwg, png, pdf"),
+    artifact: str = Query("output", description="One of: output, base, input"),
+):
+    """Download project artifacts with proper 'attachment' headers.
+
+    Why this exists:
+      - /files is served via StaticFiles (no Content-Disposition).
+      - In the UI, the sidebar disappears when status==ready, so users lost access to the link.
+
+    This endpoint makes downloads reliable across browsers and lets the UI offer DXF/DWG/PNG/PDF.
+    """
+
+    fmt = (format or "").strip().lower()
+    art = (artifact or "").strip().lower()
+    if fmt not in ("dxf", "dwg", "png", "pdf"):
+        raise HTTPException(400, "format must be one of: dxf, dwg, png, pdf")
+    if art not in ("output", "base", "input"):
+        raise HTTPException(400, "artifact must be one of: output, base, input")
+
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+
+    project_name = _safe_filename(r["name"])
+    pdir = project_dir(project_id)
+
+    # Choose the underlying source paths
+    base_dxf = r["dxf_path"]
+    output_dxf = r["output_dxf_path"]
+    output_png = r["output_preview_png_path"]
+    render_png = r["render_png_path"]
+    input_path = r["input_path"]
+
+    if art == "input":
+        if not input_path or not os.path.exists(input_path):
+            raise HTTPException(404, "input file not available")
+        # For input, we only support downloading the original file (dxf/dwg) as-is.
+        ext = os.path.splitext(input_path)[1].lower().lstrip(".")
+        if fmt in ("png", "pdf"):
+            raise HTTPException(400, "For artifact=input, use the original DWG/DXF file.")
+        if fmt == "dwg" and ext != "dwg":
+            raise HTTPException(400, "Uploaded file is not DWG.")
+        if fmt == "dxf" and ext != "dxf":
+            raise HTTPException(400, "Uploaded file is not DXF.")
+        path = input_path
+        filename = f"{project_name}_input.{ext}"
+        return FileResponse(path, media_type="application/octet-stream", filename=filename)
+
+    if art == "base":
+        if not base_dxf or not os.path.exists(base_dxf):
+            raise HTTPException(404, "base DXF not available yet. Upload DWG/DXF and run the pipeline.")
+        src_dxf = base_dxf
+        src_png = render_png
+        prefix = f"{project_name}_base"
+    else:
+        if not output_dxf or not os.path.exists(output_dxf):
+            raise HTTPException(404, "output DXF not available yet. Run auto-placement (or click Save in editor).")
+        src_dxf = output_dxf
+        src_png = output_png
+        prefix = f"{project_name}_detectors"
+
+    # Ensure PNG exists if requested
+    if fmt in ("png", "pdf"):
+        if not src_png or not os.path.exists(src_png):
+            # If we have DXF, we can render a quick preview.
+            out_png = os.path.join(pdir, f"{prefix}.png")
+            out_map = os.path.join(pdir, f"{prefix}_mapping.json")
+            render_dxf_to_png_and_mapping(
+                dxf_path=src_dxf,
+                out_png=out_png,
+                out_json=out_map,
+                target_long_side_px=8000,
+                dpi=200,
+                pad_frac=0.05,
+            )
+            src_png = out_png
+
+    if fmt == "dxf":
+        filename = f"{prefix}.dxf"
+        return FileResponse(src_dxf, media_type="application/octet-stream", filename=filename)
+
+    if fmt == "dwg":
+        if not has_oda():
+            raise HTTPException(400, "DWG export requires ODA_PATH on the server. Set ODA_PATH or download DXF instead.")
+        out_dir = os.path.join(pdir, "exports")
+        os.makedirs(out_dir, exist_ok=True)
+        out_dwg = os.path.join(out_dir, f"{prefix}.dwg")
+        if not os.path.exists(out_dwg) or os.path.getmtime(out_dwg) < os.path.getmtime(src_dxf):
+            produced = dxf_to_dwg(src_dxf, out_dir)
+            # Normalize name for repeatability.
+            try:
+                import shutil
+                shutil.copy2(produced, out_dwg)
+            except Exception:
+                out_dwg = produced
+        return FileResponse(out_dwg, media_type="application/octet-stream", filename=f"{prefix}.dwg")
+
+    if fmt == "png":
+        return FileResponse(src_png, media_type="application/octet-stream", filename=f"{prefix}.png")
+
+    # pdf
+    out_dir = os.path.join(pdir, "exports")
+    os.makedirs(out_dir, exist_ok=True)
+    out_pdf = os.path.join(out_dir, f"{prefix}.pdf")
+    if not os.path.exists(out_pdf) or os.path.getmtime(out_pdf) < os.path.getmtime(src_png):
+        Image.MAX_IMAGE_PIXELS = None
+        with Image.open(src_png) as im:
+            if im.mode != "RGB":
+                im = im.convert("RGB")
+            im.save(out_pdf, "PDF", resolution=300.0)
+    return FileResponse(out_pdf, media_type="application/octet-stream", filename=f"{prefix}.pdf")
