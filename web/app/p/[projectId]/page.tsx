@@ -20,6 +20,51 @@ function resolveApiBase() {
 
 const apiUrl = (path: string) => `${resolveApiBase()}${path}`;
 
+const NETWORK_PENDING_EVENT = "firecad-network-pending";
+let networkPendingCount = 0;
+
+function emitNetworkPending() {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent<number>(NETWORK_PENDING_EVENT, { detail: networkPendingCount }));
+}
+
+function beginNetworkActivity() {
+  networkPendingCount += 1;
+  emitNetworkPending();
+}
+
+function endNetworkActivity() {
+  networkPendingCount = Math.max(0, networkPendingCount - 1);
+  emitNetworkPending();
+}
+
+function getNetworkPendingCount() {
+  return networkPendingCount;
+}
+
+async function trackedFetch(url: string, init?: RequestInit) {
+  beginNetworkActivity();
+  try {
+    return await fetch(url, init);
+  } finally {
+    endNetworkActivity();
+  }
+}
+
+const WORLD_TO_M_BY_UNIT: Record<string, number> = {
+  mm: 0.001,
+  cm: 0.01,
+  m: 1.0,
+  inch: 0.0254,
+  in: 0.0254,
+  ft: 0.3048,
+};
+
+function deriveWorldToMFromUnits(units: string) {
+  const key = (units || "").trim().toLowerCase();
+  return WORLD_TO_M_BY_UNIT[key] ?? 0.001;
+}
+
 async function authFetch(path: string, init?: RequestInit) {
   const token = getToken();
   const headers: Record<string, string> = {
@@ -32,7 +77,13 @@ async function authFetch(path: string, init?: RequestInit) {
   }
   if (token) headers.Authorization = `Bearer ${token}`;
 
-  const res = await fetch(apiUrl(path), { ...init, headers });
+  beginNetworkActivity();
+  let res: Response;
+  try {
+    res = await fetch(apiUrl(path), { ...init, headers });
+  } finally {
+    endNetworkActivity();
+  }
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `Request failed (${res.status})`);
@@ -108,6 +159,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   const [project, setProject] = useState<Project | null>(null);
   const [detectors, setDetectors] = useState<Detector[]>([]);
   const [mapping, setMapping] = useState<Mapping | null>(null);
+  const [networkPending, setNetworkPending] = useState(0);
+  const [wizardStep, setWizardStep] = useState(1);
 
   const [settings, setSettings] = useState<any>({
     detector_spacing_m: 5.0,
@@ -117,6 +170,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     building_type: "residential",
     has_false_ceiling: false,
     units: "mm",
+    typical_ceiling_height: 3.0,
+    ceiling_height_unit: "m",
 
   });
 
@@ -129,7 +184,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
 
     const mappingUrl = p.files?.mapping_json || p.files?.output_preview_mapping;
     if (mappingUrl) {
-      const mj: Mapping = await (await fetch(apiUrl(mappingUrl))).json();
+      const mj: Mapping = await (await trackedFetch(apiUrl(mappingUrl), { cache: "no-store" })).json();
       setMapping(mj);
     } else {
       setMapping(null);
@@ -138,11 +193,39 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
 
   useEffect(() => { refresh(); }, []);
 
+  useEffect(() => {
+    setNetworkPending(getNetworkPendingCount());
+    const handler = (event: Event) => {
+      const next = (event as CustomEvent<number>).detail;
+      setNetworkPending(Number.isFinite(next) ? next : getNetworkPendingCount());
+    };
+    window.addEventListener(NETWORK_PENDING_EVENT, handler as EventListener);
+    return () => window.removeEventListener(NETWORK_PENDING_EVENT, handler as EventListener);
+  }, []);
+
+  useEffect(() => {
+    if (!project) return;
+    if (!project.files?.input) {
+      setWizardStep(1);
+      return;
+    }
+    setWizardStep((current) => {
+      if (current < 2) return 2;
+      return current;
+    });
+  }, [project]);
+
   async function saveSettings() {
+    const normalizedSettings = {
+      ...settings,
+      world_to_m: deriveWorldToMFromUnits(String(settings.units || "mm")),
+    };
+
     await authFetch(`/api/projects/${projectId}/settings`, {
       method:"POST",
-      body: JSON.stringify({ settings })
+      body: JSON.stringify({ settings: normalizedSettings })
     });
+    setSettings(normalizedSettings);
     await refresh();
   }
 
@@ -154,6 +237,9 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
 
   const isReady = project?.status === "ready";
   const isAwaitingAlignmentReview = project?.status === "awaiting_alignment_review";
+  const isRunning = project?.status === "running";
+  const isQuestionnaireMode = !isReady && !isAwaitingAlignmentReview && !isRunning;
+  const showGlobalLoader = project === null || networkPending > 0;
 
   async function saveLayout() {
     await authFetch(`/api/projects/${projectId}/save`, { method:"POST" });
@@ -183,125 +269,152 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     <main
       style={{
         ...styles.workspace,
-        gridTemplateColumns: isReady ? "1fr" : "380px 1fr"
+        gridTemplateColumns: "1fr"
       }}
     >
       <div style={styles.bgGlowTop} />
       <div style={styles.bgGlowBottom} />
 
-      {!isReady ? (
-      <aside style={styles.sidebar}>
-        <div style={styles.sidebarTopRow}>
-          <div>
-            <div style={styles.sidebarLabel}>Project</div>
-            <strong style={styles.projectTitle}>{project?.name || "Loading..."}</strong>
-          </div>
-          <button onClick={refresh} style={btn(false, true)}>Refresh</button>
-        </div>
-
-        <div style={styles.statusRow}>
-          <span>Status</span>
-          <span style={styles.statusValue}>{project?.status || "-"}</span>
-        </div>
-
-        {project?.error ? (
-          <pre style={styles.errorBox}>
-{project.error}
-          </pre>
-        ) : null}
-
-        {isAwaitingAlignmentReview ? (
-          <>
-            <div style={styles.uploadSection}>
-              <label style={styles.fieldLabel}>Replace aligned mask (optional)</label>
-              <input type="file" accept=".png,.jpg,.jpeg,.webp" onChange={uploadAlignedMaskFile} />
-            </div>
-
-            <div style={{ display:"flex", gap: 10, marginTop: 14 }}>
-              <button onClick={refresh} style={btn(false)}>Refresh</button>
-            </div>
-
-            <hr style={styles.divider} />
-            <div style={styles.helpText}>
-              <b>Alignment review:</b> verify mask alignment below. If required, upload a corrected aligned mask and then continue.
-            </div>
-          </>
-        ) : (
-          <>
-            <div style={styles.uploadSection}>
-              <label style={styles.fieldLabel}>Upload DWG/DXF</label>
-              <input type="file" accept=".dxf,.dwg" onChange={(e)=>uploadFile(projectId, e, refresh)} />
-            </div>
-
-            <hr style={styles.divider} />
-
-            <h4 style={styles.sectionTitle}>Project questions</h4>
-
-            <Field label="Building type">
-              <select value={settings.building_type} onChange={(e)=>setSettings({...settings, building_type: e.target.value})}>
-                <option value="residential">Residential</option>
-                <option value="commercial">Commercial</option>
-                <option value="industrial">Industrial</option>
-                <option value="hospital">Hospital</option>
-                <option value="school">School</option>
-              </select>
-            </Field>
-
-            <Field label="Drawing units">
-              <select value={settings.units} onChange={(e)=>setSettings({...settings, units: e.target.value})}>
-                <option value="mm">mm</option>
-                <option value="cm">cm</option>
-                <option value="m">m</option>
-                <option value="inch">inch</option>
-                <option value="ft">ft</option>
-              </select>
-            </Field>
-
-            <Field label="Detector spacing (meters)">
-              <input type="number" step="0.1" value={settings.detector_spacing_m}
-                onChange={(e)=>setSettings({...settings, detector_spacing_m: Number(e.target.value)})}/>
-            </Field>
-
-            <Field label="Min distance from wall (meters)">
-              <input type="number" step="0.1" value={settings.wall_buffer_m}
-                onChange={(e)=>setSettings({...settings, wall_buffer_m: Number(e.target.value)})}/>
-            </Field>
-
-            <Field label="Render long side (px)">
-              <input type="number" step="500" value={settings.target_long_side_px}
-                onChange={(e)=>setSettings({...settings, target_long_side_px: Number(e.target.value)})}/>
-            </Field>
-
-            <Field label="Gemini image model">
-              <input value={settings.gemini_model}
-                onChange={(e)=>setSettings({...settings, gemini_model: e.target.value})}/>
-              <div style={{ fontSize: 12, opacity:0.65, marginTop: 4 }}>
-                Requires GEMINI_API_KEY on server
+      {isQuestionnaireMode ? (
+        <section style={styles.questionnaireCenterWrap}>
+          <div style={styles.questionnaireCard}>
+            <div style={styles.sidebarTopRow}>
+              <div>
+                <div style={styles.sidebarLabel}>Project</div>
+                <strong style={styles.projectTitle}>{project?.name || "Loading..."}</strong>
               </div>
-            </Field>
-
-            <div style={{ display:"flex", gap: 10, marginTop: 14 }}>
-              <button onClick={saveSettings} style={btn()}>Save</button>
-              <button onClick={runPipeline} style={btn(true)}>Run Auto-Placement</button>
+              <button onClick={refresh} style={btn(false, true)}>Refresh</button>
             </div>
 
-            <div style={{ marginTop: 12, display:"flex", gap: 8 }}>
-              {project?.files?.output_dxf ? (
-                <a href={apiUrl(project.files.output_dxf)} style={{ ...btn(true), textDecoration:"none", display:"inline-flex", alignItems:"center", justifyContent:"center" }}>
-                  Download output DXF
-                </a>
+            <div style={styles.statusRow}>
+              <span>Status</span>
+              <span style={styles.statusValue}>{project?.status || "-"}</span>
+            </div>
+
+            {project?.error ? (
+              <pre style={styles.errorBox}>
+{project.error}
+              </pre>
+            ) : null}
+
+            <h4 style={{ ...styles.sectionTitle, marginTop: 16 }}>Setup questionnaire</h4>
+            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
+              Step {wizardStep} of 4
+            </div>
+
+            <div key={`wizard-step-${wizardStep}`} className="wizardStepPanel">
+              {wizardStep === 1 ? (
+                <>
+                  <Field label="Input DWG/DXF drawing">
+                    <input
+                      type="file"
+                      accept=".dxf,.dwg"
+                      onChange={async (e) => {
+                        await uploadFile(projectId, e, refresh);
+                        setWizardStep(2);
+                      }}
+                    />
+                  </Field>
+                  <div style={{ display:"flex", gap: 10, marginTop: 14 }}>
+                    <button
+                      onClick={() => setWizardStep(2)}
+                      disabled={!project?.files?.input}
+                      style={btn(true)}
+                    >
+                      Continue
+                    </button>
+                  </div>
+                </>
+              ) : null}
+
+              {wizardStep === 2 ? (
+                <>
+                  <Field label="What type of building is this?">
+                    <select value={settings.building_type} onChange={(e)=>setSettings({...settings, building_type: e.target.value})}>
+                      <option value="residential">Residential</option>
+                      <option value="commercial">Commercial</option>
+                      <option value="industrial">Industrial</option>
+                      <option value="hospital">Hospital</option>
+                      <option value="school">School</option>
+                    </select>
+                  </Field>
+                  <div style={{ display:"flex", gap: 10, marginTop: 14 }}>
+                    <button onClick={() => setWizardStep(1)} style={btn(false)}>Back</button>
+                    <button onClick={() => setWizardStep(3)} style={btn(true)}>Next</button>
+                  </div>
+                </>
+              ) : null}
+
+              {wizardStep === 3 ? (
+                <>
+                  <Field label="What units is this drawing in?">
+                    <select value={settings.units} onChange={(e)=>setSettings({...settings, units: e.target.value})}>
+                      <option value="mm">mm</option>
+                      <option value="cm">cm</option>
+                      <option value="m">m</option>
+                      <option value="inch">inch</option>
+                      <option value="ft">ft</option>
+                    </select>
+                  </Field>
+                  <div style={{ display:"flex", gap: 10, marginTop: 14 }}>
+                    <button onClick={() => setWizardStep(2)} style={btn(false)}>Back</button>
+                    <button onClick={() => setWizardStep(4)} style={btn(true)}>Next</button>
+                  </div>
+                </>
+              ) : null}
+
+              {wizardStep === 4 ? (
+                <>
+                  <Field label="What’s the typical ceiling height?">
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.1"
+                        value={settings.typical_ceiling_height}
+                        onChange={(e)=>setSettings({...settings, typical_ceiling_height: Number(e.target.value)})}
+                      />
+                      <select
+                        value={settings.ceiling_height_unit}
+                        onChange={(e)=>setSettings({...settings, ceiling_height_unit: e.target.value})}
+                        style={{ width: 92 }}
+                      >
+                        <option value="m">m</option>
+                        <option value="ft">ft</option>
+                      </select>
+                    </div>
+                  </Field>
+                  <div style={{ display:"flex", gap: 10, marginTop: 14 }}>
+                    <button onClick={() => setWizardStep(3)} style={btn(false)}>Back</button>
+                    <button onClick={runPipeline} style={btn(true)}>Run Auto-Placement</button>
+                  </div>
+                </>
               ) : null}
             </div>
-
-            <hr style={styles.divider} />
-            <div style={styles.helpText}>
-              <b>Editing:</b> Select tool: drag box to multi-select, drag selected to move • Add tool: click to add • Erase tool: click to delete
-            </div>
-          </>
-        )}
-      </aside>
+          </div>
+        </section>
       ) : null}
 
+      {isRunning ? (
+      <section style={styles.questionnaireCenterWrap}>
+        <div style={styles.runningCard}>
+          <div className="runningOrb" />
+          <div className="runningRing" />
+          <h3 style={{ margin: "0 0 8px 0", fontSize: 24 }}>Processing your drawing</h3>
+          <p style={{ margin: 0, opacity: 0.8, textAlign: "center", maxWidth: 460 }}>
+            Pipeline is running. We’re extracting rooms, placing detectors, and preparing outputs. This usually takes a moment.
+          </p>
+          <div style={{ marginTop: 14, fontSize: 12, opacity: 0.75 }}>
+            Status: {project?.status || "running"}
+          </div>
+          <div style={{ marginTop: 14, display: "flex", gap: 10 }}>
+            <button onClick={refresh} style={btn(false, true)}>Refresh status</button>
+          </div>
+        </div>
+      </section>
+      ) : null}
+
+      {!isQuestionnaireMode && !isRunning ? (
       <section style={styles.canvasPanel}>
         {isAwaitingAlignmentReview ? (
           project?.files?.aligned_mask && project?.files?.render_png ? (
@@ -309,6 +422,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
               originalUrl={apiUrl(project.files.render_png)}
               alignedUrl={apiUrl(project.files.aligned_mask)}
               onContinue={continuePipelineAfterAlignment}
+              onUploadAlignedMask={uploadAlignedMaskFile}
+              onRefresh={refresh}
             />
           ) : (
             <div style={styles.emptyState}>
@@ -335,6 +450,17 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           />
         )}
       </section>
+      ) : null}
+
+      {showGlobalLoader ? (
+        <div style={styles.globalLoaderOverlay}>
+          <div style={styles.globalLoaderCard}>
+            <div className="globalLoaderSpinner" />
+            <div style={{ fontSize: 16, fontWeight: 600 }}>Loading</div>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>Please wait while we complete your request...</div>
+          </div>
+        </div>
+      ) : null}
 
       <style jsx>{`
         input,
@@ -368,6 +494,77 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           color: #111827;
           background: #ffffff;
         }
+
+        .wizardStepPanel {
+          animation: wizardFadeSlide 260ms ease;
+        }
+
+        .runningOrb {
+          width: 58px;
+          height: 58px;
+          border-radius: 999px;
+          background: radial-gradient(circle at 35% 35%, #9fb4ff 0%, #6f86ff 45%, #4f63de 100%);
+          box-shadow: 0 10px 28px rgba(99, 122, 255, 0.55);
+          animation: pulseOrb 1.6s ease-in-out infinite;
+          z-index: 2;
+          margin-bottom: 12px;
+        }
+
+        .runningRing {
+          position: absolute;
+          top: 58px;
+          left: 50%;
+          width: 126px;
+          height: 126px;
+          border-radius: 999px;
+          border: 2px solid rgba(133, 157, 255, 0.45);
+          border-top-color: rgba(255, 255, 255, 0.95);
+          transform: translateX(-50%);
+          animation: spinRing 1.2s linear infinite;
+          pointer-events: none;
+        }
+
+        .globalLoaderSpinner {
+          width: 44px;
+          height: 44px;
+          border-radius: 999px;
+          border: 3px solid rgba(190, 205, 255, 0.38);
+          border-top-color: rgba(255, 255, 255, 0.98);
+          animation: spinRing 0.9s linear infinite;
+          margin-bottom: 8px;
+        }
+
+        @keyframes wizardFadeSlide {
+          from {
+            opacity: 0;
+            transform: translateY(8px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+
+        @keyframes spinRing {
+          from {
+            transform: translateX(-50%) rotate(0deg);
+          }
+          to {
+            transform: translateX(-50%) rotate(360deg);
+          }
+        }
+
+        @keyframes pulseOrb {
+          0%,
+          100% {
+            transform: scale(1);
+            opacity: 0.95;
+          }
+          50% {
+            transform: scale(1.08);
+            opacity: 1;
+          }
+        }
       `}</style>
     </main>
   );
@@ -377,10 +574,14 @@ function AlignmentReview({
   originalUrl,
   alignedUrl,
   onContinue,
+  onUploadAlignedMask,
+  onRefresh,
 }: {
   originalUrl: string;
   alignedUrl: string;
   onContinue: (adjustedMaskBlob: Blob) => Promise<void>;
+  onUploadAlignedMask: (e: any) => Promise<void>;
+  onRefresh: () => Promise<void>;
 }) {
   const [origDims, setOrigDims] = useState<{w:number; h:number} | null>(null);
   const [maskDims, setMaskDims] = useState<{w:number; h:number} | null>(null);
@@ -579,6 +780,14 @@ function AlignmentReview({
         <span style={{ fontSize: 12, color: "#dbe4ff" }}>{Math.round(viewZoom * 100)}%</span>
 
         <button onClick={() => { setOffsetX(0); setOffsetY(0); setScale(1); setViewZoom(1); setBoxScaleX(1); setBoxScaleY(1); }} style={toolBtn(false)}>Reset</button>
+        <label style={{ fontSize: 12, color: "#dbe4ff", marginLeft: 6 }}>Replace mask</label>
+        <input
+          type="file"
+          accept=".png,.jpg,.jpeg,.webp"
+          onChange={onUploadAlignedMask}
+          style={{ width: 220 }}
+        />
+        <button onClick={onRefresh} style={toolBtn(false)}>Refresh</button>
         <button onClick={continueWithAdjustedMask} style={toolBtn(true)} disabled={isContinuing}>
           {isContinuing ? "Continuing..." : "Continue Pipeline"}
         </button>
@@ -870,6 +1079,58 @@ const styles: Record<string, CSSProperties> = {
     boxShadow: "0 20px 56px rgba(0,0,0,0.34)",
     overflow: "hidden",
     minHeight: 0
+  },
+  questionnaireCenterWrap: {
+    zIndex: 1,
+    minHeight: "calc(100vh - 28px)",
+    display: "grid",
+    placeItems: "center",
+    padding: "14px"
+  },
+  questionnaireCard: {
+    width: "min(680px, 100%)",
+    borderRadius: "20px",
+    border: "1px solid rgba(255,255,255,0.18)",
+    background: "linear-gradient(160deg, rgba(255,255,255,0.13), rgba(255,255,255,0.05))",
+    backdropFilter: "blur(10px)",
+    boxShadow: "0 20px 56px rgba(0,0,0,0.34)",
+    padding: "18px"
+  },
+  runningCard: {
+    width: "min(620px, 100%)",
+    borderRadius: "22px",
+    border: "1px solid rgba(255,255,255,0.2)",
+    background: "linear-gradient(160deg, rgba(255,255,255,0.14), rgba(255,255,255,0.06))",
+    backdropFilter: "blur(12px)",
+    boxShadow: "0 26px 64px rgba(0,0,0,0.36)",
+    padding: "30px 22px",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    position: "relative",
+    overflow: "hidden"
+  },
+  globalLoaderOverlay: {
+    position: "fixed",
+    inset: 0,
+    zIndex: 30,
+    background: "rgba(6, 10, 20, 0.45)",
+    backdropFilter: "blur(6px)",
+    display: "grid",
+    placeItems: "center",
+    pointerEvents: "all"
+  },
+  globalLoaderCard: {
+    width: "min(320px, calc(100% - 32px))",
+    borderRadius: "16px",
+    border: "1px solid rgba(255,255,255,0.2)",
+    background: "linear-gradient(160deg, rgba(255,255,255,0.13), rgba(255,255,255,0.06))",
+    boxShadow: "0 20px 50px rgba(0,0,0,0.32)",
+    padding: "16px 18px",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 4
   },
   emptyState: {
     height: "100%",
