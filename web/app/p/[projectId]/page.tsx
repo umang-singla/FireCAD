@@ -475,8 +475,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           width: 100%;
           border-radius: 12px;
           border: 1px solid rgba(255, 255, 255, 0.2);
-          background: rgba(14, 19, 36, 0.85);
-          color: #f4f7ff;
+          background: rgba(13, 30, 20, 0.85);
+          color: #F0FFF4;
           padding: 10px 12px;
           outline: none;
         }
@@ -485,8 +485,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           width: 100%;
           border-radius: 12px;
           border: 1px solid rgba(255, 255, 255, 0.2);
-          background: rgba(14, 19, 36, 0.7);
-          color: #d9e2ff;
+          background: rgba(13, 30, 20, 0.7);
+          color: #D8F3DC;
           padding: 8px;
         }
 
@@ -503,8 +503,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           width: 58px;
           height: 58px;
           border-radius: 999px;
-          background: radial-gradient(circle at 35% 35%, #9fb4ff 0%, #6f86ff 45%, #4f63de 100%);
-          box-shadow: 0 10px 28px rgba(99, 122, 255, 0.55);
+          background: radial-gradient(circle at 35% 35%, #95D5B2 0%, #52B788 45%, #2D6A4F 100%);
+          box-shadow: 0 10px 28px rgba(45, 106, 79, 0.55);
           animation: pulseOrb 1.6s ease-in-out infinite;
           z-index: 2;
           margin-bottom: 12px;
@@ -517,7 +517,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           width: 126px;
           height: 126px;
           border-radius: 999px;
-          border: 2px solid rgba(133, 157, 255, 0.45);
+          border: 2px solid rgba(82, 183, 136, 0.45);
           border-top-color: rgba(255, 255, 255, 0.95);
           transform: translateX(-50%);
           animation: spinRing 1.2s linear infinite;
@@ -528,7 +528,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           width: 44px;
           height: 44px;
           border-radius: 999px;
-          border: 3px solid rgba(190, 205, 255, 0.38);
+          border: 3px solid rgba(180, 230, 200, 0.38);
           border-top-color: rgba(255, 255, 255, 0.98);
           animation: spinRing 0.9s linear infinite;
           margin-bottom: 8px;
@@ -739,12 +739,12 @@ function AlignmentReview({
           gap: 10,
           borderRadius: 12,
           border: "1px solid rgba(255,255,255,0.14)",
-          background: "rgba(9, 14, 27, 0.78)",
+          background: "rgba(9, 24, 14, 0.78)",
           padding: "10px 12px",
           flexWrap: "wrap",
         }}
       >
-        <span style={{ fontSize: 12, color: "#dbe4ff" }}>Opacity</span>
+        <span style={{ fontSize: 12, color: "#D8F3DC" }}>Opacity</span>
         <input
           type="range"
           min={0}
@@ -753,9 +753,9 @@ function AlignmentReview({
           onChange={(e) => setOpacity(Number(e.target.value))}
           style={{ width: 120 }}
         />
-        <span style={{ fontSize: 12, color: "#dbe4ff" }}>{opacity}%</span>
+        <span style={{ fontSize: 12, color: "#D8F3DC" }}>{opacity}%</span>
 
-        <span style={{ fontSize: 12, color: "#dbe4ff", marginLeft: 12 }}>Scale</span>
+        <span style={{ fontSize: 12, color: "#D8F3DC", marginLeft: 12 }}>Scale</span>
         <input
           type="range"
           min={50}
@@ -764,9 +764,9 @@ function AlignmentReview({
           onChange={(e) => setScale(Number(e.target.value) / 100)}
           style={{ width: 120 }}
         />
-        <span style={{ fontSize: 12, color: "#dbe4ff" }}>{Math.round(scale * 100)}%</span>
+        <span style={{ fontSize: 12, color: "#D8F3DC" }}>{Math.round(scale * 100)}%</span>
 
-        <span style={{ fontSize: 12, color: "#dbe4ff", marginLeft: 12 }}>View</span>
+        <span style={{ fontSize: 12, color: "#D8F3DC", marginLeft: 12 }}>View</span>
         <button onClick={() => setViewZoom((v) => Math.max(0.25, v - 0.1))} style={zoomBtn}>−</button>
         <input
           type="range"
@@ -777,10 +777,10 @@ function AlignmentReview({
           style={{ width: 120 }}
         />
         <button onClick={() => setViewZoom((v) => Math.min(3, v + 0.1))} style={zoomBtn}>+</button>
-        <span style={{ fontSize: 12, color: "#dbe4ff" }}>{Math.round(viewZoom * 100)}%</span>
+        <span style={{ fontSize: 12, color: "#D8F3DC" }}>{Math.round(viewZoom * 100)}%</span>
 
         <button onClick={() => { setOffsetX(0); setOffsetY(0); setScale(1); setViewZoom(1); setBoxScaleX(1); setBoxScaleY(1); }} style={toolBtn(false)}>Reset</button>
-        <label style={{ fontSize: 12, color: "#dbe4ff", marginLeft: 6 }}>Replace mask</label>
+        <label style={{ fontSize: 12, color: "#D8F3DC", marginLeft: 6 }}>Replace mask</label>
         <input
           type="file"
           accept=".png,.jpg,.jpeg,.webp"
@@ -800,7 +800,7 @@ function AlignmentReview({
           overflow: "auto",
           borderRadius: 12,
           border: "1px solid rgba(255,255,255,0.14)",
-          background: "rgba(4, 8, 18, 0.48)",
+          background: "rgba(4, 18, 10, 0.48)",
           padding: 10,
         }}
       >
@@ -864,7 +864,7 @@ function AlignmentReview({
                 style={{
                   position: "absolute",
                   inset: 0,
-                  border: "2px dashed rgba(143, 210, 255, 0.8)",
+                  border: "2px dashed rgba(82, 183, 136, 0.8)",
                   pointerEvents: "none",
                   borderRadius: 4,
                 }}
@@ -879,7 +879,7 @@ function AlignmentReview({
                   height: 14,
                   borderRadius: 3,
                   border: "1px solid rgba(255,255,255,0.9)",
-                  background: isResizing ? "#8fd2ff" : "#5bb9ff",
+                  background: isResizing ? "#52B788" : "#40916C",
                   cursor: "nwse-resize",
                   boxShadow: "0 2px 8px rgba(0,0,0,0.35)",
                 }}
@@ -888,37 +888,37 @@ function AlignmentReview({
 
               <div
                 onMouseDown={(e) => startResize(e, "n")}
-                style={{ position: "absolute", left: "50%", top: -6, transform: "translateX(-50%)", width: 12, height: 12, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#5bb9ff", cursor: "ns-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
+                style={{ position: "absolute", left: "50%", top: -6, transform: "translateX(-50%)", width: 12, height: 12, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#40916C", cursor: "ns-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
                 title="Resize top"
               />
               <div
                 onMouseDown={(e) => startResize(e, "s")}
-                style={{ position: "absolute", left: "50%", bottom: -6, transform: "translateX(-50%)", width: 12, height: 12, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#5bb9ff", cursor: "ns-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
+                style={{ position: "absolute", left: "50%", bottom: -6, transform: "translateX(-50%)", width: 12, height: 12, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#40916C", cursor: "ns-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
                 title="Resize bottom"
               />
               <div
                 onMouseDown={(e) => startResize(e, "e")}
-                style={{ position: "absolute", right: -6, top: "50%", transform: "translateY(-50%)", width: 12, height: 12, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#5bb9ff", cursor: "ew-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
+                style={{ position: "absolute", right: -6, top: "50%", transform: "translateY(-50%)", width: 12, height: 12, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#40916C", cursor: "ew-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
                 title="Resize right"
               />
               <div
                 onMouseDown={(e) => startResize(e, "w")}
-                style={{ position: "absolute", left: -6, top: "50%", transform: "translateY(-50%)", width: 12, height: 12, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#5bb9ff", cursor: "ew-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
+                style={{ position: "absolute", left: -6, top: "50%", transform: "translateY(-50%)", width: 12, height: 12, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#40916C", cursor: "ew-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
                 title="Resize left"
               />
               <div
                 onMouseDown={(e) => startResize(e, "nw")}
-                style={{ position: "absolute", left: -7, top: -7, width: 14, height: 14, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#5bb9ff", cursor: "nwse-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
+                style={{ position: "absolute", left: -7, top: -7, width: 14, height: 14, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#40916C", cursor: "nwse-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
                 title="Resize top-left"
               />
               <div
                 onMouseDown={(e) => startResize(e, "ne")}
-                style={{ position: "absolute", right: -7, top: -7, width: 14, height: 14, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#5bb9ff", cursor: "nesw-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
+                style={{ position: "absolute", right: -7, top: -7, width: 14, height: 14, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#40916C", cursor: "nesw-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
                 title="Resize top-right"
               />
               <div
                 onMouseDown={(e) => startResize(e, "sw")}
-                style={{ position: "absolute", left: -7, bottom: -7, width: 14, height: 14, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#5bb9ff", cursor: "nesw-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
+                style={{ position: "absolute", left: -7, bottom: -7, width: 14, height: 14, borderRadius: 3, border: "1px solid rgba(255,255,255,0.92)", background: "#40916C", cursor: "nesw-resize", boxShadow: "0 2px 8px rgba(0,0,0,0.35)" }}
                 title="Resize bottom-left"
               />
             </div>
@@ -944,15 +944,15 @@ function btn(primary=false, compact=false): CSSProperties {
   return {
     padding: compact ? "8px 12px" : "10px 12px",
     borderRadius: 12,
-    border: primary ? "1px solid rgba(127, 148, 255, 0.75)" : "1px solid rgba(255,255,255,0.2)",
+    border: primary ? "1px solid rgba(82, 183, 136, 0.75)" : "1px solid rgba(255,255,255,0.2)",
     background: primary
-      ? "linear-gradient(180deg, #697bff 0%, #5668f1 100%)"
-      : "rgba(14, 19, 36, 0.86)",
-    color: "#f4f7ff",
+      ? "linear-gradient(180deg, #40916C 0%, #2D6A4F 100%)"
+      : "rgba(13, 30, 20, 0.86)",
+    color: "#F0FFF4",
     cursor:"pointer",
     flex: 1,
     textAlign:"center",
-    boxShadow: primary ? "0 10px 24px rgba(93, 109, 241, 0.42)" : undefined,
+    boxShadow: primary ? "0 10px 24px rgba(45, 106, 79, 0.42)" : undefined,
   };
 }
 
@@ -964,7 +964,7 @@ const styles: Record<string, CSSProperties> = {
     gap: "14px",
     padding: "14px",
     background:
-      "radial-gradient(circle at 8% 18%, rgba(89, 110, 255, 0.22) 0%, transparent 35%), radial-gradient(circle at 82% 86%, rgba(33, 190, 170, 0.16) 0%, transparent 34%), linear-gradient(130deg, #090d17 0%, #0f1628 45%, #141c31 100%)",
+      "radial-gradient(circle at 8% 18%, rgba(45, 106, 79, 0.25) 0%, transparent 35%), radial-gradient(circle at 82% 86%, rgba(82, 183, 136, 0.18) 0%, transparent 34%), linear-gradient(130deg, #0A1F13 0%, #0D2818 45%, #132B1E 100%)",
     position: "relative",
     overflow: "hidden"
   },
@@ -975,7 +975,7 @@ const styles: Record<string, CSSProperties> = {
     width: "420px",
     height: "420px",
     borderRadius: "999px",
-    background: "rgba(112, 126, 255, 0.24)",
+    background: "rgba(45, 106, 79, 0.24)",
     filter: "blur(90px)",
     pointerEvents: "none"
   },
@@ -986,7 +986,7 @@ const styles: Record<string, CSSProperties> = {
     width: "460px",
     height: "460px",
     borderRadius: "999px",
-    background: "rgba(68, 224, 199, 0.18)",
+    background: "rgba(82, 183, 136, 0.18)",
     filter: "blur(96px)",
     pointerEvents: "none"
   },
@@ -1032,7 +1032,7 @@ const styles: Record<string, CSSProperties> = {
   },
   statusValue: {
     fontWeight: 600,
-    color: "#dbe4ff"
+    color: "#D8F3DC"
   },
   errorBox: {
     marginTop: "10px",
@@ -1051,7 +1051,7 @@ const styles: Record<string, CSSProperties> = {
     margin: "8px 0",
     fontSize: "14px",
     fontWeight: 600,
-    color: "#f4f7ff"
+    color: "#F0FFF4"
   },
   divider: {
     margin: "16px 0",
@@ -1074,7 +1074,7 @@ const styles: Record<string, CSSProperties> = {
     zIndex: 1,
     borderRadius: "20px",
     border: "1px solid rgba(255,255,255,0.16)",
-    background: "rgba(10, 14, 26, 0.7)",
+    background: "rgba(10, 26, 16, 0.7)",
     backdropFilter: "blur(8px)",
     boxShadow: "0 20px 56px rgba(0,0,0,0.34)",
     overflow: "hidden",
@@ -1413,7 +1413,7 @@ function Editor({
                 padding: "8px 10px",
                 borderRadius: 12,
                 border: "1px solid rgba(255,255,255,0.18)",
-                background: "rgba(9, 14, 27, 0.78)",
+                background: "rgba(9, 24, 14, 0.78)",
                 backdropFilter: "blur(8px)"
               }}
             >
@@ -1440,7 +1440,7 @@ function Editor({
                   );
                 })}
               </div>
-              <span style={{ fontSize: 12, color: "#dbe4ff", marginLeft: 2 }}>
+              <span style={{ fontSize: 12, color: "#D8F3DC", marginLeft: 2 }}>
                 Selected: {selectedIds.length}
               </span>
               {selectedIds.length > 0 ? (
@@ -1485,7 +1485,7 @@ function Editor({
                 padding: "8px 10px",
                 borderRadius: 12,
                 border: "1px solid rgba(255,255,255,0.18)",
-                background: "rgba(9, 14, 27, 0.78)",
+                background: "rgba(9, 24, 14, 0.78)",
                 backdropFilter: "blur(8px)"
               }}
             >
@@ -1503,7 +1503,7 @@ function Editor({
               />
               <button onClick={() => zoomIn()} style={zoomBtn}>+</button>
               <button onClick={() => resetTransform()} style={zoomBtn}>Fit</button>
-              <span style={{ fontSize: 12, color: "#dbe4ff", minWidth: 44, textAlign: "right" }}>
+              <span style={{ fontSize: 12, color: "#D8F3DC", minWidth: 44, textAlign: "right" }}>
                 {Math.round(transformState.scale * 100)}%
               </span>
             </div>
@@ -1514,7 +1514,7 @@ function Editor({
                 height:"100%",
                 borderRadius: "14px",
                 border: "1px solid rgba(255,255,255,0.14)",
-                background: "rgba(4, 8, 18, 0.48)"
+                background: "rgba(4, 18, 10, 0.48)"
               }}
             >
               <div style={{ position:"relative", display:"inline-block" }}>
@@ -1630,8 +1630,8 @@ function Editor({
                           y={rect.top}
                           width={Math.max(1, rect.right - rect.left)}
                           height={Math.max(1, rect.bottom - rect.top)}
-                          fill="rgba(143, 210, 255, 0.15)"
-                          stroke="#8fd2ff"
+                          fill="rgba(82, 183, 136, 0.15)"
+                          stroke="#52B788"
                           strokeWidth={2}
                           strokeDasharray="6 4"
                         />
@@ -1639,9 +1639,9 @@ function Editor({
                     })() : null}
                     {tool === "add" && hoverPoint ? (
                       <g>
-                        <circle cx={hoverPoint.px} cy={hoverPoint.py} r={13} fill="none" stroke="#8fd2ff" strokeWidth={2} strokeDasharray="5 4" />
-                        <line x1={hoverPoint.px - 9} y1={hoverPoint.py} x2={hoverPoint.px + 9} y2={hoverPoint.py} stroke="#8fd2ff" strokeWidth={2} />
-                        <line x1={hoverPoint.px} y1={hoverPoint.py - 9} x2={hoverPoint.px} y2={hoverPoint.py + 9} stroke="#8fd2ff" strokeWidth={2} />
+                        <circle cx={hoverPoint.px} cy={hoverPoint.py} r={13} fill="none" stroke="#52B788" strokeWidth={2} strokeDasharray="5 4" />
+                        <line x1={hoverPoint.px - 9} y1={hoverPoint.py} x2={hoverPoint.px + 9} y2={hoverPoint.py} stroke="#52B788" strokeWidth={2} />
+                        <line x1={hoverPoint.px} y1={hoverPoint.py - 9} x2={hoverPoint.px} y2={hoverPoint.py + 9} stroke="#52B788" strokeWidth={2} />
                       </g>
                     ) : null}
                   </svg>
@@ -1658,8 +1658,8 @@ function Editor({
 const zoomBtn: CSSProperties = {
   borderRadius: 10,
   border: "1px solid rgba(255,255,255,0.2)",
-  background: "rgba(18, 24, 44, 0.9)",
-  color: "#f4f7ff",
+  background: "rgba(18, 35, 24, 0.9)",
+  color: "#F0FFF4",
   height: 30,
   minWidth: 34,
   padding: "0 10px",
@@ -1671,9 +1671,9 @@ const zoomBtn: CSSProperties = {
 function toolBtn(active: boolean): CSSProperties {
   return {
     borderRadius: 10,
-    border: active ? "1px solid rgba(127, 148, 255, 0.82)" : "1px solid rgba(255,255,255,0.2)",
-    background: active ? "linear-gradient(180deg, #697bff 0%, #5668f1 100%)" : "rgba(18, 24, 44, 0.9)",
-    color: "#f4f7ff",
+    border: active ? "1px solid rgba(82, 183, 136, 0.82)" : "1px solid rgba(255,255,255,0.2)",
+    background: active ? "linear-gradient(180deg, #40916C 0%, #2D6A4F 100%)" : "rgba(18, 35, 24, 0.9)",
+    color: "#F0FFF4",
     height: 30,
     minWidth: 56,
     padding: "0 10px",
@@ -1789,9 +1789,9 @@ function objectLabel(dtype: ObjectType): string {
 function objectToolBtn(active: boolean): CSSProperties {
   return {
     borderRadius: 10,
-    border: active ? "1px solid rgba(127, 148, 255, 0.82)" : "1px solid rgba(255,255,255,0.2)",
-    background: active ? "linear-gradient(180deg, #697bff 0%, #5668f1 100%)" : "rgba(18, 24, 44, 0.9)",
-    color: "#f4f7ff",
+    border: active ? "1px solid rgba(82, 183, 136, 0.82)" : "1px solid rgba(255,255,255,0.2)",
+    background: active ? "linear-gradient(180deg, #40916C 0%, #2D6A4F 100%)" : "rgba(18, 35, 24, 0.9)",
+    color: "#F0FFF4",
     height: 30,
     minWidth: 74,
     padding: "0 8px",
