@@ -40,6 +40,19 @@ services:
       - ./data:/data
       - ./qcad-3.32.6-trial-linux-x86_64:/opt/qcad:ro
 
+  proxy:
+    build: ./proxy
+    environment:
+      PROXY_HOST: "0.0.0.0"
+      PROXY_PORT: "8080"
+      PROXY_TIMEOUT: ${PROXY_TIMEOUT:-120}
+      PROXY_DEFAULT_TARGET: ${PROXY_DEFAULT_TARGET:-http://api:8000}
+      PROXY_TARGETS: ${PROXY_TARGETS:-'{"api":"http://api:8000"}'}
+    ports:
+      - "8080:8080"
+    depends_on:
+      - api
+
   web:
     build: ./web
     environment:
