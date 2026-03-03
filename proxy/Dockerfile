@@ -3,10 +3,10 @@ ARG PROXY_DEFAULT_TARGET=""
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY proxy/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py .
+COPY proxy/server.py .
 
 ENV PYTHONUNBUFFERED=1
 ENV PROXY_DEFAULT_TARGET=${PROXY_DEFAULT_TARGET}
