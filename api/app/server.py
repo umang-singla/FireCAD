@@ -11,9 +11,11 @@ def main():
         env_file = Path(__file__).resolve().parent.parent / ".env"
         if env_file.is_file():
             load_dotenv(env_file, override=False)
-            logging.info("Loaded env from %s", env_file)
+            print(f"[dotenv] Loaded env from {env_file}")
+        else:
+            print(f"[dotenv] No .env file at {env_file}")
     except ImportError:
-        pass
+        print("[dotenv] python-dotenv not installed, skipping .env load")
     host = os.getenv("API_HOST", "0.0.0.0")
     port = int(os.getenv("API_PORT", "8000"))
     log_level = os.getenv("LOG_LEVEL", "info").lower()

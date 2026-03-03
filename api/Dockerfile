@@ -1,5 +1,4 @@
 FROM python:3.11-slim
-ARG GEMINI_API_KEY=""
 
 # System libs needed by OpenCV + PyMuPDF
 RUN apt-get update -qq && apt-get install -y -qq \
@@ -70,7 +69,6 @@ COPY api/app /app/app
 COPY .env /app/.env
 
 ENV PYTHONUNBUFFERED=1
-ENV GEMINI_API_KEY=${GEMINI_API_KEY}
 ENV ODA_PATH=/opt/oda/ODAFileConverter
 ENV QCAD_DWG2BMP=/opt/qcad/dwg2bmp
 ENV USE_QCAD_DWG2BMP=1
