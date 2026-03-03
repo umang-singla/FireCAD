@@ -165,7 +165,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   const [settings, setSettings] = useState<any>({
     detector_spacing_m: 5.0,
     wall_buffer_m: 0.5,
-    target_long_side_px: 12000,
+    target_long_side_px: 6000,
     gemini_model: "gemini-3.1-flash-image-preview",
     building_type: "residential",
     has_false_ceiling: false,

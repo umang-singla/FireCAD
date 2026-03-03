@@ -35,6 +35,9 @@ RUN set -eux; \
 # Bundle QCAD binaries for DWG preview rendering in cloud environments
 COPY qcad-3.32.6-trial-linux-x86_64 /opt/qcad
 RUN set -eux; \
+		# Strip any Windows CR from shell-script wrappers (autocrlf safety net)
+		find /opt/qcad -maxdepth 1 -type f ! -name '*.so*' -exec \
+			sh -c 'head -c2 "$1" | grep -q "#!" && sed -i "s/\r$//" "$1"' _ {} \; ; \
 		if [ -d /opt/qcad ]; then \
 			for f in /opt/qcad/dwg2bmp /opt/qcad/qcad-bin /opt/qcad/qcad; do \
 				if [ -f "$f" ]; then chmod +x "$f"; fi; \

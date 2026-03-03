@@ -15,7 +15,7 @@ services:
       # ✅ ADD THIS LINE (for login JWT tokens)
       JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
 
-      TARGET_LONG_SIDE_PX: ${TARGET_LONG_SIDE_PX:-12000}
+      TARGET_LONG_SIDE_PX: ${TARGET_LONG_SIDE_PX:-6000}
       DPI: ${DPI:-600}
       RENDER_MAX_MEGAPIXELS: ${RENDER_MAX_MEGAPIXELS:-25}
       QCAD_DWG2BMP: ${QCAD_DWG2BMP:-/opt/qcad/dwg2bmp}
@@ -38,10 +38,16 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/data
-      - ./qcad-3.32.6-trial-linux-x86_64:/opt/qcad:ro
+      # QCAD is already baked into the image via COPY in Dockerfile.
+      # Do NOT mount over /opt/qcad — it shadows the image contents
+      # and breaks execution on Azure/cloud where the host path is absent.
+      # Uncomment below ONLY for local dev to avoid rebuilds:
+      # - ./qcad-3.32.6-trial-linux-x86_64:/opt/qcad:ro
 
   proxy:
-    build: ./proxy
+    build:
+      context: .
+      dockerfile: proxy/Dockerfile
     environment:
       PROXY_HOST: "0.0.0.0"
       PROXY_PORT: "8080"

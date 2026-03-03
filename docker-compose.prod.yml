@@ -1,0 +1,15 @@
+# docker-compose.prod.yml
+# Production overrides – use when deploying to Azure or any cloud host.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up
+#
+# This removes the local QCAD bind-mount so the image's baked-in /opt/qcad
+# (from the Dockerfile COPY) is used instead.
+
+services:
+  api:
+    volumes:
+      - ./data:/data
+      # NOTE: the qcad volume mount from docker-compose.yml is intentionally
+      # removed here – the Dockerfile already COPYs QCAD into the image.

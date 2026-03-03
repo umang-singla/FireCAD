@@ -3,7 +3,7 @@ import os
 
 @dataclass
 class PipelineOptions:
-    target_long_side_px: int = 12000
+    target_long_side_px: int = 6000
     dpi: int = 600
     pad_frac: float = 0.01
     detector_spacing_m: float = 5.0
@@ -15,7 +15,7 @@ class PipelineOptions:
     @staticmethod
     def from_env() -> "PipelineOptions":
         return PipelineOptions(
-            target_long_side_px=int(os.getenv("TARGET_LONG_SIDE_PX", "12000")),
+            target_long_side_px=int(os.getenv("TARGET_LONG_SIDE_PX", "6000")),
             dpi=int(os.getenv("DPI", "600")),
             pad_frac=float(os.getenv("PAD_FRAC", "0.01")),
             detector_spacing_m=float(os.getenv("DETECTOR_SPACING_M", "5.0")),

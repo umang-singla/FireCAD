@@ -294,7 +294,7 @@ def render_dxf_to_png_and_mapping(
     dxf_path: str,
     out_png: str,
     out_json: str,
-    target_long_side_px: int = 12000,
+    target_long_side_px: int = 6000,
     dpi: int = 600,
     pad_frac: float = 0.01,
     background_hex: str = "#ffffff",

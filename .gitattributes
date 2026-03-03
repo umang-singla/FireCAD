@@ -1,0 +1,31 @@
+# Ensure all files default to LF in the repo
+* text=auto eol=lf
+
+# Force LF for shell scripts (critical for Docker / Linux execution)
+*.sh text eol=lf
+
+# QCAD shell-script wrappers (no extension but must be LF)
+qcad-3.32.6-trial-linux-x86_64/qcad       text eol=lf
+qcad-3.32.6-trial-linux-x86_64/dwg2bmp    text eol=lf
+qcad-3.32.6-trial-linux-x86_64/dwg2csv    text eol=lf
+qcad-3.32.6-trial-linux-x86_64/dwg2dwg    text eol=lf
+qcad-3.32.6-trial-linux-x86_64/dwg2pdf    text eol=lf
+qcad-3.32.6-trial-linux-x86_64/dwg2svg    text eol=lf
+qcad-3.32.6-trial-linux-x86_64/dwg2maptiles text eol=lf
+qcad-3.32.6-trial-linux-x86_64/dwgexplode text eol=lf
+qcad-3.32.6-trial-linux-x86_64/dwghatch   text eol=lf
+qcad-3.32.6-trial-linux-x86_64/dwghatcharea text eol=lf
+qcad-3.32.6-trial-linux-x86_64/dwginfo    text eol=lf
+qcad-3.32.6-trial-linux-x86_64/dwgmapconvert text eol=lf
+qcad-3.32.6-trial-linux-x86_64/merge      text eol=lf
+qcad-3.32.6-trial-linux-x86_64/bbox       text eol=lf
+qcad-3.32.6-trial-linux-x86_64/bmp2dwg    text eol=lf
+qcad-3.32.6-trial-linux-x86_64/pdf2dwg    text eol=lf
+qcad-3.32.6-trial-linux-x86_64/svg2dwg    text eol=lf
+
+# QCAD ELF binaries – must NOT be treated as text
+qcad-3.32.6-trial-linux-x86_64/qcad-bin   binary
+qcad-3.32.6-trial-linux-x86_64/*.so*      binary
+
+# Dockerfiles
+Dockerfile text eol=lf
