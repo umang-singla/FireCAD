@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.routers import projects, detectors, auth
+from app.routers import projects, detectors, auth, ws
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -24,8 +24,19 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(projects.router, prefix="/api")
 app.include_router(detectors.router, prefix="/api")
 
+# WebSocket (real-time pipeline status)
+app.include_router(ws.router)
+
 # Static: project artifacts (render.png, mapping.json, etc.)
 app.mount("/files", StaticFiles(directory=DATA_DIR), name="files")
+
+
+@app.on_event("startup")
+async def _capture_event_loop() -> None:
+    """Store the main asyncio loop so background threads can schedule WS broadcasts."""
+    import asyncio
+    from app.ws_manager import manager  # noqa: F811
+    manager.set_loop(asyncio.get_running_loop())
 
 
 @app.on_event("startup")

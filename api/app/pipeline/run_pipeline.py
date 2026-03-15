@@ -17,6 +17,7 @@ from app.pipeline.wall_fix import fix_walls
 from app.pipeline.rooms_from_image import extract_rooms
 from app.pipeline.dxf_export import write_detectors_to_dxf
 from app.pipeline.place_detectors_advanced import place_detectors_from_rooms_json
+from app.ws_manager import manager as ws_manager
 
 logger = logging.getLogger("firecad.pipeline")
 
@@ -33,6 +34,13 @@ def _set_project(con, project_id: str, **fields):
     vals.append(now())
     vals.append(project_id)
     con.execute(f"UPDATE projects SET {', '.join(cols)} WHERE id=?", vals)
+
+    # Broadcast status change over WebSocket if status was updated
+    if "status" in fields:
+        ws_data: dict = {"type": "status", "status": fields["status"]}
+        if "error" in fields:
+            ws_data["error"] = fields["error"]
+        ws_manager.broadcast_sync(project_id, ws_data)
 
 def _get_project(con, project_id: str):
     return con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
@@ -83,6 +91,34 @@ def _run_post_alignment_steps(
     stage_done("extract_rooms", stage_ts, rooms=len(rooms), rooms_json=rooms_json)
     with db() as con:
         _set_project(con, project_id, rooms_json_path=rooms_json, status="rooms_extracted")
+
+    # ── Pause for user room review ──
+    with db() as con:
+        _set_project(con, project_id, status="awaiting_room_review", error=None)
+    logger.info(
+        "pipeline project=%s status=awaiting_room_review rooms=%d",
+        project_id,
+        len(rooms),
+    )
+    # Pipeline stops here.  Resumed by continue_pipeline_after_rooms().
+
+
+def _run_post_room_review_steps(
+    project_id: str,
+    opts: PipelineOptions,
+    pdir: str,
+    dxf_path: str,
+    mapping_json: str,
+    stage_start,
+    stage_done,
+):
+    """Stages 7-9: place detectors, export DXF, render output preview."""
+    # Load the (possibly user-edited) rooms JSON
+    rooms_json_path = os.path.join(pdir, "rooms_from_image.json")
+    import json as _json
+    with open(rooms_json_path, "r", encoding="utf-8") as f:
+        rooms_data = _json.load(f)
+    rooms = rooms_data.get("rooms", rooms_data) if isinstance(rooms_data, dict) else rooms_data
 
     # 7) Autoplace detectors
     stage_ts = time.perf_counter()
@@ -150,6 +186,7 @@ def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
 
     def stage_start(name: str):
         logger.info("pipeline project=%s stage=%s status=start", project_id, name)
+        ws_manager.broadcast_sync(project_id, {"type": "stage", "stage": name, "event": "start"})
 
     def stage_done(name: str, stage_ts: float, **extra):
         suffix = " ".join(f"{k}={v}" for k, v in extra.items())
@@ -162,6 +199,12 @@ def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
             time.perf_counter() - stage_ts,
             suffix,
         )
+        ws_manager.broadcast_sync(project_id, {
+            "type": "stage",
+            "stage": name,
+            "event": "done",
+            "elapsed": round(time.perf_counter() - stage_ts, 2),
+        })
 
     logger.info("pipeline project=%s status=start", project_id)
     try:
@@ -280,6 +323,7 @@ def continue_pipeline_after_alignment(project_id: str, opts: PipelineOptions):
 
     def stage_start(name: str):
         logger.info("pipeline-continue project=%s stage=%s status=start", project_id, name)
+        ws_manager.broadcast_sync(project_id, {"type": "stage", "stage": name, "event": "start"})
 
     def stage_done(name: str, stage_ts: float, **extra):
         suffix = " ".join(f"{k}={v}" for k, v in extra.items())
@@ -292,6 +336,12 @@ def continue_pipeline_after_alignment(project_id: str, opts: PipelineOptions):
             time.perf_counter() - stage_ts,
             suffix,
         )
+        ws_manager.broadcast_sync(project_id, {
+            "type": "stage",
+            "stage": name,
+            "event": "done",
+            "elapsed": round(time.perf_counter() - stage_ts, 2),
+        })
 
     logger.info("pipeline-continue project=%s status=start", project_id)
     try:
@@ -331,12 +381,79 @@ def continue_pipeline_after_alignment(project_id: str, opts: PipelineOptions):
         )
 
         logger.info(
-            "pipeline-continue project=%s status=ready total_elapsed=%.2fs",
+            "pipeline-continue project=%s status=awaiting_room_review total_elapsed=%.2fs",
             project_id,
             time.perf_counter() - start_ts,
         )
     except Exception as e:
         err = f"{e}\n\n{traceback.format_exc()}"
         logger.exception("pipeline-continue project=%s status=failed", project_id)
+        with db() as con:
+            _set_project(con, project_id, status="failed", error=err)
+
+
+def continue_pipeline_after_rooms(project_id: str, opts: PipelineOptions):
+    """Resume pipeline after user has reviewed / edited rooms."""
+    start_ts = time.perf_counter()
+
+    def stage_start(name: str):
+        logger.info("pipeline-rooms project=%s stage=%s status=start", project_id, name)
+        ws_manager.broadcast_sync(project_id, {"type": "stage", "stage": name, "event": "start"})
+
+    def stage_done(name: str, stage_ts: float, **extra):
+        suffix = " ".join(f"{k}={v}" for k, v in extra.items())
+        if suffix:
+            suffix = f" {suffix}"
+        logger.info(
+            "pipeline-rooms project=%s stage=%s status=done elapsed=%.2fs%s",
+            project_id,
+            name,
+            time.perf_counter() - stage_ts,
+            suffix,
+        )
+        ws_manager.broadcast_sync(project_id, {
+            "type": "stage",
+            "stage": name,
+            "event": "done",
+            "elapsed": round(time.perf_counter() - stage_ts, 2),
+        })
+
+    logger.info("pipeline-rooms project=%s status=start", project_id)
+    try:
+        with db() as con:
+            p = _get_project(con, project_id)
+            if not p:
+                logger.warning("pipeline-rooms project=%s status=aborted reason=project_not_found", project_id)
+                return
+
+            dxf_path = p["dxf_path"]
+            mapping_json = p["mapping_json_path"]
+
+            if not dxf_path or not os.path.exists(dxf_path):
+                _set_project(con, project_id, status="failed", error="Base DXF not found for room-continue flow.")
+                return
+            if not mapping_json or not os.path.exists(mapping_json):
+                _set_project(con, project_id, status="failed", error="Mapping JSON not found for room-continue flow.")
+                return
+
+        pdir = project_dir(project_id)
+        _run_post_room_review_steps(
+            project_id=project_id,
+            opts=opts,
+            pdir=pdir,
+            dxf_path=dxf_path,
+            mapping_json=mapping_json,
+            stage_start=stage_start,
+            stage_done=stage_done,
+        )
+
+        logger.info(
+            "pipeline-rooms project=%s status=ready total_elapsed=%.2fs",
+            project_id,
+            time.perf_counter() - start_ts,
+        )
+    except Exception as e:
+        err = f"{e}\n\n{traceback.format_exc()}"
+        logger.exception("pipeline-rooms project=%s status=failed", project_id)
         with db() as con:
             _set_project(con, project_id, status="failed", error=err)

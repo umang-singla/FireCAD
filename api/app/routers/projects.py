@@ -4,7 +4,12 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks,
 from app.db import db, now
 from app.storage import new_id, project_dir, relpath
 from app.schemas import ProjectCreate, ProjectOut, ProjectUpdateSettings
-from app.pipeline.run_pipeline import run_pipeline_for_project, continue_pipeline_after_alignment, PipelineOptions
+from app.pipeline.run_pipeline import (
+    run_pipeline_for_project,
+    continue_pipeline_after_alignment,
+    continue_pipeline_after_rooms,
+    PipelineOptions,
+)
 from app.pipeline.dxf_export import write_detectors_to_dxf
 from app.pipeline.render import render_dwg_to_png_with_qcad, write_mapping_from_dxf_and_png
 from app.routers.auth import get_current_user
@@ -28,6 +33,7 @@ def _project_row_to_out(r) -> ProjectOut:
     preview_mapping_path = os.path.join(project_dir(r["id"]), "detectors_preview_mapping.json")
     detectors_debug_path = os.path.join(project_dir(r["id"]), "detectors_global_snapping_debug.png")
     detectors_overlay_debug_path = os.path.join(project_dir(r["id"]), "detectors_global_snapping_overlay.png")
+    rooms_debug_path = os.path.join(project_dir(r["id"]), "rooms_debug.png")
 
     add("input", r["input_path"])
     add("dxf", r["dxf_path"])
@@ -37,6 +43,7 @@ def _project_row_to_out(r) -> ProjectOut:
     add("aligned_mask", r["aligned_mask_path"])
     add("fixed_wall", r["fixed_wall_path"])
     add("rooms_json", r["rooms_json_path"])
+    add("rooms_debug", rooms_debug_path if os.path.exists(rooms_debug_path) else None)
     add("output_dxf", r["output_dxf_path"])
     add("output_preview_png", r["output_preview_png_path"])
     add("output_preview_mapping", preview_mapping_path if os.path.exists(preview_mapping_path) else None)
@@ -192,6 +199,65 @@ def continue_pipeline(project_id: str, bg: BackgroundTasks, user=Depends(get_cur
     with db() as con:
         r2 = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
     return _project_row_to_out(r2)
+
+# ── Rooms review endpoints ──────────────────────────────────
+
+@router.get("/projects/{project_id}/rooms")
+def get_rooms(project_id: str, user=Depends(get_current_user)):
+    """Return the extracted rooms JSON for the project."""
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+    rooms_path = r["rooms_json_path"]
+    if not rooms_path or not os.path.exists(rooms_path):
+        raise HTTPException(404, "rooms not yet extracted")
+    with open(rooms_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@router.put("/projects/{project_id}/rooms")
+def update_rooms(project_id: str, payload: dict, user=Depends(get_current_user)):
+    """Overwrite rooms JSON (user edits: rename, split, delete, re-draw)."""
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+    rooms_path = r["rooms_json_path"]
+    if not rooms_path:
+        rooms_path = os.path.join(project_dir(project_id), "rooms_from_image.json")
+    with open(rooms_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return payload
+
+
+@router.post("/projects/{project_id}/continue_rooms", response_model=ProjectOut)
+def continue_after_rooms(project_id: str, bg: BackgroundTasks, user=Depends(get_current_user)):
+    """Resume pipeline after user has reviewed / edited rooms."""
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+        if r["status"] in ("running",):
+            raise HTTPException(409, "pipeline already running")
+        if r["status"] not in ("awaiting_room_review", "rooms_extracted"):
+            raise HTTPException(409, "project is not awaiting room review")
+
+        con.execute("UPDATE projects SET status=?, error=NULL, updated_at=? WHERE id=?",
+                    ("running", now(), project_id))
+
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        settings = json.loads(r["settings_json"] or "{}")
+
+    opts = PipelineOptions.from_env().merge_settings(settings)
+    bg.add_task(continue_pipeline_after_rooms, project_id, opts)
+
+    with db() as con:
+        r2 = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+    return _project_row_to_out(r2)
+
+# ─────────────────────────────────────────────────────────────
 
 @router.post("/projects/{project_id}/reset_detectors", response_model=ProjectOut)
 def reset_detectors(project_id: str, user=Depends(get_current_user)):

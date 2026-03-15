@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { use, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
@@ -175,6 +175,9 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
 
   });
 
+  // Current pipeline stage for live progress display
+  const [pipelineStage, setPipelineStage] = useState<string | null>(null);
+
   async function refresh() {
     const p: Project = await (await authFetch(`/api/projects/${projectId}`)).json();
     setProject(p);
@@ -192,6 +195,55 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   }
 
   useEffect(() => { refresh(); }, []);
+
+  // Real-time pipeline status via WebSocket
+  useEffect(() => {
+    const base = resolveApiBase().replace(/^http/, "ws");
+    const wsUrl = `${base}/api/projects/${projectId}/ws`;
+    let ws: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let cancelled = false;
+
+    function connect() {
+      if (cancelled) return;
+      ws = new WebSocket(wsUrl);
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "status") {
+            // Full refresh to pick up new files/status from the API
+            refresh();
+            if (msg.status === "ready" || msg.status === "failed" || msg.status === "ready_no_mask" || msg.status === "awaiting_alignment_review") {
+              setPipelineStage(null);
+            }
+          } else if (msg.type === "stage") {
+            if (msg.event === "start") {
+              setPipelineStage(msg.stage);
+            }
+          }
+        } catch {}
+      };
+
+      ws.onclose = () => {
+        if (!cancelled) {
+          reconnectTimer = setTimeout(connect, 3000);
+        }
+      };
+
+      ws.onerror = () => {
+        ws?.close();
+      };
+    }
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      ws?.close();
+    };
+  }, [projectId]);
 
   useEffect(() => {
     setNetworkPending(getNetworkPendingCount());
@@ -231,14 +283,19 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
 
   async function runPipeline() {
     await saveSettings();
+    setPipelineStage(null);
     await authFetch(`/api/projects/${projectId}/run`, { method:"POST" });
     await refresh();
   }
 
   const isReady = project?.status === "ready";
   const isAwaitingAlignmentReview = project?.status === "awaiting_alignment_review";
-  const isRunning = project?.status === "running";
-  const isQuestionnaireMode = !isReady && !isAwaitingAlignmentReview && !isRunning;
+  const isAwaitingRoomReview = project?.status === "awaiting_room_review";
+  // Treat ALL intermediate pipeline statuses as "running" so the loader
+  // stays visible until a review step or final output appears.
+  const IDLE_STATUSES = new Set(["created", "uploaded", "ready", "ready_no_mask", "failed", "awaiting_alignment_review", "awaiting_room_review"]);
+  const isRunning = !!project && !IDLE_STATUSES.has(project.status);
+  const isQuestionnaireMode = !isReady && !isAwaitingAlignmentReview && !isAwaitingRoomReview && !isRunning;
   const showGlobalLoader = project === null || networkPending > 0;
 
   async function saveLayout() {
@@ -252,6 +309,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
       fd.append("file", adjustedMaskBlob, "mask_aligned_adjusted.png");
       await authFetch(`/api/projects/${projectId}/aligned_mask`, { method:"POST", body: fd });
     }
+    setPipelineStage(null);
     await authFetch(`/api/projects/${projectId}/continue`, { method:"POST" });
     await refresh();
   }
@@ -262,6 +320,24 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     const fd = new FormData();
     fd.append("file", f);
     await authFetch(`/api/projects/${projectId}/aligned_mask`, { method:"POST", body: fd });
+    await refresh();
+  }
+
+  async function saveRoomsAndContinue(rooms: any[]) {
+    await authFetch(`/api/projects/${projectId}/rooms`, {
+      method: "PUT",
+      body: JSON.stringify({ rooms }),
+    });
+    setPipelineStage(null);
+    await authFetch(`/api/projects/${projectId}/continue_rooms`, { method: "POST" });
+    await refresh();
+  }
+
+  async function saveRoomsOnly(rooms: any[]) {
+    await authFetch(`/api/projects/${projectId}/rooms`, {
+      method: "PUT",
+      body: JSON.stringify({ rooms }),
+    });
     await refresh();
   }
 
@@ -404,12 +480,16 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           <p style={{ margin: 0, opacity: 0.8, textAlign: "center", maxWidth: 460 }}>
             Pipeline is running. We’re extracting rooms, placing detectors, and preparing outputs. This usually takes a moment.
           </p>
-          <div style={{ marginTop: 14, fontSize: 12, opacity: 0.75 }}>
-            Status: {project?.status || "running"}
-          </div>
-          <div style={{ marginTop: 14, display: "flex", gap: 10 }}>
-            <button onClick={refresh} style={btn(false, true)}>Refresh status</button>
-          </div>
+          {pipelineStage ? (
+            <div style={{ marginTop: 14, fontSize: 13, opacity: 0.9, display: "flex", alignItems: "center", gap: 8 }}>
+              <span className="stageDot" />
+              Stage: <strong>{pipelineStage.replace(/_/g, " ")}</strong>
+            </div>
+          ) : (
+            <div style={{ marginTop: 14, fontSize: 12, opacity: 0.75 }}>
+              Status: {project?.status || "running"}
+            </div>
+          )}
         </div>
       </section>
       ) : null}
@@ -431,6 +511,14 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
               <p style={styles.emptySubtitle}>Upload an aligned mask from the sidebar to continue.</p>
             </div>
           )
+        ) : isAwaitingRoomReview && project?.files?.render_png && mapping ? (
+          <RoomEditor
+            renderUrl={apiUrl(project.files.render_png)}
+            mapping={mapping}
+            projectId={projectId}
+            onSave={saveRoomsOnly}
+            onContinue={saveRoomsAndContinue}
+          />
         ) : !project?.files?.render_png || !mapping ? (
           <div style={styles.emptyState}>
             <h3 style={styles.emptyTitle}>No preview yet</h3>
@@ -564,6 +652,20 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
             transform: scale(1.08);
             opacity: 1;
           }
+        }
+
+        .stageDot {
+          display: inline-block;
+          width: 8px;
+          height: 8px;
+          border-radius: 999px;
+          background: #52B788;
+          animation: stagePulse 1s ease-in-out infinite;
+        }
+
+        @keyframes stagePulse {
+          0%, 100% { opacity: 0.5; transform: scale(0.9); }
+          50% { opacity: 1; transform: scale(1.2); }
         }
       `}</style>
     </main>
@@ -955,6 +1057,529 @@ function btn(primary=false, compact=false): CSSProperties {
     boxShadow: primary ? "0 10px 24px rgba(45, 106, 79, 0.42)" : undefined,
   };
 }
+
+// ─── Room Editor Component ──────────────────────────────────────────────────
+
+type Room = {
+  id: string;
+  label?: string;
+  area_px: number;
+  polygon_px: number[][];
+  polygon_world: number[][];
+};
+
+function RoomEditor({
+  renderUrl,
+  mapping,
+  projectId,
+  onSave,
+  onContinue,
+}: {
+  renderUrl: string;
+  mapping: Mapping;
+  projectId: string;
+  onSave: (rooms: Room[]) => Promise<void>;
+  onContinue: (rooms: Room[]) => Promise<void>;
+}) {
+  const [rooms, setRooms] = useState<Room[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [editingLabelId, setEditingLabelId] = useState<string | null>(null);
+  const [labelDraft, setLabelDraft] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [isSavingRooms, setIsSavingRooms] = useState(false);
+  const [isContinuing, setIsContinuing] = useState(false);
+  const [splitMode, setSplitMode] = useState(false);
+  const [splitStart, setSplitStart] = useState<{px:number; py:number} | null>(null);
+  const [splitEnd, setSplitEnd] = useState<{px:number; py:number} | null>(null);
+  const [splitHover, setSplitHover] = useState<{px:number; py:number} | null>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
+
+  function samePoint(a: {px:number; py:number}, b: {px:number; py:number}, tolerance = 0.5) {
+    return Math.hypot(a.px - b.px, a.py - b.py) <= tolerance;
+  }
+
+  function resetSplitState() {
+    setSplitStart(null);
+    setSplitEnd(null);
+    setSplitHover(null);
+  }
+
+  function pointerToImagePoint(e: React.MouseEvent<SVGSVGElement>): {px:number; py:number} | null {
+    if (!svgRef.current) return null;
+    const rect = svgRef.current.getBoundingClientRect();
+    const sx = ((e.clientX - rect.left) / rect.width) * mapping.width_px;
+    const sy = ((e.clientY - rect.top) / rect.height) * mapping.height_px;
+    return { px: sx, py: sy };
+  }
+
+  function closestPointOnSegment(point: {px:number; py:number}, a: number[], b: number[]) {
+    const abx = b[0] - a[0];
+    const aby = b[1] - a[1];
+    const apx = point.px - a[0];
+    const apy = point.py - a[1];
+    const abLen2 = abx * abx + aby * aby;
+    if (abLen2 <= 1e-9) {
+      return { px: a[0], py: a[1] };
+    }
+    const t = Math.max(0, Math.min(1, (apx * abx + apy * aby) / abLen2));
+    return {
+      px: a[0] + t * abx,
+      py: a[1] + t * aby,
+    };
+  }
+
+  function snapPointToRoomBoundary(room: Room, point: {px:number; py:number}, maxDistPx = 14): {px:number; py:number} | null {
+    const pts = room.polygon_px;
+    const n = pts.length;
+    if (n < 2) return null;
+
+    let best: {px:number; py:number} | null = null;
+    let bestD2 = Number.POSITIVE_INFINITY;
+
+    for (let i = 0; i < n; i++) {
+      const a = pts[i];
+      const b = pts[(i + 1) % n];
+      const hit = closestPointOnSegment(point, a, b);
+      const dx = hit.px - point.px;
+      const dy = hit.py - point.py;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestD2) {
+        bestD2 = d2;
+        best = hit;
+      }
+    }
+
+    if (!best || bestD2 > maxDistPx * maxDistPx) return null;
+    return best;
+  }
+
+  function handleSvgSplitClick(e: React.MouseEvent<SVGSVGElement>) {
+    if (!splitMode || !selectedRoom) return;
+    const point = pointerToImagePoint(e);
+    if (!point) return;
+    const snapped = snapPointToRoomBoundary(selectedRoom, point);
+    if (!snapped) return;
+    handleSplitDotClick(snapped);
+  }
+
+  function handleSvgSplitMouseMove(e: React.MouseEvent<SVGSVGElement>) {
+    if (!splitMode || !selectedRoom) {
+      if (splitHover) setSplitHover(null);
+      return;
+    }
+    const point = pointerToImagePoint(e);
+    if (!point) {
+      if (splitHover) setSplitHover(null);
+      return;
+    }
+    const snapped = snapPointToRoomBoundary(selectedRoom, point);
+    setSplitHover(snapped);
+  }
+
+  function handleSvgSplitMouseLeave() {
+    if (splitHover) setSplitHover(null);
+  }
+
+  // Load rooms from API
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await authFetch(`/api/projects/${projectId}/rooms`);
+        const data = await res.json();
+        const raw: Room[] = data.rooms || data;
+        // Ensure every room has a label
+        setRooms(raw.map((r, i) => ({ ...r, label: r.label || `Room ${i + 1}` })));
+      } catch (e) {
+        console.error("Failed to load rooms", e);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [projectId]);
+
+  function roomCentroidPx(room: Room): { cx: number; cy: number } {
+    const pts = room.polygon_px;
+    const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+    const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+    return { cx, cy };
+  }
+
+  function handleRenameStart(room: Room) {
+    setEditingLabelId(room.id);
+    setLabelDraft(room.label || "");
+  }
+
+  function handleRenameCommit(roomId: string) {
+    setRooms(prev => prev.map(r => r.id === roomId ? { ...r, label: labelDraft.trim() || r.label } : r));
+    setEditingLabelId(null);
+  }
+
+  function handleDeleteRoom(roomId: string) {
+    setRooms(prev => prev.filter(r => r.id !== roomId));
+    if (selectedId === roomId) setSelectedId(null);
+  }
+
+  function handleSplitDotClick(point: {px:number; py:number}) {
+    if (!splitMode || !selectedId) return;
+
+    if (!splitStart) {
+      setSplitStart(point);
+      setSplitEnd(null);
+      return;
+    }
+
+    if (samePoint(splitStart, point)) return;
+
+    setSplitEnd(point);
+    const target = rooms.find(r => r.id === selectedId);
+    if (!target) return;
+
+    const splitRooms = splitPolygon(target, splitStart, point);
+    if (!splitRooms) {
+      setSplitStart(point);
+      setSplitEnd(null);
+      return;
+    }
+
+    setRooms(prev => {
+      const others = prev.filter(r => r.id !== target.id);
+      return [...others, ...splitRooms];
+    });
+    setSelectedId(null);
+    resetSplitState();
+    setSplitMode(false);
+  }
+
+  // Simple polygon split: cut polygon with a line and produce 2 halves
+  function splitPolygon(room: Room, p1: {px:number;py:number}, p2: {px:number;py:number}): Room[] | null {
+    const pts = room.polygon_px;
+    const n = pts.length;
+    // Find two edges that intersect the split line
+    const intersections: { idx: number; pt: number[]; ptW: number[] }[] = [];
+
+    for (let i = 0; i < n; i++) {
+      const a = pts[i];
+      const b = pts[(i + 1) % n];
+      const inter = lineSegIntersect(p1.px, p1.py, p2.px, p2.py, a[0], a[1], b[0], b[1]);
+      if (inter) {
+        // World coordinate for this intersection
+        const w = pixelToWorld(mapping, inter[0], inter[1]);
+        intersections.push({ idx: i, pt: inter, ptW: [w.x, w.y] });
+      }
+    }
+    const uniqueIntersections: { idx: number; pt: number[]; ptW: number[] }[] = [];
+    for (const inter of intersections) {
+      const exists = uniqueIntersections.some((hit) => {
+        const dx = hit.pt[0] - inter.pt[0];
+        const dy = hit.pt[1] - inter.pt[1];
+        return dx * dx + dy * dy <= 0.25;
+      });
+      if (!exists) uniqueIntersections.push(inter);
+    }
+    if (uniqueIntersections.length < 2) return null;
+
+    let ia: { idx: number; pt: number[]; ptW: number[] } | null = null;
+    let ib: { idx: number; pt: number[]; ptW: number[] } | null = null;
+    let bestA = Number.POSITIVE_INFINITY;
+    let bestB = Number.POSITIVE_INFINITY;
+
+    for (const inter of uniqueIntersections) {
+      const da = (inter.pt[0] - p1.px) ** 2 + (inter.pt[1] - p1.py) ** 2;
+      if (da < bestA) {
+        bestA = da;
+        ia = inter;
+      }
+    }
+    for (const inter of uniqueIntersections) {
+      if (ia && inter === ia) continue;
+      const db = (inter.pt[0] - p2.px) ** 2 + (inter.pt[1] - p2.py) ** 2;
+      if (db < bestB) {
+        bestB = db;
+        ib = inter;
+      }
+    }
+    if (!ia || !ib) return null;
+    // Build two polygons
+    const poly1Px: number[][] = [];
+    const poly1W: number[][] = [];
+    const poly2Px: number[][] = [];
+    const poly2W: number[][] = [];
+    const wPts = room.polygon_world;
+
+    // Polygon A: from ia.pt along edges to ib.pt then jump back
+    poly1Px.push(ia.pt);
+    poly1W.push(ia.ptW);
+    for (let i = (ia.idx + 1) % n; i !== (ib.idx + 1) % n; i = (i + 1) % n) {
+      poly1Px.push(pts[i]);
+      poly1W.push(wPts[i]);
+    }
+    poly1Px.push(ib.pt);
+    poly1W.push(ib.ptW);
+
+    // Polygon B: from ib.pt along edges to ia.pt then jump back
+    poly2Px.push(ib.pt);
+    poly2W.push(ib.ptW);
+    for (let i = (ib.idx + 1) % n; i !== (ia.idx + 1) % n; i = (i + 1) % n) {
+      poly2Px.push(pts[i]);
+      poly2W.push(wPts[i]);
+    }
+    poly2Px.push(ia.pt);
+    poly2W.push(ia.ptW);
+
+    if (poly1Px.length < 3 || poly2Px.length < 3) return null;
+
+    const area1 = Math.abs(polyArea(poly1Px));
+    const area2 = Math.abs(polyArea(poly2Px));
+
+    return [
+      { id: room.id + "_a", label: (room.label || "Room") + " A", area_px: area1, polygon_px: poly1Px, polygon_world: poly1W },
+      { id: room.id + "_b", label: (room.label || "Room") + " B", area_px: area2, polygon_px: poly2Px, polygon_world: poly2W },
+    ];
+  }
+
+  function polyArea(pts: number[][]): number {
+    let a = 0;
+    for (let i = 0; i < pts.length; i++) {
+      const j = (i + 1) % pts.length;
+      a += pts[i][0] * pts[j][1] - pts[j][0] * pts[i][1];
+    }
+    return a / 2;
+  }
+
+  function lineSegIntersect(
+    x1: number, y1: number, x2: number, y2: number,
+    x3: number, y3: number, x4: number, y4: number,
+  ): number[] | null {
+    const d = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+    if (Math.abs(d) < 1e-10) return null;
+    const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / d;
+    const u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / d;
+    if (u >= 0 && u <= 1) {
+      // t can be anything (we want the infinite line from the user's drawn line to hit the edge)
+      // but let's restrict: the intersection must be within the segment [x3,y3]-[x4,y4]
+      return [x3 + u * (x4 - x3), y3 + u * (y4 - y3)];
+    }
+    return null;
+  }
+
+  async function handleContinue() {
+    setIsContinuing(true);
+    try { await onContinue(rooms); } finally { setIsContinuing(false); }
+  }
+
+  async function handleSaveRooms() {
+    setIsSavingRooms(true);
+    try { await onSave(rooms); } finally { setIsSavingRooms(false); }
+  }
+
+  if (loading) {
+    return (
+      <div style={{ height: "100%", display: "grid", placeItems: "center", color: "rgba(244,247,255,0.8)" }}>
+        <p>Loading rooms...</p>
+      </div>
+    );
+  }
+
+  const selectedRoom = rooms.find(r => r.id === selectedId);
+  const splitPreviewEnd = splitEnd || splitHover;
+
+  return (
+    <div style={{ display: "flex", height: "100%", overflow: "hidden" }}>
+      {/* SVG + floor plan overlay */}
+      <div style={{ flex: 1, position: "relative", overflow: "auto", background: "#0A1F13" }}>
+        <div style={{ position: "relative", display: "inline-block" }}>
+          <img
+            src={renderUrl}
+            alt="Floor plan"
+            style={{ display: "block", maxWidth: "100%", height: "auto" }}
+            draggable={false}
+          />
+          <svg
+            ref={svgRef}
+            viewBox={`0 0 ${mapping.width_px} ${mapping.height_px}`}
+            style={{ position: "absolute", inset: 0, width: "100%", height: "100%", cursor: splitMode ? "crosshair" : "default" }}
+            onClick={handleSvgSplitClick}
+            onMouseMove={handleSvgSplitMouseMove}
+            onMouseLeave={handleSvgSplitMouseLeave}
+          >
+            {rooms.map(room => {
+              const pts = room.polygon_px.map(p => `${p[0]},${p[1]}`).join(" ");
+              const { cx, cy } = roomCentroidPx(room);
+              const isSelected = room.id === selectedId;
+              return (
+                <g key={room.id} onClick={() => { if (!splitMode) setSelectedId(isSelected ? null : room.id); }}>
+                  <polygon
+                    points={pts}
+                    fill={isSelected ? "rgba(82,183,136,0.35)" : "rgba(82,183,136,0.18)"}
+                    stroke={isSelected ? "#95D5B2" : "rgba(149,213,178,0.6)"}
+                    strokeWidth={isSelected ? 3 : 1.5}
+                    style={{ cursor: "pointer", transition: "fill 0.15s" }}
+                  />
+                  <text
+                    x={cx} y={cy}
+                    textAnchor="middle"
+                    dominantBaseline="central"
+                    fill="#F0FFF4"
+                    fontSize={Math.max(12, mapping.width_px / 80)}
+                    fontWeight={600}
+                    style={{ pointerEvents: "none", textShadow: "0 1px 4px rgba(0,0,0,0.7)" }}
+                  >
+                    {room.label || room.id}
+                  </text>
+                </g>
+              );
+            })}
+            {/* Split line preview */}
+            {splitMode && splitStart && splitPreviewEnd ? (
+              <line
+                x1={splitStart.px} y1={splitStart.py}
+                x2={splitPreviewEnd.px} y2={splitPreviewEnd.py}
+                stroke="#FF6B6B" strokeWidth={3} strokeDasharray="8 4"
+              />
+            ) : null}
+            {splitMode && splitHover ? (
+              <circle
+                cx={splitHover.px}
+                cy={splitHover.py}
+                r={5}
+                fill="#FFDEE2"
+                stroke="#FF6B6B"
+                strokeWidth={2}
+                style={{ pointerEvents: "none" }}
+              />
+            ) : null}
+            {/* Split dots for selected room */}
+            {splitMode && selectedRoom ? selectedRoom.polygon_px.map((p, idx) => {
+              const dot = { px: p[0], py: p[1] };
+              const isStart = !!splitStart && samePoint(splitStart, dot);
+              return (
+                <circle
+                  key={`${selectedRoom.id}-split-dot-${idx}`}
+                  cx={dot.px}
+                  cy={dot.py}
+                  r={isStart ? 8 : 6}
+                  fill={isStart ? "#FF6B6B" : "#F0FFF4"}
+                  stroke={isStart ? "#FFD3D3" : "#2D6A4F"}
+                  strokeWidth={2}
+                  style={{ cursor: "pointer" }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleSplitDotClick(dot);
+                  }}
+                />
+              );
+            }) : null}
+          </svg>
+        </div>
+      </div>
+
+      {/* Room list sidebar */}
+      <div style={{
+        width: 320, flexShrink: 0, borderLeft: "1px solid rgba(255,255,255,0.14)",
+        background: "linear-gradient(180deg, rgba(13,40,24,0.95), rgba(10,31,19,0.98))",
+        display: "flex", flexDirection: "column", overflow: "hidden",
+      }}>
+        <div style={{ padding: "14px 14px 8px", borderBottom: "1px solid rgba(255,255,255,0.12)" }}>
+          <h3 style={{ margin: 0, fontSize: 16, color: "#F0FFF4" }}>Rooms ({rooms.length})</h3>
+          <p style={{ margin: "4px 0 0", fontSize: 12, opacity: 0.7, color: "#D8F3DC" }}>
+            Review and edit extracted rooms. Click a room to select it, then rename, delete, or split.
+          </p>
+        </div>
+
+        <div style={{ flex: 1, overflow: "auto", padding: "8px 14px" }}>
+          {rooms.map((room) => {
+            const isSelected = room.id === selectedId;
+            return (
+              <div
+                key={room.id}
+                onClick={() => setSelectedId(isSelected ? null : room.id)}
+                style={{
+                  padding: "10px 12px",
+                  marginBottom: 6,
+                  borderRadius: 12,
+                  border: isSelected ? "1px solid #52B788" : "1px solid rgba(255,255,255,0.1)",
+                  background: isSelected ? "rgba(82,183,136,0.18)" : "rgba(255,255,255,0.05)",
+                  cursor: "pointer",
+                  transition: "all 0.15s",
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  {editingLabelId === room.id ? (
+                    <input
+                      autoFocus
+                      value={labelDraft}
+                      onChange={e => setLabelDraft(e.target.value)}
+                      onBlur={() => handleRenameCommit(room.id)}
+                      onKeyDown={e => { if (e.key === "Enter") handleRenameCommit(room.id); if (e.key === "Escape") setEditingLabelId(null); }}
+                      onClick={e => e.stopPropagation()}
+                      style={{
+                        background: "rgba(0,0,0,0.3)", border: "1px solid #52B788", borderRadius: 8,
+                        color: "#F0FFF4", padding: "4px 8px", fontSize: 13, width: "60%", outline: "none",
+                      }}
+                    />
+                  ) : (
+                    <span style={{ fontSize: 13, fontWeight: 600, color: "#F0FFF4" }}>{room.label || room.id}</span>
+                  )}
+                  <span style={{ fontSize: 11, opacity: 0.6, color: "#D8F3DC" }}>{room.polygon_px.length} pts</span>
+                </div>
+                {isSelected ? (
+                  <div style={{ marginTop: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    <button onClick={(e) => { e.stopPropagation(); handleRenameStart(room); }} style={roomBtnStyle}>Rename</button>
+                    <button onClick={(e) => { e.stopPropagation(); resetSplitState(); setSplitMode(true); }} style={roomBtnStyle}>Split</button>
+                    <button onClick={(e) => { e.stopPropagation(); handleDeleteRoom(room.id); }} style={{ ...roomBtnStyle, borderColor: "rgba(255,102,102,0.5)", color: "#ffa0a0" }}>Delete</button>
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+
+        <div style={{ padding: "12px 14px", borderTop: "1px solid rgba(255,255,255,0.12)", display: "flex", gap: 8 }}>
+          {splitMode ? (
+            <button onClick={() => { setSplitMode(false); resetSplitState(); }} style={{ ...roomBtnStyle, flex: 1, background: "rgba(255,102,102,0.15)" }}>
+              Cancel Split
+            </button>
+          ) : null}
+          <button
+            onClick={handleSaveRooms}
+            disabled={isSavingRooms || isContinuing || rooms.length === 0}
+            style={{
+              ...roomBtnStyle,
+              flex: 1,
+              opacity: (isSavingRooms || isContinuing || rooms.length === 0) ? 0.7 : 1,
+              cursor: (isSavingRooms || isContinuing || rooms.length === 0) ? "wait" : "pointer",
+            }}
+          >
+            {isSavingRooms ? "Saving..." : "Save rooms"}
+          </button>
+          <button
+            onClick={handleContinue}
+            disabled={isSavingRooms || isContinuing || rooms.length === 0}
+            style={{
+              flex: 1, padding: "10px 16px", borderRadius: 12, border: "none",
+              background: "linear-gradient(135deg, #52B788, #2D6A4F)", color: "#fff",
+              fontWeight: 600, fontSize: 14, cursor: (isSavingRooms || isContinuing) ? "wait" : "pointer",
+              opacity: (isSavingRooms || isContinuing) ? 0.7 : 1,
+            }}
+          >
+            {isContinuing ? "Processing..." : "Continue with these rooms"}
+          </button>
+        </div>
+        {splitMode && selectedRoom ? (
+          <div style={{ padding: "0 14px 12px", fontSize: 12, color: "#D8F3DC", opacity: 0.9 }}>
+            Click two points on the selected room boundary (dots or any wall point) to split.
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+const roomBtnStyle: CSSProperties = {
+  padding: "4px 10px", borderRadius: 8, fontSize: 11, fontWeight: 600,
+  background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.2)",
+  color: "#D8F3DC", cursor: "pointer",
+};
 
 const styles: Record<string, CSSProperties> = {
   workspace: {
@@ -1724,7 +2349,12 @@ function renderPlacedObject(dtype: string, cx: number, cy: number) {
     );
   }
 
-  return <circle cx={cx} cy={cy} r={9} fill="#ff5a7e" opacity={0.96} />;
+  return (
+    <>
+      <circle cx={cx} cy={cy} r={9} fill="none" stroke="#ff5a7e" strokeWidth={2.2} />
+      <text x={cx} y={cy + 3} textAnchor="middle" fontSize={10} fontWeight={700} fill="#ff5a7e">S</text>
+    </>
+  );
 }
 
 function drawPlacedObjectOnCanvas(ctx: CanvasRenderingContext2D, dtype: string, cx: number, cy: number) {
@@ -1777,8 +2407,14 @@ function drawPlacedObjectOnCanvas(ctx: CanvasRenderingContext2D, dtype: string, 
 
   ctx.beginPath();
   ctx.arc(cx, cy, 9, 0, Math.PI * 2);
+  ctx.strokeStyle = "#ff5a7e";
+  ctx.lineWidth = 2.2;
+  ctx.stroke();
   ctx.fillStyle = "#ff5a7e";
-  ctx.fill();
+  ctx.font = "700 11px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("S", cx, cy + 0.5);
 }
 
 function objectLabel(dtype: ObjectType): string {
@@ -1833,7 +2469,8 @@ function renderObjectIcon(dtype: ObjectType) {
 
   return (
     <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden>
-      <circle cx="7" cy="7" r="4.2" fill="#ff5a7e" stroke="#fff" strokeWidth="1" />
+      <circle cx="7" cy="7" r="4.2" fill="none" stroke="#ff5a7e" strokeWidth="1.2" />
+      <text x="7" y="9" textAnchor="middle" fontSize="5" fontWeight="700" fill="#ff5a7e">S</text>
     </svg>
   );
 }
