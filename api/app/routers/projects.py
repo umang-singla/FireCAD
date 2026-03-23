@@ -1,9 +1,11 @@
 import os
 import json
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Depends
+from pydantic import BaseModel
+from typing import Any, Dict, Optional
 from app.db import db, now
 from app.storage import new_id, project_dir, relpath
-from app.schemas import ProjectCreate, ProjectOut, ProjectUpdateSettings
+from app.schemas import ProjectOut, ProjectUpdateSettings
 from app.pipeline.run_pipeline import (
     run_pipeline_for_project,
     continue_pipeline_after_alignment,
@@ -12,6 +14,12 @@ from app.pipeline.run_pipeline import (
 )
 from app.pipeline.dxf_export import write_detectors_to_dxf
 from app.pipeline.render import render_dwg_to_png_with_qcad, write_mapping_from_dxf_and_png
+from app.pipeline.nbc_rules import (
+    get_questions as nbc_get_questions,
+    evaluate_building,
+    OCCUPANCY_DISPLAY_LABELS,
+    FOLLOWUP_QUESTIONS,
+)
 from app.routers.auth import get_current_user
 
 router = APIRouter(tags=["projects"])
@@ -56,10 +64,45 @@ def _project_row_to_out(r) -> ProjectOut:
         status=r["status"],
         error=r["error"],
         files=files,
+        nbc_evaluation=json.loads(r["settings_json"] or "{}").get("nbc_evaluation"),
+        nbc_answers=json.loads(r["settings_json"] or "{}").get("nbc_answers"),
+        input_filename=r["input_filename"],
     )
 
+# ── NBC rule engine endpoints ───────────────────────────────
+
+@router.get("/nbc/questions")
+def nbc_questions(occupancy_subtype: Optional[str] = None):
+    return nbc_get_questions(occupancy_subtype)
+
+@router.get("/nbc/occupancy_types")
+def nbc_occupancy_types():
+    return OCCUPANCY_DISPLAY_LABELS
+
+@router.get("/nbc/followup_fields")
+def nbc_followup_fields(occupancy_subtype: str):
+    return FOLLOWUP_QUESTIONS.get(occupancy_subtype, [])
+
+class NBCEvaluatePayload(BaseModel):
+    answers: Dict[str, Any]
+
+@router.post("/nbc/evaluate")
+def nbc_evaluate(payload: NBCEvaluatePayload):
+    return evaluate_building(payload.answers)
+
+# ── Project CRUD ────────────────────────────────────────────
+
+class ProjectCreateWithNBC(BaseModel):
+    name: str
+    nbc_answers: Dict[str, Any]
+
 @router.post("/projects", response_model=ProjectOut)
-def create_project(payload: ProjectCreate, user=Depends(get_current_user)):
+def create_project(payload: ProjectCreateWithNBC, user=Depends(get_current_user)):
+    nbc_result = evaluate_building(payload.nbc_answers)
+    settings = {
+        "nbc_answers": payload.nbc_answers,
+        "nbc_evaluation": nbc_result,
+    }
     pid = new_id()
     project_dir(pid)
     with db() as con:
@@ -67,7 +110,7 @@ def create_project(payload: ProjectCreate, user=Depends(get_current_user)):
             """INSERT INTO projects
                 (id,owner_id,name,status,created_at,updated_at,settings_json)
                 VALUES (?,?,?,?,?,?,?)""",
-            (pid, user["id"], payload.name, "created", now(), now(), json.dumps({})),
+            (pid, user["id"], payload.name, "created", now(), now(), json.dumps(settings)),
         )
         r = con.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
     return _project_row_to_out(r)
@@ -229,6 +272,80 @@ def update_rooms(project_id: str, payload: dict, user=Depends(get_current_user))
     with open(rooms_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     return payload
+
+
+@router.post("/projects/{project_id}/auto_place")
+def auto_place_detectors(project_id: str, payload: dict = None, user=Depends(get_current_user)):
+    """Run NBC-based auto-placement of detectors using current rooms, without changing project status.
+    
+    Optional payload: {"equipment_type": "smoke" | "sprinkler" | "fire_hose" | ...}
+    If equipment_type given, only add those detectors (appending to existing).
+    If not given, replace all with smoke detectors.
+    """
+    from app.pipeline.place_detectors_advanced import place_detectors_from_rooms_json
+    import uuid as _uuid
+
+    equipment_type = (payload or {}).get("equipment_type", "smoke") if payload else "smoke"
+    # Validate
+    ALLOWED_TYPES = {"smoke", "sprinkler", "fire_hose", "panel", "hooter", "mcb"}
+    if equipment_type not in ALLOWED_TYPES:
+        equipment_type = "smoke"
+
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+
+    rooms_path = r["rooms_json_path"]
+    if not rooms_path or not os.path.exists(rooms_path):
+        raise HTTPException(404, "rooms not yet extracted")
+
+    mapping_path = r["mapping_json_path"]
+    if not mapping_path or not os.path.exists(mapping_path):
+        raise HTTPException(404, "mapping not available")
+
+    pdir = project_dir(project_id)
+    render_png = os.path.join(pdir, "render.png")
+
+    with open(rooms_path, "r", encoding="utf-8") as f:
+        rooms_data = json.load(f)
+    rooms = rooms_data.get("rooms", rooms_data) if isinstance(rooms_data, dict) else rooms_data
+
+    settings = json.loads(r["settings_json"] or "{}")
+    opts = PipelineOptions.from_env().merge_settings(settings)
+
+    placed, _regions = place_detectors_from_rooms_json(
+        rooms,
+        opts.detector_spacing_m,
+        opts.wall_buffer_m,
+        opts.world_to_m,
+        mapping_json_path=mapping_path,
+        base_png_path=render_png,
+    )
+
+    new_dets = [
+        {"id": str(_uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0, "dtype": equipment_type, "locked": 0}
+        for (x, y) in placed
+    ]
+
+    with db() as con:
+        # Delete only detectors of this type, keep others
+        con.execute("DELETE FROM detectors WHERE project_id=? AND dtype=?", (project_id, equipment_type))
+        for d in new_dets:
+            con.execute(
+                """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,created_at,updated_at)
+                     VALUES (?,?,?,?,?,?,?,?,?)""",
+                (d["id"], project_id, float(d["x"]), float(d["y"]), float(d.get("z", 0.0)),
+                 d.get("dtype", "smoke"), int(d.get("locked", 0)), now(), now()),
+            )
+
+    # Return placed detectors
+    with db() as con:
+        rows = con.execute(
+            "SELECT id, project_id, x, y, z, dtype, locked FROM detectors WHERE project_id=? ORDER BY created_at ASC",
+            (project_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 @router.post("/projects/{project_id}/continue_rooms", response_model=ProjectOut)

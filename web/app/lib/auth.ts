@@ -143,3 +143,16 @@ export async function apiLogin(email: string, password: string) {
 export async function apiFetch(path: string, init?: RequestInit) {
   return apiJson(path, init);
 }
+
+export async function apiUpload(path: string, formData: FormData) {
+  const token = getToken();
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(apiUrl(path), { method: "POST", headers, body: formData });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Upload failed (${res.status})`);
+  }
+  const text = await res.text();
+  try { return text ? JSON.parse(text) : null; } catch { return null; }
+}

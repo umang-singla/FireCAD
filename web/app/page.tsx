@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
-import { clearAuth, getName, apiFetch } from "./lib/auth";
+import { clearAuth, getName, apiFetch, apiUpload } from "./lib/auth";
 import { useRouter } from "next/navigation";
 
 /* ── types ─────────────────────────────────── */
@@ -12,6 +12,22 @@ type Project = {
   name: string;
   status: string;
   error?: string | null;
+  nbc_evaluation?: any;
+};
+
+type NBCQuestion = {
+  id: string;
+  type: "select" | "number" | "boolean";
+  label: string;
+  options?: string[];
+};
+
+type NBCEquipment = {
+  key: string;
+  label: string;
+  required: boolean;
+  supported: boolean;
+  notes: string[];
 };
 
 type NavKey =
@@ -95,15 +111,26 @@ const C = {
 export default function Dashboard() {
   const router = useRouter();
   const [active, setActive] = useState<NavKey>("dashboard");
-  const [projectName, setProjectName] = useState("New Building");
   const [projects, setProjects] = useState<Project[]>([]);
-  const [isCreating, setIsCreating] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [userName, setUserName] = useState("User");
   const [searchQuery, setSearchQuery] = useState("");
   const [timerRunning, setTimerRunning] = useState(true);
   const [timerSeconds, setTimerSeconds] = useState(5048);
+
+  // NBC Wizard state
+  const [showWizard, setShowWizard] = useState(false);
+  const [wizardStepIdx, setWizardStepIdx] = useState(0);
+  // step 0: project name + DWG upload (required), step 1: common questions, step 2: followup questions, step 3: evaluation result
+  const [wizardProjectName, setWizardProjectName] = useState("New Building");
+  const [nbcQuestions, setNbcQuestions] = useState<NBCQuestion[]>([]);
+  const [nbcFollowups, setNbcFollowups] = useState<NBCQuestion[]>([]);
+  const [nbcAnswers, setNbcAnswers] = useState<Record<string, any>>({});
+  const [nbcEvaluation, setNbcEvaluation] = useState<any>(null);
+  const [nbcOccupancyLabels, setNbcOccupancyLabels] = useState<Record<string, string>>({});
+  const [wizardSubmitting, setWizardSubmitting] = useState(false);
+  const [wizardDwgFile, setWizardDwgFile] = useState<File | null>(null);
 
   useEffect(() => {
     setUserName(getName() || "User");
@@ -139,32 +166,85 @@ export default function Dashboard() {
     loadProjects();
   }, []);
 
-  async function createProject() {
+  async function openWizard() {
+    setShowWizard(true);
+    setWizardStepIdx(0);
+    setWizardProjectName("New Building");
+    setNbcAnswers({});
+    setNbcFollowups([]);
+    setNbcEvaluation(null);
+    setWizardDwgFile(null);
+    try {
+      const [qs, labels] = await Promise.all([
+        apiFetch("/api/nbc/questions"),
+        apiFetch("/api/nbc/occupancy_types"),
+      ]);
+      setNbcQuestions(qs);
+      setNbcOccupancyLabels(labels);
+    } catch {}
+  }
+
+  async function wizardSelectOccupancy(subtype: string) {
+    setNbcAnswers((prev) => ({ ...prev, occupancy_subtype: subtype }));
+    try {
+      const followups: NBCQuestion[] = await apiFetch(`/api/nbc/followup_fields?occupancy_subtype=${encodeURIComponent(subtype)}`);
+      setNbcFollowups(followups);
+    } catch {
+      setNbcFollowups([]);
+    }
+  }
+
+  function setNbcAnswer(id: string, value: any) {
+    setNbcAnswers((prev) => ({ ...prev, [id]: value }));
+  }
+
+  async function wizardEvaluate() {
+    try {
+      const result = await apiFetch("/api/nbc/evaluate", {
+        method: "POST",
+        body: JSON.stringify({ answers: nbcAnswers }),
+      });
+      setNbcEvaluation(result);
+      setWizardStepIdx(3);
+    } catch (e: any) {
+      setError(e?.message || "Evaluation failed");
+    }
+  }
+
+  async function wizardCreateProject() {
+    setWizardSubmitting(true);
     setError(null);
-    setIsCreating(true);
     try {
       const j: Project = await apiFetch("/api/projects", {
         method: "POST",
-        body: JSON.stringify({ name: projectName }),
+        body: JSON.stringify({ name: wizardProjectName, nbc_answers: nbcAnswers }),
       });
       setProjects((prev) => [j, ...prev]);
-      setProjectName("New Building");
+      setShowWizard(false);
+
+      // Upload DWG if one was selected during the wizard
+      if (wizardDwgFile) {
+        const fd = new FormData();
+        fd.append("file", wizardDwgFile);
+        await apiUpload(`/api/projects/${j.id}/upload`, fd);
+      }
+
+      // Navigate to the project workspace
+      router.push(`/p/${j.id}`);
     } catch (e: any) {
       setError(e?.message || "Could not create project.");
     } finally {
-      setIsCreating(false);
+      setWizardSubmitting(false);
     }
+  }
+
+  async function createProject() {
+    openWizard();
   }
 
   const stats = useMemo(() => {
     const total = projects.length;
-    const ready = projects.filter((p) => (p.status || "").toLowerCase() === "ready").length;
-    const running = projects.filter((p) => (p.status || "").toLowerCase() === "running").length;
-    const pending = projects.filter(
-      (p) => !["ready", "running", "failed"].includes((p.status || "").toLowerCase())
-    ).length;
-    const failed = projects.filter((p) => (p.status || "").toLowerCase() === "failed").length;
-    return { total, ready, running, pending, failed };
+    return { total };
   }, [projects]);
 
   function signOut() {
@@ -289,15 +369,9 @@ export default function Dashboard() {
                 </p>
               </div>
               <div style={S.titleActions}>
-                <input
-                  value={projectName}
-                  onChange={(e) => setProjectName(e.target.value)}
-                  placeholder="Project name"
-                  style={S.projectInput}
-                />
-                <button type="button" onClick={createProject} disabled={isCreating} style={S.addBtn}>
+                <button type="button" onClick={createProject} style={S.addBtn}>
                   <Icon name="plus" />
-                  <span>{isCreating ? "Creating…" : "Add Project"}</span>
+                  <span>New Project</span>
                 </button>
                 <button type="button" onClick={loadProjects} disabled={isLoading} style={S.importBtn}>
                   <Icon name="download" />
@@ -310,10 +384,7 @@ export default function Dashboard() {
 
             {/* KPI cards */}
             <div style={S.kpiRow}>
-              <KpiCard label="Total Projects" value={stats.total} sub="Increased from last month" color={C.primary} bgColor="#E8F5E9" icon="box" />
-              <KpiCard label="Ended Projects" value={stats.ready} sub="Increased from last week" color={C.textSecondary} bgColor="#F5F5F5" icon="check" />
-              <KpiCard label="Running Projects" value={stats.running} sub="Increased from last month" color={C.textSecondary} bgColor="#F5F5F5" icon="clock" />
-              <KpiCard label="Pending Projects" value={stats.pending} sub={stats.failed > 0 ? `${stats.failed} failed` : "On track"} color={C.textSecondary} bgColor="#F5F5F5" icon="alert" />
+              <KpiCard label="Total Projects" value={stats.total} sub="All projects" color={C.primary} bgColor="#E8F5E9" icon="box" />
             </div>
 
             {/* row 2: analytics + reminders + project tasks */}
@@ -379,9 +450,9 @@ export default function Dashboard() {
                   <div style={S.progressRing}>
                     <svg width="120" height="120" viewBox="0 0 120 120">
                       <circle cx="60" cy="60" r="52" fill="none" stroke={C.cardBorder} strokeWidth="8" />
-                      <circle cx="60" cy="60" r="52" fill="none" stroke={C.primary} strokeWidth="8" strokeLinecap="round" strokeDasharray={`${2 * Math.PI * 52}`} strokeDashoffset={`${2 * Math.PI * 52 * (1 - (stats.total > 0 ? stats.ready / stats.total : 0.41))}`} transform="rotate(-90 60 60)" />
+                      <circle cx="60" cy="60" r="52" fill="none" stroke={C.primary} strokeWidth="8" strokeLinecap="round" strokeDasharray={`${2 * Math.PI * 52}`} strokeDashoffset={`${2 * Math.PI * 52 * 0.59}`} transform="rotate(-90 60 60)" />
                     </svg>
-                    <div style={S.progressText}>{stats.total > 0 ? Math.round((stats.ready / stats.total) * 100) : 41}%</div>
+                    <div style={S.progressText}>{stats.total}</div>
                   </div>
                   <div style={S.progressLegend}>
                     <span style={S.legendDot} /> In Progress &nbsp;
@@ -414,15 +485,9 @@ export default function Dashboard() {
                 <p style={S.pageSubtitle}>Manage all your projects in one place.</p>
               </div>
               <div style={S.titleActions}>
-                <input
-                  value={projectName}
-                  onChange={(e) => setProjectName(e.target.value)}
-                  placeholder="Project name"
-                  style={S.projectInput}
-                />
-                <button type="button" onClick={createProject} disabled={isCreating} style={S.addBtn}>
+                <button type="button" onClick={createProject} style={S.addBtn}>
                   <Icon name="plus" />
-                  <span>{isCreating ? "Creating…" : "Add Project"}</span>
+                  <span>New Project</span>
                 </button>
                 <button type="button" onClick={loadProjects} disabled={isLoading} style={S.importBtn}>
                   <Icon name="download" />
@@ -436,9 +501,6 @@ export default function Dashboard() {
             {/* stats strip */}
             <div style={S.kpiRow}>
               <KpiCard label="Total" value={stats.total} sub="All projects" color={C.primary} bgColor="#E8F5E9" icon="box" />
-              <KpiCard label="Ready" value={stats.ready} sub="Completed" color={C.success} bgColor="#ECFDF5" icon="check" />
-              <KpiCard label="Running" value={stats.running} sub="In progress" color={C.info} bgColor="#EFF6FF" icon="clock" />
-              <KpiCard label="Failed" value={stats.failed} sub="Need attention" color={C.danger} bgColor="#FEF2F2" icon="alert" />
             </div>
 
             {/* projects table */}
@@ -459,9 +521,8 @@ export default function Dashboard() {
               </div>
 
               <div style={S.tableScrollWrapper}>
-              <div style={{ ...S.tableHead, gridTemplateColumns: "1fr 140px 140px 120px" }}>
+              <div style={{ ...S.tableHead, gridTemplateColumns: "1fr 140px 120px" }}>
                 <span>Project Name</span>
-                <span>Status</span>
                 <span>Created</span>
                 <span style={{ textAlign: "right" }}>Action</span>
               </div>
@@ -472,12 +533,11 @@ export default function Dashboard() {
                 </div>
               ) : (
                 projects.map((p, idx) => (
-                  <div key={p.id} style={{ ...S.tableRow, gridTemplateColumns: "1fr 140px 140px 120px", background: idx % 2 === 0 ? C.card : "#FAFBFC" }}>
+                  <div key={p.id} style={{ ...S.tableRow, gridTemplateColumns: "1fr 140px 120px", background: idx % 2 === 0 ? C.card : "#FAFBFC" }}>
                     <div>
                       <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{p.name}</div>
                       <div style={{ fontSize: 11, color: C.textSecondary, marginTop: 2 }}>{p.id}</div>
                     </div>
-                    <div><span style={statusChip(p.status)}>{p.status}</span></div>
                     <div style={{ fontSize: 12, color: C.textSecondary }}>—</div>
                     <div style={{ display: "flex", justifyContent: "flex-end" }}>
                       <a href={`/p/${p.id}`} style={S.openLink}>Open <Icon name="chevronRight" /></a>
@@ -521,6 +581,264 @@ export default function Dashboard() {
           </div>
         )}
       </section>
+
+      {/* ═══════ NBC WIZARD MODAL ═══════ */}
+      {showWizard && (
+        <div style={WZ.overlay} onClick={() => setShowWizard(false)}>
+          <div style={WZ.modal} onClick={(e) => e.stopPropagation()}>
+            <div style={WZ.header}>
+              <span style={WZ.headerTitle}>
+                {wizardStepIdx === 0 && "New Project — Upload Drawing"}
+                {wizardStepIdx === 1 && "Building Details"}
+                {wizardStepIdx === 2 && "Additional Details"}
+                {wizardStepIdx === 3 && "NBC Compliance Results"}
+              </span>
+              <button type="button" style={WZ.closeBtn} onClick={() => setShowWizard(false)}>&times;</button>
+            </div>
+
+            {/* Step indicator */}
+            <div style={WZ.stepRow}>
+              {[0, 1, 2, 3].map((s) => (
+                <div key={s} style={{ ...WZ.stepDot, background: wizardStepIdx >= s ? C.primary : C.cardBorder }} />
+              ))}
+            </div>
+
+            <div style={WZ.body}>
+              {/* STEP 0: Project name + DWG upload */}
+              {wizardStepIdx === 0 && (
+                <div style={WZ.stepContent}>
+                  <label style={WZ.label}>Project Name</label>
+                  <input
+                    value={wizardProjectName}
+                    onChange={(e) => setWizardProjectName(e.target.value)}
+                    placeholder="Enter project name"
+                    style={WZ.input}
+                    autoFocus
+                  />
+                  <div style={{ marginTop: 8 }}>
+                    <label style={WZ.label}>Upload DWG/DXF Drawing <span style={{ color: C.danger }}>*</span></label>
+                    <div style={{
+                      marginTop: 6, padding: "20px 16px", borderRadius: 12, textAlign: "center",
+                      border: `2px dashed ${wizardDwgFile ? C.primary : C.cardBorder}`,
+                      background: wizardDwgFile ? "#ECFDF5" : "#FAFBFC",
+                      cursor: "pointer", transition: "all 0.15s",
+                    }}>
+                      <label style={{ cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+                        {wizardDwgFile ? (
+                          <>
+                            <div style={{ width: 40, height: 40, borderRadius: 10, background: C.primary, display: "grid", placeItems: "center" }}>
+                              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2"><polyline points="20 6 9 17 4 12"/></svg>
+                            </div>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{wizardDwgFile.name}</div>
+                            <div style={{ fontSize: 11, color: C.success }}>File selected — click to change</div>
+                          </>
+                        ) : (
+                          <>
+                            <div style={{ width: 40, height: 40, borderRadius: 10, background: "#F3F4F6", display: "grid", placeItems: "center" }}>
+                              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={C.textMuted} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+                              </svg>
+                            </div>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>Click to upload DWG or DXF file</div>
+                            <div style={{ fontSize: 11, color: C.textMuted }}>Required to proceed</div>
+                          </>
+                        )}
+                        <input
+                          type="file"
+                          accept=".dxf,.dwg"
+                          style={{ display: "none" }}
+                          onChange={(e) => setWizardDwgFile(e.target.files?.[0] || null)}
+                        />
+                      </label>
+                    </div>
+                  </div>
+                  <div style={WZ.btnRow}>
+                    <button type="button" style={WZ.secondaryBtn} onClick={() => setShowWizard(false)}>Cancel</button>
+                    <button type="button" style={WZ.primaryBtn} onClick={() => setWizardStepIdx(1)} disabled={!wizardProjectName.trim() || !wizardDwgFile}>
+                      Next
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* STEP 1: Common questions */}
+              {wizardStepIdx === 1 && (
+                <div style={WZ.stepContent}>
+                  {nbcQuestions.map((q) => (
+                    <div key={q.id} style={WZ.fieldGroup}>
+                      <label style={WZ.label}>{q.label}</label>
+                      {q.type === "select" && q.options && (
+                        <select
+                          value={nbcAnswers[q.id] ?? ""}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setNbcAnswer(q.id, val);
+                            if (q.id === "occupancy_subtype") wizardSelectOccupancy(val);
+                          }}
+                          style={WZ.select}
+                        >
+                          <option value="">— Select —</option>
+                          {q.options.map((opt) => (
+                            <option key={opt} value={opt}>
+                              {nbcOccupancyLabels[opt] || opt.replace(/_/g, " ")}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      {q.type === "number" && (
+                        <input
+                          type="number"
+                          value={nbcAnswers[q.id] ?? ""}
+                          onChange={(e) => setNbcAnswer(q.id, e.target.value === "" ? "" : Number(e.target.value))}
+                          style={WZ.input}
+                          placeholder="0"
+                        />
+                      )}
+                      {q.type === "boolean" && (
+                        <div style={WZ.toggleRow}>
+                          <button
+                            type="button"
+                            onClick={() => setNbcAnswer(q.id, true)}
+                            style={{ ...WZ.toggleBtn, ...(nbcAnswers[q.id] === true ? WZ.toggleActive : {}) }}
+                          >Yes</button>
+                          <button
+                            type="button"
+                            onClick={() => setNbcAnswer(q.id, false)}
+                            style={{ ...WZ.toggleBtn, ...(nbcAnswers[q.id] === false ? WZ.toggleActive : {}) }}
+                          >No</button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                  <div style={WZ.btnRow}>
+                    <button type="button" style={WZ.secondaryBtn} onClick={() => setWizardStepIdx(0)}>Back</button>
+                    <button
+                      type="button"
+                      style={WZ.primaryBtn}
+                      onClick={() => nbcFollowups.length > 0 ? setWizardStepIdx(2) : wizardEvaluate()}
+                      disabled={!nbcAnswers.occupancy_subtype}
+                    >
+                      {nbcFollowups.length > 0 ? "Next" : "Evaluate"}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* STEP 2: Followup questions */}
+              {wizardStepIdx === 2 && (
+                <div style={WZ.stepContent}>
+                  <p style={{ fontSize: 13, color: C.textSecondary, margin: "0 0 12px" }}>
+                    Additional details for <b>{nbcOccupancyLabels[nbcAnswers.occupancy_subtype] || nbcAnswers.occupancy_subtype}</b>
+                  </p>
+                  {nbcFollowups.map((q) => (
+                    <div key={q.id} style={WZ.fieldGroup}>
+                      <label style={WZ.label}>{q.label}</label>
+                      {q.type === "number" && (
+                        <input
+                          type="number"
+                          value={nbcAnswers[q.id] ?? ""}
+                          onChange={(e) => setNbcAnswer(q.id, e.target.value === "" ? "" : Number(e.target.value))}
+                          style={WZ.input}
+                          placeholder="0"
+                        />
+                      )}
+                      {q.type === "boolean" && (
+                        <div style={WZ.toggleRow}>
+                          <button
+                            type="button"
+                            onClick={() => setNbcAnswer(q.id, true)}
+                            style={{ ...WZ.toggleBtn, ...(nbcAnswers[q.id] === true ? WZ.toggleActive : {}) }}
+                          >Yes</button>
+                          <button
+                            type="button"
+                            onClick={() => setNbcAnswer(q.id, false)}
+                            style={{ ...WZ.toggleBtn, ...(nbcAnswers[q.id] === false ? WZ.toggleActive : {}) }}
+                          >No</button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                  <div style={WZ.btnRow}>
+                    <button type="button" style={WZ.secondaryBtn} onClick={() => setWizardStepIdx(1)}>Back</button>
+                    <button type="button" style={WZ.primaryBtn} onClick={wizardEvaluate}>Evaluate</button>
+                  </div>
+                </div>
+              )}
+
+              {/* STEP 3: Evaluation results */}
+              {wizardStepIdx === 3 && nbcEvaluation && (
+                <div style={WZ.stepContent}>
+                  {nbcEvaluation.matched_category && (
+                    <div style={WZ.resultBanner}>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>Matched Category</div>
+                      <div style={{ fontSize: 15, fontWeight: 800, color: C.primary, marginTop: 4 }}>{nbcEvaluation.matched_category}</div>
+                    </div>
+                  )}
+
+                  {nbcEvaluation.warnings && nbcEvaluation.warnings.length > 0 && (
+                    <div style={WZ.warningBox}>
+                      <div style={{ fontWeight: 700, fontSize: 12, marginBottom: 6 }}>Warnings</div>
+                      {nbcEvaluation.warnings.map((w: string, i: number) => (
+                        <div key={i} style={{ fontSize: 12, marginBottom: 4 }}>&#9888; {w}</div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div style={{ fontSize: 13, fontWeight: 800, color: C.text, marginTop: 12, marginBottom: 8 }}>
+                    Fire Safety Equipment
+                  </div>
+
+                  <div style={WZ.equipGrid}>
+                    {(nbcEvaluation.equipment || []).map((eq: NBCEquipment) => {
+                      const isRequired = eq.required;
+                      const isSupported = eq.supported;
+                      return (
+                        <div key={eq.key} style={{ ...WZ.equipCard, borderColor: isRequired ? (isSupported ? C.primary : C.warning) : C.cardBorder }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                            <span style={{ fontSize: 12, fontWeight: 700, color: C.text, flex: 1 }}>{eq.label}</span>
+                            {isRequired ? (
+                              isSupported ? (
+                                <span style={{ ...WZ.chip, background: "#ECFDF5", color: C.success, borderColor: "rgba(5,150,105,0.2)" }}>Supported</span>
+                              ) : (
+                                <span style={{ ...WZ.chip, background: "#FEF3C7", color: C.warning, borderColor: "rgba(217,119,6,0.2)" }}>Coming Soon</span>
+                              )
+                            ) : (
+                              <span style={{ ...WZ.chip, background: "#F3F4F6", color: C.textMuted, borderColor: "rgba(156,163,175,0.2)" }}>Not Required</span>
+                            )}
+                          </div>
+                          {eq.notes.length > 0 && (
+                            <div style={{ fontSize: 11, color: C.textSecondary, marginTop: 6 }}>
+                              {eq.notes.map((n, ni) => <div key={ni}>{n}</div>)}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {error && <div style={{ ...S.errorBanner, marginTop: 12 }}>{error}</div>}
+
+                  {wizardDwgFile && (
+                    <div style={{ marginTop: 12, padding: "10px 14px", borderRadius: 10, background: "#ECFDF5", border: "1px solid rgba(5,150,105,0.2)", display: "flex", alignItems: "center", gap: 8 }}>
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={C.success} strokeWidth="2"><polyline points="20 6 9 17 4 12"/></svg>
+                      <span style={{ fontSize: 12, color: C.text, fontWeight: 600 }}>{wizardDwgFile.name}</span>
+                    </div>
+                  )}
+
+                  <div style={WZ.btnRow}>
+                    <button type="button" style={WZ.secondaryBtn} onClick={() => nbcFollowups.length > 0 ? setWizardStepIdx(2) : setWizardStepIdx(1)}>
+                      Back
+                    </button>
+                    <button type="button" style={WZ.primaryBtn} onClick={wizardCreateProject} disabled={wizardSubmitting}>
+                      {wizardSubmitting ? "Creating…" : "Create Project"}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       <style>{`
         input::placeholder { color: ${C.textMuted}; }
@@ -1302,6 +1620,183 @@ const S: Record<string, CSSProperties> = {
 };
 
 /* ── helpers ──────────────────────────────── */
+
+/* ── Wizard styles ───────────────────────── */
+const WZ: Record<string, CSSProperties> = {
+  overlay: {
+    position: "fixed",
+    inset: 0,
+    background: "rgba(0,0,0,0.45)",
+    display: "grid",
+    placeItems: "center",
+    zIndex: 1000,
+  },
+  modal: {
+    background: C.card,
+    borderRadius: 20,
+    width: "100%",
+    maxWidth: 620,
+    maxHeight: "90vh",
+    display: "flex",
+    flexDirection: "column",
+    boxShadow: "0 24px 48px rgba(0,0,0,0.18)",
+    overflow: "hidden",
+  },
+  header: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: "18px 24px",
+    borderBottom: `1px solid ${C.cardBorder}`,
+  },
+  headerTitle: {
+    fontSize: 16,
+    fontWeight: 800,
+    color: C.text,
+  },
+  closeBtn: {
+    background: "none",
+    border: "none",
+    fontSize: 22,
+    color: C.textMuted,
+    cursor: "pointer",
+    padding: "4px 8px",
+    lineHeight: 1,
+  },
+  stepRow: {
+    display: "flex",
+    gap: 6,
+    justifyContent: "center",
+    padding: "14px 24px 0",
+  },
+  stepDot: {
+    width: 32,
+    height: 4,
+    borderRadius: 999,
+    transition: "background 0.2s",
+  },
+  body: {
+    padding: "0 24px 24px",
+    overflowY: "auto",
+    flex: 1,
+  },
+  stepContent: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+    paddingTop: 16,
+  },
+  fieldGroup: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+  },
+  label: {
+    fontSize: 12,
+    fontWeight: 700,
+    color: C.textSecondary,
+  },
+  input: {
+    borderRadius: 10,
+    border: `1px solid ${C.cardBorder}`,
+    padding: "10px 14px",
+    fontSize: 13,
+    color: C.text,
+    outline: "none",
+    background: C.card,
+  },
+  select: {
+    borderRadius: 10,
+    border: `1px solid ${C.cardBorder}`,
+    padding: "10px 14px",
+    fontSize: 13,
+    color: C.text,
+    outline: "none",
+    background: C.card,
+    cursor: "pointer",
+  },
+  toggleRow: {
+    display: "flex",
+    gap: 8,
+  },
+  toggleBtn: {
+    borderRadius: 8,
+    border: `1px solid ${C.cardBorder}`,
+    background: C.card,
+    color: C.textSecondary,
+    padding: "8px 20px",
+    fontSize: 12,
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  toggleActive: {
+    background: C.primary,
+    color: C.white,
+    borderColor: C.primary,
+  },
+  btnRow: {
+    display: "flex",
+    justifyContent: "flex-end",
+    gap: 10,
+    marginTop: 8,
+  },
+  primaryBtn: {
+    borderRadius: 10,
+    border: "none",
+    background: C.primary,
+    color: C.white,
+    padding: "10px 24px",
+    fontSize: 13,
+    fontWeight: 700,
+    cursor: "pointer",
+    boxShadow: "0 4px 12px rgba(45,106,79,0.3)",
+  },
+  secondaryBtn: {
+    borderRadius: 10,
+    border: `1px solid ${C.cardBorder}`,
+    background: C.card,
+    color: C.text,
+    padding: "10px 24px",
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  resultBanner: {
+    borderRadius: 12,
+    border: `1px solid rgba(45,106,79,0.2)`,
+    background: "#E8F5E9",
+    padding: "14px 16px",
+  },
+  warningBox: {
+    borderRadius: 12,
+    border: "1px solid rgba(217,119,6,0.2)",
+    background: "#FEF3C7",
+    padding: "12px 16px",
+    color: C.warning,
+    marginTop: 8,
+  },
+  equipGrid: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+  },
+  equipCard: {
+    borderRadius: 10,
+    border: "1px solid",
+    padding: "12px 14px",
+    background: C.card,
+  },
+  chip: {
+    display: "inline-flex",
+    borderRadius: 999,
+    padding: "3px 10px",
+    fontSize: 10,
+    fontWeight: 700,
+    border: "1px solid",
+    whiteSpace: "nowrap",
+    flexShrink: 0,
+  },
+};
 
 function navStyle(active: boolean): CSSProperties {
   return {

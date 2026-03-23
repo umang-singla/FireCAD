@@ -13,6 +13,9 @@ class ProjectOut(BaseModel):
     status: str
     error: Optional[str] = None
     files: Dict[str, Optional[str]] = {}
+    nbc_evaluation: Optional[Dict[str, Any]] = None
+    nbc_answers: Optional[Dict[str, Any]] = None
+    input_filename: Optional[str] = None
 
 class DetectorOut(BaseModel):
     id: str
