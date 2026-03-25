@@ -50,11 +50,17 @@ def init_db():
         z REAL NOT NULL DEFAULT 0.0,
         dtype TEXT NOT NULL DEFAULT 'smoke',
         locked INTEGER NOT NULL DEFAULT 0,
+        floor_plan_id TEXT,
         created_at REAL,
         updated_at REAL,
-        FOREIGN KEY(project_id) REFERENCES projects(id)
+        FOREIGN KEY(project_id) REFERENCES projects(id),
+        FOREIGN KEY(floor_plan_id) REFERENCES floor_plans(id)
     )
     """)
+
+    det_cols = {row[1] for row in cur.execute("PRAGMA table_info(detectors)").fetchall()}
+    if "floor_plan_id" not in det_cols:
+        cur.execute("ALTER TABLE detectors ADD COLUMN floor_plan_id TEXT")
 
     # ✅ auth tables
     cur.execute("""
@@ -77,6 +83,28 @@ def init_db():
         FOREIGN KEY(user_id) REFERENCES users(id)
     )
     """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS floor_plans (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        block_index INTEGER NOT NULL,
+        world_bbox_json TEXT,
+        pixel_bbox_json TEXT,
+        render_png_path TEXT,
+        mapping_json_path TEXT,
+        mask_png_path TEXT,
+        aligned_mask_path TEXT,
+        fixed_wall_path TEXT,
+        rooms_json_path TEXT,
+        status TEXT NOT NULL DEFAULT 'created',
+        created_at REAL,
+        updated_at REAL,
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+    )
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_floor_plans_project_id ON floor_plans(project_id)")
 
     con.commit()
     con.close()

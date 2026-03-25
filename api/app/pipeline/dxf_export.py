@@ -7,12 +7,16 @@ DXF_LAYER_PANEL = "AI_PANEL"
 DXF_LAYER_HOOTER = "AI_HOOTER"
 DXF_LAYER_MCB = "AI_MCB"
 DXF_LAYER_LEGEND = "AI_LEGEND"
+DXF_LAYER_SPRINKLER = "AI_FIRE_SPRINKLERS"
+DXF_LAYER_PIPES = "AI_FIRE_PIPES"
+DXF_LAYER_SOURCE = "AI_FIRE_SOURCE"
 
 LAYER_BY_DTYPE = {
     "smoke": DXF_LAYER_SMOKE,
     "panel": DXF_LAYER_PANEL,
     "hooter": DXF_LAYER_HOOTER,
     "mcb": DXF_LAYER_MCB,
+    "sprinkler": DXF_LAYER_SPRINKLER,
 }
 
 LABEL_BY_DTYPE = {
@@ -20,6 +24,7 @@ LABEL_BY_DTYPE = {
     "panel": "Panel",
     "hooter": "Hooter",
     "mcb": "MCB",
+    "sprinkler": "Fire Sprinkler",
 }
 
 
@@ -45,11 +50,21 @@ def _add_smoke_symbol(msp, x: float, y: float, radius: float, layer: str):
     txt.set_placement((x, y), align=TextEntityAlignment.MIDDLE_CENTER)
 
 
+def _add_sprinkler_symbol(msp, x: float, y: float, radius: float, layer: str):
+    """Sprinkler symbol: circle with a + (plus) sign inside."""
+    msp.add_circle((x, y), radius=radius, dxfattribs={"layer": layer, "color": 1})
+    arm = radius * 0.7
+    msp.add_line((x - arm, y), (x + arm, y), dxfattribs={"layer": layer, "color": 1})
+    msp.add_line((x, y - arm), (x, y + arm), dxfattribs={"layer": layer, "color": 1})
+
+
 def _add_symbol_for_dtype(msp, dtype: str, x: float, y: float, radius: float):
     key = str(dtype or "smoke").strip().lower()
     layer = LAYER_BY_DTYPE.get(key, DXF_LAYER_SMOKE)
     if key == "smoke":
         _add_smoke_symbol(msp, x, y, radius, layer)
+    elif key == "sprinkler":
+        _add_sprinkler_symbol(msp, x, y, radius, layer)
     else:
         _add_filled_dot(msp, x, y, radius, layer)
 
@@ -135,7 +150,7 @@ def write_detectors_to_dxf(base_dxf: str, out_dxf: str, detectors: list[dict],
     doc = ezdxf.readfile(base_dxf)
     msp = doc.modelspace()
 
-    for layer_name in [*LAYER_BY_DTYPE.values(), DXF_LAYER_LEGEND]:
+    for layer_name in [*LAYER_BY_DTYPE.values(), DXF_LAYER_LEGEND, DXF_LAYER_PIPES, DXF_LAYER_SOURCE]:
         if layer_name not in doc.layers:
             doc.layers.add(layer_name)
 

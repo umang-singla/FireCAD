@@ -12,6 +12,14 @@ class PipelineOptions:
     use_gemini: bool = False
     world_to_m: float = 0.001  # DXF units -> meters (default mm)
 
+    # Sprinkler settings
+    sprinkler_spacing_m: float = 3.0
+    enable_sprinklers: bool = False
+    sprinkler_source_labels: list | None = None   # DXF text/block labels for pipe source detection
+
+    # Room filtering
+    room_exclude_keywords: list | None = None      # DXF text labels to exclude rooms (e.g. toilets)
+
     @staticmethod
     def from_env() -> "PipelineOptions":
         return PipelineOptions(
@@ -23,6 +31,8 @@ class PipelineOptions:
             gemini_model=os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image-preview"),
             use_gemini=bool(os.getenv("GEMINI_API_KEY", "").strip()),
             world_to_m=float(os.getenv("WORLD_TO_M", "0.001")),
+            sprinkler_spacing_m=float(os.getenv("SPRINKLER_SPACING_M", "3.0")),
+            enable_sprinklers=os.getenv("ENABLE_SPRINKLERS", "0").strip().lower() in ("1", "true", "yes"),
         )
 
     def merge_settings(self, settings: dict) -> "PipelineOptions":
@@ -35,6 +45,17 @@ class PipelineOptions:
             self.target_long_side_px = int(settings["target_long_side_px"])
         if "gemini_model" in settings:
             self.gemini_model = str(settings["gemini_model"])
+
+        # Sprinkler overrides
+        if "sprinkler_spacing_m" in settings:
+            self.sprinkler_spacing_m = float(settings["sprinkler_spacing_m"])
+        if "enable_sprinklers" in settings:
+            val = settings["enable_sprinklers"]
+            self.enable_sprinklers = val if isinstance(val, bool) else str(val).lower() in ("1", "true", "yes")
+        if "sprinkler_source_labels" in settings:
+            self.sprinkler_source_labels = list(settings["sprinkler_source_labels"])
+        if "room_exclude_keywords" in settings:
+            self.room_exclude_keywords = list(settings["room_exclude_keywords"])
 
         # Units overrides
         if "world_to_m" in settings:

@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
+from typing import Optional
 from app.db import db, now
 from app.storage import new_id
 from app.schemas import DetectorOut, DetectorCreate, DetectorUpdate
@@ -15,21 +16,34 @@ def _row_to_out(r) -> DetectorOut:
         z=float(r["z"]),
         dtype=r["dtype"],
         locked=bool(r["locked"]),
+        floor_plan_id=r["floor_plan_id"] if "floor_plan_id" in r.keys() else None,
     )
 
 @router.get("/projects/{project_id}/detectors", response_model=list[DetectorOut])
-def list_detectors(project_id: str, user=Depends(get_current_user)):
+def list_detectors(project_id: str, floor_plan_id: Optional[str] = Query(None), user=Depends(get_current_user)):
     with db() as con:
-        rows = con.execute(
-            """
-            SELECT d.*
-            FROM detectors d
-            JOIN projects p ON p.id = d.project_id
-            WHERE d.project_id=? AND p.owner_id=?
-            ORDER BY d.created_at ASC
-            """,
-            (project_id, user["id"]),
-        ).fetchall()
+        if floor_plan_id:
+            rows = con.execute(
+                """
+                SELECT d.*
+                FROM detectors d
+                JOIN projects p ON p.id = d.project_id
+                WHERE d.project_id=? AND p.owner_id=? AND d.floor_plan_id=?
+                ORDER BY d.created_at ASC
+                """,
+                (project_id, user["id"], floor_plan_id),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                """
+                SELECT d.*
+                FROM detectors d
+                JOIN projects p ON p.id = d.project_id
+                WHERE d.project_id=? AND p.owner_id=?
+                ORDER BY d.created_at ASC
+                """,
+                (project_id, user["id"]),
+            ).fetchall()
     return [_row_to_out(r) for r in rows]
 
 @router.post("/projects/{project_id}/detectors", response_model=DetectorOut)
@@ -41,10 +55,10 @@ def create_detector(project_id: str, payload: DetectorCreate, user=Depends(get_c
         if not p:
             raise HTTPException(404, "project not found")
         con.execute(
-            """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,created_at,updated_at)
-                 VALUES (?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,floor_plan_id,created_at,updated_at)
+                 VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (did, project_id, float(payload.x), float(payload.y), float(payload.z),
-             payload.dtype, 0, now(), now())
+             payload.dtype, 0, payload.floor_plan_id, now(), now())
         )
         r = con.execute("SELECT * FROM detectors WHERE id=?", (did,)).fetchone()
     return _row_to_out(r)

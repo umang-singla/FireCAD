@@ -58,6 +58,16 @@ def _project_row_to_out(r) -> ProjectOut:
     add("detectors_global_snap_debug", detectors_debug_path if os.path.exists(detectors_debug_path) else None)
     add("detectors_global_snap_overlay", detectors_overlay_debug_path if os.path.exists(detectors_overlay_debug_path) else None)
 
+    sprinkler_pipes_path = os.path.join(project_dir(r["id"]), "sprinkler_pipes.json")
+    add("sprinkler_pipes", sprinkler_pipes_path if os.path.exists(sprinkler_pipes_path) else None)
+
+    # Count floor plan blocks
+    with db() as con:
+        fp_count = con.execute(
+            "SELECT COUNT(*) FROM floor_plans WHERE project_id=?",
+            (r["id"],),
+        ).fetchone()[0]
+
     return ProjectOut(
         id=r["id"],
         name=r["name"],
@@ -67,6 +77,7 @@ def _project_row_to_out(r) -> ProjectOut:
         nbc_evaluation=json.loads(r["settings_json"] or "{}").get("nbc_evaluation"),
         nbc_answers=json.loads(r["settings_json"] or "{}").get("nbc_answers"),
         input_filename=r["input_filename"],
+        floor_plans_count=fp_count,
     )
 
 # ── NBC rule engine endpoints ───────────────────────────────
@@ -283,6 +294,7 @@ def auto_place_detectors(project_id: str, payload: dict = None, user=Depends(get
     If not given, replace all with smoke detectors.
     """
     from app.pipeline.place_detectors_advanced import place_detectors_from_rooms_json
+    from app.pipeline.sprinkler_routing import place_sprinklers_only
     import uuid as _uuid
 
     equipment_type = (payload or {}).get("equipment_type", "smoke") if payload else "smoke"
@@ -304,8 +316,7 @@ def auto_place_detectors(project_id: str, payload: dict = None, user=Depends(get
     if not mapping_path or not os.path.exists(mapping_path):
         raise HTTPException(404, "mapping not available")
 
-    pdir = project_dir(project_id)
-    render_png = os.path.join(pdir, "render.png")
+    render_png = os.path.join(project_dir(project_id), "render.png")
 
     with open(rooms_path, "r", encoding="utf-8") as f:
         rooms_data = json.load(f)
@@ -314,19 +325,31 @@ def auto_place_detectors(project_id: str, payload: dict = None, user=Depends(get
     settings = json.loads(r["settings_json"] or "{}")
     opts = PipelineOptions.from_env().merge_settings(settings)
 
-    placed, _regions = place_detectors_from_rooms_json(
-        rooms,
-        opts.detector_spacing_m,
-        opts.wall_buffer_m,
-        opts.world_to_m,
-        mapping_json_path=mapping_path,
-        base_png_path=render_png,
-    )
-
-    new_dets = [
-        {"id": str(_uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0, "dtype": equipment_type, "locked": 0}
-        for (x, y) in placed
-    ]
+    if equipment_type == "sprinkler":
+        # Place sprinklers only (no pipe routing)
+        sp_points = place_sprinklers_only(
+            rooms,
+            spacing_m=opts.sprinkler_spacing_m,
+            wall_buffer_m=opts.wall_buffer_m,
+            world_to_m=opts.world_to_m,
+        )
+        new_dets = [
+            {"id": str(_uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0, "dtype": "sprinkler", "locked": 0}
+            for x, y in sp_points
+        ]
+    else:
+        placed, _regions = place_detectors_from_rooms_json(
+            rooms,
+            opts.detector_spacing_m,
+            opts.wall_buffer_m,
+            opts.world_to_m,
+            mapping_json_path=mapping_path,
+            base_png_path=render_png,
+        )
+        new_dets = [
+            {"id": str(_uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0, "dtype": equipment_type, "locked": 0}
+            for (x, y) in placed
+        ]
 
     with db() as con:
         # Delete only detectors of this type, keep others
@@ -387,6 +410,97 @@ def reset_detectors(project_id: str, user=Depends(get_current_user)):
         r2 = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
     return _project_row_to_out(r2)
 
+
+@router.put("/projects/{project_id}/bulk_save")
+def bulk_save(project_id: str, payload: dict, user=Depends(get_current_user)):
+    """Save rooms, detectors, and pipes in a single call. No QCAD rendering."""
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+
+        pdir = project_dir(project_id)
+        floor_plan_id = payload.get("floor_plan_id")
+
+        # ── 1. Save rooms ──────────────────────────────────────────────
+        rooms = payload.get("rooms")
+        if rooms is not None:
+            if floor_plan_id:
+                fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (floor_plan_id, project_id)).fetchone()
+                if not fp:
+                    raise HTTPException(404, "floor plan not found")
+                rooms_path = fp["rooms_json_path"]
+            else:
+                rooms_path = r["rooms_json_path"]
+            if rooms_path and os.path.exists(rooms_path):
+                with open(rooms_path, "r", encoding="utf-8") as f:
+                    rooms_data = json.load(f)
+                if isinstance(rooms_data, dict):
+                    rooms_data["rooms"] = rooms
+                else:
+                    rooms_data = {"rooms": rooms}
+                with open(rooms_path, "w", encoding="utf-8") as f:
+                    json.dump(rooms_data, f, indent=2)
+
+        # ── 2. Sync detectors ──────────────────────────────────────────
+        det_list = payload.get("detectors")
+        if det_list is not None:
+            # Delete existing detectors for this scope
+            if floor_plan_id:
+                con.execute("DELETE FROM detectors WHERE project_id=? AND floor_plan_id=?", (project_id, floor_plan_id))
+            else:
+                con.execute("DELETE FROM detectors WHERE project_id=?", (project_id,))
+            # Re-insert all
+            t = now()
+            for d in det_list:
+                con.execute(
+                    """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,floor_plan_id,created_at,updated_at)
+                         VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (d.get("id", str(__import__('uuid').uuid4())), project_id,
+                     float(d["x"]), float(d["y"]), float(d.get("z", 0)),
+                     d.get("dtype", "smoke"), int(d.get("locked", False)),
+                     d.get("floor_plan_id") or floor_plan_id, t, t),
+                )
+
+        # ── 3. Save pipes ──────────────────────────────────────────────
+        pipes = payload.get("pipes")
+        if pipes is not None:
+            if floor_plan_id:
+                fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (floor_plan_id, project_id)).fetchone()
+                pipes_path = os.path.join(pdir, f"sprinkler_pipes_{fp['block_index']}.json") if fp else None
+            else:
+                pipes_path = os.path.join(pdir, "sprinkler_pipes.json")
+            if pipes_path:
+                with open(pipes_path, "w", encoding="utf-8") as f:
+                    json.dump(pipes, f, indent=2)
+
+        con.execute("UPDATE projects SET updated_at=? WHERE id=?", (now(), project_id))
+
+    # Return updated detectors
+    with db() as con:
+        if floor_plan_id:
+            rows = con.execute(
+                "SELECT * FROM detectors WHERE project_id=? AND floor_plan_id=? ORDER BY created_at ASC",
+                (project_id, floor_plan_id),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT * FROM detectors WHERE project_id=? ORDER BY created_at ASC",
+                (project_id,),
+            ).fetchall()
+
+    return {
+        "ok": True,
+        "detectors": [
+            {"id": row["id"], "project_id": row["project_id"],
+             "x": float(row["x"]), "y": float(row["y"]), "z": float(row["z"]),
+             "dtype": row["dtype"], "locked": bool(row["locked"]),
+             "floor_plan_id": row["floor_plan_id"]}
+            for row in rows
+        ],
+    }
+
+
 @router.post("/projects/{project_id}/save", response_model=ProjectOut)
 def save_project_layout(project_id: str, user=Depends(get_current_user)):
     with db() as con:
@@ -418,6 +532,25 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
         out_dxf = os.path.join(project_dir(project_id), "detectors_overlay.dxf")
         write_detectors_to_dxf(dxf_path, out_dxf, dets, symbol_radius_world=150.0, text_height_world=150.0)
 
+        # Write sprinkler pipes into the DXF if they exist
+        pipes_json_path = os.path.join(project_dir(project_id), "sprinkler_pipes.json")
+        if os.path.exists(pipes_json_path):
+            from app.pipeline.sprinkler_routing import write_sprinklers_to_dxf
+            with open(pipes_json_path, "r", encoding="utf-8") as pf:
+                pipes_data = json.load(pf)
+            sprinkler_dets = [(float(d["x"]), float(d["y"])) for d in dets if d["dtype"] == "sprinkler"]
+            pipe_segments = [
+                (((p["from"][0], p["from"][1]), (p["to"][0], p["to"][1])), p["diameter"])
+                for p in pipes_data.get("pipes", [])
+            ]
+            pipe_sources = [(s["x"], s["y"]) for s in pipes_data.get("sources", [])]
+            if sprinkler_dets or pipe_segments:
+                write_sprinklers_to_dxf(
+                    out_dxf, out_dxf,
+                    sprinkler_dets, pipe_segments, pipe_sources,
+                    symbol_radius_world=150.0, text_height_world=150.0,
+                )
+
         out_png = os.path.join(project_dir(project_id), "detectors_preview.png")
         out_map = os.path.join(project_dir(project_id), "detectors_preview_mapping.json")
 
@@ -444,3 +577,428 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
         r2 = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
 
     return _project_row_to_out(r2)
+
+
+# ── Floor plan (block) management endpoints ─────────────────
+
+@router.get("/projects/{project_id}/floor_plans")
+def list_floor_plans(project_id: str, user=Depends(get_current_user)):
+    """Return all floor-plan blocks extracted from the project's DXF."""
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+        rows = con.execute(
+            "SELECT * FROM floor_plans WHERE project_id=? ORDER BY block_index ASC",
+            (project_id,),
+        ).fetchall()
+    return [_floor_plan_row_to_dict(fp) for fp in rows]
+
+
+def _floor_plan_row_to_dict(fp) -> dict:
+    d: dict = {
+        "id": fp["id"],
+        "project_id": fp["project_id"],
+        "block_index": fp["block_index"],
+        "status": fp["status"],
+        "world_bbox": json.loads(fp["world_bbox_json"]) if fp["world_bbox_json"] else None,
+        "pixel_bbox": json.loads(fp["pixel_bbox_json"]) if fp["pixel_bbox_json"] else None,
+        "files": {},
+    }
+    def add(k, p):
+        d["files"][k] = f"/files/{relpath(p)}" if p and os.path.exists(p) else None
+    add("render_png", fp["render_png_path"])
+    add("mapping_json", fp["mapping_json_path"])
+    add("mask_png", fp["mask_png_path"])
+    add("aligned_mask", fp["aligned_mask_path"])
+    add("fixed_wall", fp["fixed_wall_path"])
+    add("rooms_json", fp["rooms_json_path"])
+    # Per-floor-plan sprinkler pipes
+    idx = fp["block_index"]
+    pid = fp["project_id"]
+    pipes_path = os.path.join(project_dir(pid), f"sprinkler_pipes_{idx}.json")
+    add("sprinkler_pipes", pipes_path if os.path.exists(pipes_path) else None)
+    return d
+
+
+@router.post("/projects/{project_id}/floor_plans/{fp_id}/aligned_mask")
+async def upload_floor_plan_aligned_mask(
+    project_id: str, fp_id: str,
+    file: UploadFile = File(...),
+    user=Depends(get_current_user),
+):
+    """Upload / replace the aligned mask for a specific floor-plan block."""
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
+        if not fp:
+            raise HTTPException(404, "floor plan block not found")
+
+    filename = (file.filename or "aligned_mask").strip().lower()
+    ext = os.path.splitext(filename)[1]
+    if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+        raise HTTPException(400, "Upload aligned mask as .png/.jpg/.jpeg/.webp")
+
+    data = await file.read()
+    if len(data) < 100:
+        raise HTTPException(400, "File too small")
+
+    idx = fp["block_index"]
+    blocks_dir = os.path.join(project_dir(project_id), "blocks")
+    os.makedirs(blocks_dir, exist_ok=True)
+    aligned_path = os.path.join(blocks_dir, f"block_{idx}_aligned.png")
+    with open(aligned_path, "wb") as f:
+        f.write(data)
+
+    with db() as con:
+        con.execute(
+            "UPDATE floor_plans SET aligned_mask_path=?, status=?, updated_at=? WHERE id=?",
+            (aligned_path, "aligned", now(), fp_id),
+        )
+        fp2 = con.execute("SELECT * FROM floor_plans WHERE id=?", (fp_id,)).fetchone()
+    return _floor_plan_row_to_dict(fp2)
+
+
+@router.get("/projects/{project_id}/floor_plans/{fp_id}")
+def get_floor_plan(project_id: str, fp_id: str, user=Depends(get_current_user)):
+    """Return a single floor-plan block."""
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
+        if not fp:
+            raise HTTPException(404, "floor plan block not found")
+    return _floor_plan_row_to_dict(fp)
+
+
+# ── Per-floor-plan rooms endpoints ──────────────────────────
+
+@router.get("/projects/{project_id}/floor_plans/{fp_id}/rooms")
+def get_floor_plan_rooms(project_id: str, fp_id: str, user=Depends(get_current_user)):
+    """Return rooms JSON for a specific floor-plan block."""
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
+        if not fp:
+            raise HTTPException(404, "floor plan block not found")
+    rooms_path = fp["rooms_json_path"]
+    if not rooms_path or not os.path.exists(rooms_path):
+        raise HTTPException(404, "rooms not yet extracted for this floor plan")
+    with open(rooms_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@router.put("/projects/{project_id}/floor_plans/{fp_id}/rooms")
+def update_floor_plan_rooms(project_id: str, fp_id: str, payload: dict, user=Depends(get_current_user)):
+    """Overwrite rooms JSON for a specific floor-plan block."""
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
+        if not fp:
+            raise HTTPException(404, "floor plan block not found")
+    rooms_path = fp["rooms_json_path"]
+    if not rooms_path:
+        # Create rooms path for this floor plan
+        blocks_dir = os.path.join(project_dir(project_id), "blocks")
+        os.makedirs(blocks_dir, exist_ok=True)
+        rooms_path = os.path.join(blocks_dir, f"block_{fp['block_index']}_rooms.json")
+        with db() as con:
+            con.execute("UPDATE floor_plans SET rooms_json_path=?, updated_at=? WHERE id=?",
+                        (rooms_path, now(), fp_id))
+    with open(rooms_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return payload
+
+
+@router.post("/projects/{project_id}/floor_plans/{fp_id}/auto_place")
+def auto_place_floor_plan(project_id: str, fp_id: str, payload: dict = None, user=Depends(get_current_user)):
+    """Auto-place detectors for a specific floor-plan block using its rooms."""
+    from app.pipeline.place_detectors_advanced import place_detectors_from_rooms_json
+    import uuid as _uuid
+
+    equipment_type = (payload or {}).get("equipment_type", "smoke") if payload else "smoke"
+    ALLOWED_TYPES = {"smoke", "sprinkler", "fire_hose", "panel", "hooter", "mcb"}
+    if equipment_type not in ALLOWED_TYPES:
+        equipment_type = "smoke"
+
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
+        if not fp:
+            raise HTTPException(404, "floor plan block not found")
+
+    rooms_path = fp["rooms_json_path"]
+    if not rooms_path or not os.path.exists(rooms_path):
+        raise HTTPException(404, "rooms not yet extracted for this floor plan")
+
+    fp_mapping = fp["mapping_json_path"]
+    fp_render = fp["render_png_path"]
+
+    with open(rooms_path, "r", encoding="utf-8") as f:
+        rooms_data = json.load(f)
+    rooms = rooms_data.get("rooms", rooms_data) if isinstance(rooms_data, dict) else rooms_data
+
+    settings = json.loads(r["settings_json"] or "{}")
+    opts = PipelineOptions.from_env().merge_settings(settings)
+
+    if equipment_type == "sprinkler":
+        from app.pipeline.sprinkler_routing import place_sprinklers_only
+        # Place sprinklers only (no pipe routing)
+        sp_points = place_sprinklers_only(
+            rooms,
+            spacing_m=opts.sprinkler_spacing_m,
+            wall_buffer_m=opts.wall_buffer_m,
+            world_to_m=opts.world_to_m,
+        )
+        new_dets = [
+            {"id": str(_uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0,
+             "dtype": "sprinkler", "locked": 0, "floor_plan_id": fp_id}
+            for x, y in sp_points
+        ]
+    else:
+        placed, _regions = place_detectors_from_rooms_json(
+            rooms,
+            opts.detector_spacing_m,
+            opts.wall_buffer_m,
+            opts.world_to_m,
+            mapping_json_path=fp_mapping,
+            base_png_path=fp_render,
+        )
+        new_dets = [
+            {"id": str(_uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0,
+             "dtype": equipment_type, "locked": 0, "floor_plan_id": fp_id}
+            for (x, y) in placed
+        ]
+
+    with db() as con:
+        # Delete only detectors of this type for this floor plan
+        con.execute("DELETE FROM detectors WHERE project_id=? AND dtype=? AND floor_plan_id=?",
+                    (project_id, equipment_type, fp_id))
+        for d in new_dets:
+            con.execute(
+                """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,floor_plan_id,created_at,updated_at)
+                     VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (d["id"], project_id, float(d["x"]), float(d["y"]), float(d.get("z", 0.0)),
+                 d.get("dtype", "smoke"), int(d.get("locked", 0)), fp_id, now(), now()),
+            )
+
+    # Return detectors for this floor plan
+    with db() as con:
+        rows = con.execute(
+            "SELECT id, project_id, x, y, z, dtype, locked, floor_plan_id FROM detectors WHERE project_id=? AND floor_plan_id=? ORDER BY created_at ASC",
+            (project_id, fp_id),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@router.get("/projects/{project_id}/sprinkler_pipes")
+def get_sprinkler_pipes(project_id: str, user=Depends(get_current_user)):
+    """Return sprinkler pipe routing data for the project."""
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+    pipes_path = os.path.join(project_dir(project_id), "sprinkler_pipes.json")
+    if not os.path.exists(pipes_path):
+        raise HTTPException(404, "no sprinkler pipes data")
+    with open(pipes_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@router.put("/projects/{project_id}/sprinkler_pipes")
+def update_sprinkler_pipes(project_id: str, payload: dict, user=Depends(get_current_user)):
+    """Save modified sprinkler pipe data for the project."""
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+    pipes_path = os.path.join(project_dir(project_id), "sprinkler_pipes.json")
+    pipes_data = {
+        "pipes": payload.get("pipes", []),
+        "sources": payload.get("sources", []),
+    }
+    with open(pipes_path, "w", encoding="utf-8") as f:
+        json.dump(pipes_data, f, indent=2)
+    return pipes_data
+
+
+@router.get("/projects/{project_id}/floor_plans/{fp_id}/sprinkler_pipes")
+def get_floor_plan_sprinkler_pipes(project_id: str, fp_id: str, user=Depends(get_current_user)):
+    """Return sprinkler pipe routing data for a specific floor plan block."""
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
+        if not fp:
+            raise HTTPException(404, "floor plan block not found")
+    pipes_path = os.path.join(project_dir(project_id), f"sprinkler_pipes_{fp['block_index']}.json")
+    if not os.path.exists(pipes_path):
+        raise HTTPException(404, "no sprinkler pipes data for this floor plan")
+    with open(pipes_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@router.get("/projects/{project_id}/detect_sources")
+def detect_sources(project_id: str, user=Depends(get_current_user)):
+    """Return pipeline source points detected from the DXF drawing."""
+    from app.pipeline.sprinkler_routing import detect_sources_from_dxf, SOURCE_LABELS
+
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+
+    dxf_path = r["dxf_path"]
+    if not dxf_path or not os.path.exists(dxf_path):
+        raise HTTPException(400, "base DXF not available")
+
+    settings = json.loads(r["settings_json"] or "{}")
+    opts = PipelineOptions.from_env().merge_settings(settings)
+    labels = opts.sprinkler_source_labels or SOURCE_LABELS
+
+    sources = detect_sources_from_dxf(dxf_path, labels)
+    return [{"x": s[0], "y": s[1]} for s in sources]
+
+
+@router.post("/projects/{project_id}/route_pipes")
+def route_pipes_project(project_id: str, payload: dict = None, user=Depends(get_current_user)):
+    """Route pipes connecting existing sprinkler detectors for the project.
+    
+    Optional payload: {"source": {"x": ..., "y": ...}} to use a user-selected source.
+    """
+    from app.pipeline.sprinkler_routing import route_pipes_for_sprinklers
+
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+        sprinkler_rows = con.execute(
+            "SELECT x, y FROM detectors WHERE project_id=? AND dtype='sprinkler' ORDER BY created_at ASC",
+            (project_id,),
+        ).fetchall()
+
+    if not sprinkler_rows:
+        raise HTTPException(400, "no sprinklers placed yet")
+
+    rooms_path = r["rooms_json_path"]
+    if not rooms_path or not os.path.exists(rooms_path):
+        raise HTTPException(404, "rooms not yet extracted")
+
+    dxf_path = r["dxf_path"]
+    if not dxf_path or not os.path.exists(dxf_path):
+        raise HTTPException(400, "base DXF not available")
+
+    pdir = project_dir(project_id)
+
+    with open(rooms_path, "r", encoding="utf-8") as f:
+        rooms_data = json.load(f)
+    rooms = rooms_data.get("rooms", rooms_data) if isinstance(rooms_data, dict) else rooms_data
+
+    settings = json.loads(r["settings_json"] or "{}")
+    opts = PipelineOptions.from_env().merge_settings(settings)
+
+    sprinkler_coords = [(float(row["x"]), float(row["y"])) for row in sprinkler_rows]
+
+    user_source = None
+    if payload and isinstance(payload.get("source"), dict):
+        src = payload["source"]
+        user_source = (float(src["x"]), float(src["y"]))
+
+    pipe_segments, _snapped, sources = route_pipes_for_sprinklers(
+        sprinkler_coords, rooms, dxf_path,
+        spacing_m=opts.sprinkler_spacing_m,
+        wall_buffer_m=opts.wall_buffer_m,
+        world_to_m=opts.world_to_m,
+        source_labels=opts.sprinkler_source_labels,
+        override_source=user_source,
+    )
+
+    pipes_data = {
+        "pipes": [
+            {"from": list(seg[0][0]), "to": list(seg[0][1]), "diameter": seg[1]}
+            for seg in pipe_segments
+        ],
+        "sources": [{"x": s[0], "y": s[1]} for s in sources],
+    }
+    pipes_json_path = os.path.join(pdir, "sprinkler_pipes.json")
+    with open(pipes_json_path, "w", encoding="utf-8") as f:
+        json.dump(pipes_data, f, indent=2)
+
+    return pipes_data
+
+
+@router.post("/projects/{project_id}/floor_plans/{fp_id}/route_pipes")
+def route_pipes_floor_plan(project_id: str, fp_id: str, payload: dict = None, user=Depends(get_current_user)):
+    """Route pipes connecting existing sprinkler detectors for a floor plan block."""
+    from app.pipeline.sprinkler_routing import route_pipes_for_sprinklers
+
+    with db() as con:
+        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        if not r:
+            raise HTTPException(404, "project not found")
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
+        if not fp:
+            raise HTTPException(404, "floor plan block not found")
+        sprinkler_rows = con.execute(
+            "SELECT x, y FROM detectors WHERE project_id=? AND dtype='sprinkler' AND floor_plan_id=? ORDER BY created_at ASC",
+            (project_id, fp_id),
+        ).fetchall()
+
+    if not sprinkler_rows:
+        raise HTTPException(400, "no sprinklers placed in this floor plan")
+
+    rooms_path = fp["rooms_json_path"]
+    if not rooms_path or not os.path.exists(rooms_path):
+        raise HTTPException(404, "rooms not yet extracted for this floor plan")
+
+    dxf_path = r["dxf_path"]
+    if not dxf_path or not os.path.exists(dxf_path):
+        raise HTTPException(400, "base DXF not available")
+
+    pdir = project_dir(project_id)
+
+    with open(rooms_path, "r", encoding="utf-8") as f:
+        rooms_data = json.load(f)
+    rooms = rooms_data.get("rooms", rooms_data) if isinstance(rooms_data, dict) else rooms_data
+
+    settings = json.loads(r["settings_json"] or "{}")
+    opts = PipelineOptions.from_env().merge_settings(settings)
+
+    sprinkler_coords = [(float(row["x"]), float(row["y"])) for row in sprinkler_rows]
+
+    user_source = None
+    if payload and isinstance(payload.get("source"), dict):
+        src = payload["source"]
+        user_source = (float(src["x"]), float(src["y"]))
+
+    pipe_segments, _snapped, sources = route_pipes_for_sprinklers(
+        sprinkler_coords, rooms, dxf_path,
+        spacing_m=opts.sprinkler_spacing_m,
+        wall_buffer_m=opts.wall_buffer_m,
+        world_to_m=opts.world_to_m,
+        source_labels=opts.sprinkler_source_labels,
+        override_source=user_source,
+    )
+
+    pipes_data = {
+        "pipes": [
+            {"from": list(seg[0][0]), "to": list(seg[0][1]), "diameter": seg[1]}
+            for seg in pipe_segments
+        ],
+        "sources": [{"x": s[0], "y": s[1]} for s in sources],
+    }
+    pipes_json_path = os.path.join(pdir, f"sprinkler_pipes_{fp['block_index']}.json")
+    with open(pipes_json_path, "w", encoding="utf-8") as f:
+        json.dump(pipes_data, f, indent=2)
+
+    return pipes_data
