@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
-import { clearAuth, getName, apiFetch, apiUpload } from "./lib/auth";
+import { clearAuth, getName, getTenantName, getTenantRole, apiFetch, apiUpload } from "./lib/auth";
 import { useRouter } from "next/navigation";
 
 /* ── types ─────────────────────────────────── */
@@ -115,9 +115,9 @@ export default function Dashboard() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [userName, setUserName] = useState("User");
+  const [tenantName, setTenantName] = useState("");
+  const [tenantRole, setTenantRole] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
-  const [timerRunning, setTimerRunning] = useState(true);
-  const [timerSeconds, setTimerSeconds] = useState(5048);
 
   // NBC Wizard state
   const [showWizard, setShowWizard] = useState(false);
@@ -134,20 +134,9 @@ export default function Dashboard() {
 
   useEffect(() => {
     setUserName(getName() || "User");
+    setTenantName(getTenantName() || "");
+    setTenantRole(getTenantRole() || "");
   }, []);
-
-  useEffect(() => {
-    if (!timerRunning) return;
-    const interval = setInterval(() => setTimerSeconds((s) => s + 1), 1000);
-    return () => clearInterval(interval);
-  }, [timerRunning]);
-
-  const formattedTime = useMemo(() => {
-    const h = Math.floor(timerSeconds / 3600);
-    const m = Math.floor((timerSeconds % 3600) / 60);
-    const s = timerSeconds % 60;
-    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-  }, [timerSeconds]);
 
   async function loadProjects() {
     setIsLoading(true);
@@ -244,30 +233,28 @@ export default function Dashboard() {
 
   const stats = useMemo(() => {
     const total = projects.length;
-    return { total };
+    const ready = projects.filter((p) => p.status === "ready").length;
+    const failed = projects.filter((p) => p.status === "failed").length;
+    const inProgress = total - ready - failed;
+    return { total, ready, failed, inProgress };
   }, [projects]);
+
+  type ActivityItem = { id: string; user_name: string; action: string; target_type: string; target_id: string; target_name: string; created_at: number };
+  const [activity, setActivity] = useState<ActivityItem[]>([]);
+
+  async function loadActivity() {
+    try {
+      const items: ActivityItem[] = await apiFetch("/api/activity?limit=20");
+      setActivity(items);
+    } catch {}
+  }
+
+  useEffect(() => { loadActivity(); }, []);
 
   function signOut() {
     clearAuth();
     router.push("/login");
   }
-
-  /* ─ mock data for dashboard widgets ─ */
-  const projectTasks = [
-    { label: "Design API Endpoints", done: true },
-    { label: "Create Data Models", done: true },
-    { label: "Onboarding Flow", done: false },
-    { label: "Build Dashboard", done: false },
-    { label: "Optimize Page Load", done: false },
-    { label: "Cross-Browser Testing", done: false },
-  ];
-
-  const teamMembers = [
-    { name: "Alexandra Craft", role: "Project Management", color: "#2D6A4F" },
-    { name: "Ethan Alperda", role: "Project Repository", color: "#40916C" },
-    { name: "Diana Chakaborina", role: "Administrative Support", color: "#52B788" },
-    { name: "David Olenzoal", role: "Project Template Technologist", color: "#1B4332" },
-  ];
 
   return (
     <main style={S.shell}>
@@ -351,7 +338,7 @@ export default function Dashboard() {
               <div style={S.headerAvatar}>{userName.charAt(0).toUpperCase()}</div>
               <div>
                 <div style={S.headerUserName}>{userName}</div>
-                <div style={S.headerUserRole}>Manager</div>
+                <div style={S.headerUserRole}>{tenantName ? `${tenantName} · ${tenantRole || "member"}` : "Personal"}</div>
               </div>
             </div>
           </div>
@@ -365,17 +352,13 @@ export default function Dashboard() {
               <div>
                 <h1 style={S.pageTitle}>Dashboard</h1>
                 <p style={S.pageSubtitle}>
-                  Plan, prioritize, and complete your projects with ease.
+                  Overview of your projects and team activity.
                 </p>
               </div>
               <div style={S.titleActions}>
                 <button type="button" onClick={createProject} style={S.addBtn}>
                   <Icon name="plus" />
                   <span>New Project</span>
-                </button>
-                <button type="button" onClick={loadProjects} disabled={isLoading} style={S.importBtn}>
-                  <Icon name="download" />
-                  <span>{isLoading ? "Loading…" : "Import Data"}</span>
                 </button>
               </div>
             </div>
@@ -385,91 +368,88 @@ export default function Dashboard() {
             {/* KPI cards */}
             <div style={S.kpiRow}>
               <KpiCard label="Total Projects" value={stats.total} sub="All projects" color={C.primary} bgColor="#E8F5E9" icon="box" />
+              <KpiCard label="Ready" value={stats.ready} sub="Completed" color={C.success} bgColor="#ECFDF5" icon="check" />
+              <KpiCard label="In Progress" value={stats.inProgress} sub="Running / reviewing" color={C.info} bgColor="#EFF6FF" icon="clock" />
+              <KpiCard label="Failed" value={stats.failed} sub="Errors" color={C.danger} bgColor="#FEF2F2" icon="alert" />
             </div>
 
-            {/* row 2: analytics + reminders + project tasks */}
-            <div style={S.gridRow3}>
-              <div style={S.card}>
-                <div style={S.cardHeader}><span style={S.cardTitle}>Project Analytics</span></div>
-                <div style={S.analyticsChart}>
-                  {[65, 85, 45, 75, 90, 55, 70, 80].map((h, i) => (
-                    <div key={i} style={S.barCol}>
-                      <div style={{ ...S.bar, height: `${h}%`, background: i % 2 === 0 ? `linear-gradient(180deg, ${C.primary}, ${C.primaryLight})` : `linear-gradient(180deg, ${C.accent}, ${C.primaryLighter})`, borderRadius: 8 }} />
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div style={S.card}>
-                <div style={S.cardHeader}><span style={S.cardTitle}>Reminders</span><span style={S.badge}>New</span></div>
-                <div style={S.reminderCard}>
-                  <div style={S.reminderDot} />
-                  <div>
-                    <div style={{ fontWeight: 700, fontSize: 13, color: C.text }}>Meeting with Architecture Company</div>
-                    <div style={{ fontSize: 12, color: C.textSecondary, marginTop: 4 }}>Sprint review &amp; planning session</div>
-                    <button type="button" style={S.reminderBtn}>Start Meeting</button>
-                  </div>
-                </div>
-              </div>
-
-              <div style={S.card}>
-                <div style={S.cardHeader}><span style={S.cardTitle}>Project</span><span style={S.badge}>New</span></div>
-                <div style={S.taskList}>
-                  {projectTasks.map((t, i) => (
-                    <label key={i} style={S.taskItem}>
-                      <span style={{ ...S.taskCheck, background: t.done ? C.primary : C.white, border: t.done ? `2px solid ${C.primary}` : `2px solid ${C.cardBorder}` }}>
-                        {t.done && (<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3"><path d="M20 6 9 17l-5-5" /></svg>)}
-                      </span>
-                      <span style={{ fontSize: 13, color: t.done ? C.textMuted : C.text, textDecoration: t.done ? "line-through" : "none" }}>{t.label}</span>
-                    </label>
-                  ))}
-                </div>
-              </div>
-            </div>
-
-            {/* row 3: team + progress + timer */}
-            <div style={S.gridRow3b}>
-              <div style={S.card}>
-                <div style={S.cardHeader}><span style={S.cardTitle}>Team Collaboration</span><button type="button" style={S.addMemberBtn}>+ Add Member</button></div>
-                <div style={S.teamList}>
-                  {teamMembers.map((m, i) => (
-                    <div key={i} style={S.teamRow}>
-                      <div style={{ ...S.teamAvatar, background: m.color }}>{m.name.charAt(0)}</div>
-                      <div>
-                        <div style={{ fontSize: 13, fontWeight: 600, color: C.text }}>{m.name}</div>
-                        <div style={{ fontSize: 11, color: C.textSecondary }}>{m.role}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
+            {/* row 2: progress ring + activity feed */}
+            <div style={{ display: "grid", gridTemplateColumns: "320px 1fr", gap: 16 }}>
+              {/* progress ring */}
               <div style={S.card}>
                 <div style={S.cardHeader}><span style={S.cardTitle}>Project Progress</span></div>
                 <div style={S.progressCenter}>
                   <div style={S.progressRing}>
                     <svg width="120" height="120" viewBox="0 0 120 120">
                       <circle cx="60" cy="60" r="52" fill="none" stroke={C.cardBorder} strokeWidth="8" />
-                      <circle cx="60" cy="60" r="52" fill="none" stroke={C.primary} strokeWidth="8" strokeLinecap="round" strokeDasharray={`${2 * Math.PI * 52}`} strokeDashoffset={`${2 * Math.PI * 52 * 0.59}`} transform="rotate(-90 60 60)" />
+                      {stats.total > 0 && (
+                        <>
+                          <circle cx="60" cy="60" r="52" fill="none" stroke={C.success} strokeWidth="8" strokeLinecap="round"
+                            strokeDasharray={`${2 * Math.PI * 52}`}
+                            strokeDashoffset={`${2 * Math.PI * 52 * (1 - stats.ready / stats.total)}`}
+                            transform="rotate(-90 60 60)" />
+                          <circle cx="60" cy="60" r="52" fill="none" stroke={C.info} strokeWidth="8" strokeLinecap="round"
+                            strokeDasharray={`${2 * Math.PI * 52}`}
+                            strokeDashoffset={`${2 * Math.PI * 52 * (1 - stats.inProgress / stats.total)}`}
+                            transform={`rotate(${-90 + 360 * stats.ready / stats.total} 60 60)`} />
+                        </>
+                      )}
                     </svg>
                     <div style={S.progressText}>{stats.total}</div>
                   </div>
-                  <div style={S.progressLegend}>
-                    <span style={S.legendDot} /> In Progress &nbsp;
-                    <span style={{ ...S.legendDot, background: C.primaryLight }} /> Completed
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={S.progressLegend}><span style={{ ...S.legendDot, background: C.success }} /> Ready ({stats.ready})</div>
+                    <div style={S.progressLegend}><span style={{ ...S.legendDot, background: C.info }} /> In Progress ({stats.inProgress})</div>
+                    <div style={S.progressLegend}><span style={{ ...S.legendDot, background: C.danger }} /> Failed ({stats.failed})</div>
                   </div>
                 </div>
               </div>
 
-              <div style={{ ...S.card, background: C.sidebar, color: C.white }}>
-                <div style={S.cardHeader}><span style={{ ...S.cardTitle, color: C.white }}>Time Tracker</span></div>
-                <div style={S.timerCenter}>
-                  <div style={S.timerDisplay}>{formattedTime}</div>
-                  <div style={S.timerControls}>
-                    <button type="button" onClick={() => setTimerRunning(!timerRunning)} style={S.timerBtn}>
-                      <Icon name={timerRunning ? "pause" : "play"} />
-                    </button>
-                  </div>
+              {/* activity feed */}
+              <div style={S.card}>
+                <div style={S.cardHeader}>
+                  <span style={S.cardTitle}>Team Activity</span>
+                  <button type="button" onClick={loadActivity} style={{ ...S.importBtn, padding: "6px 12px", fontSize: 12 }}>
+                    <Icon name="download" /><span>Refresh</span>
+                  </button>
+                </div>
+                <div style={{ maxHeight: 380, overflowY: "auto" }}>
+                  {activity.length === 0 ? (
+                    <div style={S.emptyRow}>No activity yet. Actions like creating projects, uploading files, and running the pipeline will show up here.</div>
+                  ) : (
+                    activity.map((a) => {
+                      const actionLabels: Record<string, string> = {
+                        created_project: "created project",
+                        uploaded_file: "uploaded file",
+                        ran_pipeline: "ran pipeline on",
+                        saved_project: "saved",
+                        invited_member: "invited",
+                        removed_member: "removed",
+                        changed_role: "changed role of",
+                      };
+                      const label = actionLabels[a.action] || a.action.replace(/_/g, " ");
+                      const timeAgo = (() => {
+                        const diff = Date.now() / 1000 - a.created_at;
+                        if (diff < 60) return "just now";
+                        if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+                        if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+                        return `${Math.floor(diff / 86400)}d ago`;
+                      })();
+                      return (
+                        <div key={a.id} style={{ display: "flex", gap: 12, padding: "12px 20px", borderBottom: `1px solid ${C.cardBorder}`, alignItems: "flex-start" }}>
+                          <div style={{ width: 32, height: 32, borderRadius: 999, background: C.primary, color: C.white, display: "grid", placeItems: "center", fontWeight: 700, fontSize: 13, flexShrink: 0 }}>
+                            {a.user_name.charAt(0).toUpperCase()}
+                          </div>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 13, color: C.text }}>
+                              <strong>{a.user_name}</strong> {label} {a.target_name && <strong>{a.target_name}</strong>}
+                            </div>
+                            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>{timeAgo}</div>
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
                 </div>
               </div>
             </div>
@@ -501,6 +481,9 @@ export default function Dashboard() {
             {/* stats strip */}
             <div style={S.kpiRow}>
               <KpiCard label="Total" value={stats.total} sub="All projects" color={C.primary} bgColor="#E8F5E9" icon="box" />
+              <KpiCard label="Ready" value={stats.ready} sub="Completed" color={C.success} bgColor="#ECFDF5" icon="check" />
+              <KpiCard label="In Progress" value={stats.inProgress} sub="Running / reviewing" color={C.info} bgColor="#EFF6FF" icon="clock" />
+              <KpiCard label="Failed" value={stats.failed} sub="Errors" color={C.danger} bgColor="#FEF2F2" icon="alert" />
             </div>
 
             {/* projects table */}
@@ -564,8 +547,21 @@ export default function Dashboard() {
         {/* ═══════ TAB: BILLING ═══════ */}
         {active === "billing" && <BillingTab />}
 
+        {/* ═══════ TAB: TEAM ═══════ */}
+        {active === "team" && <TeamTab tenantRole={tenantRole} onTenantSwitch={async () => {
+          // Refresh tenant info and project list after switching teams
+          try {
+            const me = await apiFetch("/api/auth/me");
+            if (me.tenant) {
+              setTenantName(me.tenant.name || "");
+              setTenantRole(me.tenant.role || "");
+            }
+          } catch {}
+          await loadProjects();
+        }} />}
+
         {/* ═══════ PLACEHOLDER TABS ═══════ */}
-        {!["dashboard", "projects", "billing"].includes(active) && (
+        {!["dashboard", "projects", "billing", "team"].includes(active) && (
           <div style={S.card}>
             <div style={{ padding: 40, textAlign: "center" }}>
               <div style={{ fontSize: 40, marginBottom: 12 }}>
@@ -1857,6 +1853,521 @@ function statusChip(status: string): CSSProperties {
     background: bg,
     color,
   };
+}
+
+/* ── Team Tab ──────────────────────────────── */
+
+type TeamMember = {
+  member_id: string;
+  user_id: string;
+  name: string;
+  email: string;
+  role: string;
+  created_at: number;
+};
+
+type Tenant = {
+  id: string;
+  name: string;
+  role: string;
+  is_active: boolean;
+  created_at: number;
+};
+
+function TeamTab({ tenantRole, onTenantSwitch }: { tenantRole: string; onTenantSwitch?: () => Promise<void> }) {
+  const [tenants, setTenants] = useState<Tenant[]>([]);
+  const [members, setMembers] = useState<TeamMember[]>([]);
+  const [activeTenant, setActiveTenant] = useState<Tenant | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Invite modal state
+  const [showInvite, setShowInvite] = useState(false);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState("viewer");
+  const [inviteLoading, setInviteLoading] = useState(false);
+  const [inviteError, setInviteError] = useState<string | null>(null);
+
+  // Create team modal state
+  const [showCreateTeam, setShowCreateTeam] = useState(false);
+  const [newTeamName, setNewTeamName] = useState("");
+  const [createLoading, setCreateLoading] = useState(false);
+
+  // Rename tenant
+  const [editingName, setEditingName] = useState(false);
+  const [editName, setEditName] = useState("");
+
+  const isAdmin = activeTenant?.role === "admin";
+
+  async function loadTenants() {
+    setLoading(true);
+    try {
+      const list: Tenant[] = await apiFetch("/api/teams");
+      setTenants(list);
+      const active = list.find((t) => t.is_active) || list[0] || null;
+      setActiveTenant(active);
+      if (active) {
+        await loadMembers(active.id);
+      }
+      setError(null);
+    } catch (e: any) {
+      setError(e?.message || "Failed to load teams");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadMembers(tenantId: string) {
+    try {
+      const list: TeamMember[] = await apiFetch(`/api/teams/${tenantId}/members`);
+      setMembers(list);
+    } catch (e: any) {
+      setMembers([]);
+    }
+  }
+
+  useEffect(() => {
+    loadTenants();
+  }, []);
+
+  async function switchTenant(tenantId: string) {
+    try {
+      await apiFetch("/api/teams/switch", {
+        method: "POST",
+        body: JSON.stringify({ tenant_id: tenantId }),
+      });
+      await loadTenants();
+      if (onTenantSwitch) await onTenantSwitch();
+    } catch (e: any) {
+      setError(e?.message || "Failed to switch team");
+    }
+  }
+
+  async function handleInvite() {
+    setInviteLoading(true);
+    setInviteError(null);
+    try {
+      await apiFetch(`/api/teams/${activeTenant!.id}/members`, {
+        method: "POST",
+        body: JSON.stringify({ email: inviteEmail, role: inviteRole }),
+      });
+      setShowInvite(false);
+      setInviteEmail("");
+      setInviteRole("viewer");
+      await loadMembers(activeTenant!.id);
+    } catch (e: any) {
+      setInviteError(e?.message || "Failed to invite member");
+    } finally {
+      setInviteLoading(false);
+    }
+  }
+
+  async function handleRemoveMember(memberId: string) {
+    if (!confirm("Remove this member from the team?")) return;
+    try {
+      await apiFetch(`/api/teams/${activeTenant!.id}/members/${memberId}`, {
+        method: "DELETE",
+      });
+      await loadMembers(activeTenant!.id);
+    } catch (e: any) {
+      setError(e?.message || "Failed to remove member");
+    }
+  }
+
+  async function handleChangeRole(memberId: string, newRole: string) {
+    try {
+      await apiFetch(`/api/teams/${activeTenant!.id}/members/${memberId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ role: newRole }),
+      });
+      await loadMembers(activeTenant!.id);
+    } catch (e: any) {
+      setError(e?.message || "Failed to change role");
+    }
+  }
+
+  async function handleCreateTeam() {
+    setCreateLoading(true);
+    try {
+      await apiFetch("/api/teams", {
+        method: "POST",
+        body: JSON.stringify({ name: newTeamName }),
+      });
+      setShowCreateTeam(false);
+      setNewTeamName("");
+      await loadTenants();
+    } catch (e: any) {
+      setError(e?.message || "Failed to create team");
+    } finally {
+      setCreateLoading(false);
+    }
+  }
+
+  async function handleRename() {
+    if (!editName.trim()) return;
+    try {
+      await apiFetch(`/api/teams/${activeTenant!.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: editName.trim() }),
+      });
+      setEditingName(false);
+      await loadTenants();
+    } catch (e: any) {
+      setError(e?.message || "Failed to rename team");
+    }
+  }
+
+  const roleBadge = (role: string) => {
+    const colors: Record<string, { bg: string; color: string; border: string }> = {
+      admin: { bg: "#FEF3C7", color: "#D97706", border: "rgba(217,119,6,0.2)" },
+      editor: { bg: "#EFF6FF", color: "#2563EB", border: "rgba(37,99,235,0.2)" },
+      viewer: { bg: "#F3F4F6", color: "#6B7280", border: "rgba(156,163,175,0.2)" },
+    };
+    const c = colors[role] || colors.viewer;
+    return (
+      <span
+        style={{
+          display: "inline-flex",
+          borderRadius: 999,
+          padding: "3px 10px",
+          fontSize: 11,
+          fontWeight: 700,
+          background: c.bg,
+          color: c.color,
+          border: `1px solid ${c.border}`,
+          textTransform: "capitalize",
+        }}
+      >
+        {role}
+      </span>
+    );
+  };
+
+  if (loading) {
+    return (
+      <div style={S.card}>
+        <div style={{ padding: 40, textAlign: "center", color: C.textSecondary }}>Loading team data...</div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div style={S.titleRow}>
+        <div>
+          <h1 style={S.pageTitle}>Team Management</h1>
+          <p style={S.pageSubtitle}>Manage your team members and permissions.</p>
+        </div>
+        <div style={S.titleActions}>
+          <button type="button" onClick={() => setShowCreateTeam(true)} style={S.addBtn}>
+            <Icon name="plus" />
+            <span>New Team</span>
+          </button>
+        </div>
+      </div>
+
+      {error && <div style={S.errorBanner}>{error}</div>}
+
+      {/* Team selector */}
+      {tenants.length > 1 && (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {tenants.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => switchTenant(t.id)}
+              style={{
+                padding: "8px 16px",
+                borderRadius: 10,
+                fontSize: 13,
+                fontWeight: 700,
+                cursor: "pointer",
+                border: t.is_active ? `2px solid ${C.primary}` : `1px solid ${C.cardBorder}`,
+                background: t.is_active ? C.primaryLighter : C.card,
+                color: t.is_active ? "#1A3C34" : C.text,
+              }}
+            >
+              {t.name}
+              {t.is_active && " ✓"}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {activeTenant && (
+        <>
+          {/* Team info card */}
+          <div style={S.card}>
+            <div style={S.cardHeader}>
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                {editingName ? (
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <input
+                      value={editName}
+                      onChange={(e) => setEditName(e.target.value)}
+                      style={{ ...S.projectInput, minWidth: 200 }}
+                      autoFocus
+                      onKeyDown={(e) => e.key === "Enter" && handleRename()}
+                    />
+                    <button type="button" style={{ ...S.addBtn, padding: "8px 14px" }} onClick={handleRename}>Save</button>
+                    <button type="button" style={{ ...S.importBtn, padding: "8px 14px" }} onClick={() => setEditingName(false)}>Cancel</button>
+                  </div>
+                ) : (
+                  <>
+                    <span style={S.cardTitle}>{activeTenant.name}</span>
+                    {roleBadge(activeTenant.role)}
+                    {isAdmin && (
+                      <button
+                        type="button"
+                        onClick={() => { setEditName(activeTenant.name); setEditingName(true); }}
+                        style={{ background: "none", border: "none", color: C.primary, cursor: "pointer", fontSize: 12, fontWeight: 700 }}
+                      >
+                        Rename
+                      </button>
+                    )}
+                  </>
+                )}
+              </div>
+              {isAdmin && (
+                <button
+                  type="button"
+                  onClick={() => { setInviteEmail(""); setInviteRole("viewer"); setInviteError(null); setShowInvite(true); }}
+                  style={S.addBtn}
+                >
+                  <Icon name="plus" />
+                  <span>Invite Member</span>
+                </button>
+              )}
+            </div>
+
+            {/* Members table */}
+            <div style={S.tableScrollWrapper}>
+              <div style={{ ...S.tableHead, gridTemplateColumns: "1fr 180px 120px 120px" }}>
+                <span>Member</span>
+                <span>Email</span>
+                <span>Role</span>
+                <span style={{ textAlign: "right" }}>Actions</span>
+              </div>
+
+              {members.length === 0 ? (
+                <div style={S.emptyRow}>No members found.</div>
+              ) : (
+                members.map((m, idx) => (
+                  <div
+                    key={m.member_id}
+                    style={{
+                      ...S.tableRow,
+                      gridTemplateColumns: "1fr 180px 120px 120px",
+                      background: idx % 2 === 0 ? C.card : "#FAFBFC",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <div
+                        style={{
+                          width: 34,
+                          height: 34,
+                          borderRadius: 999,
+                          background: C.primary,
+                          color: C.white,
+                          display: "grid",
+                          placeItems: "center",
+                          fontWeight: 700,
+                          fontSize: 14,
+                          flexShrink: 0,
+                        }}
+                      >
+                        {m.name.charAt(0).toUpperCase()}
+                      </div>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{m.name}</div>
+                    </div>
+                    <div style={{ fontSize: 12, color: C.textSecondary }}>{m.email}</div>
+                    <div>
+                      {isAdmin ? (
+                        <select
+                          value={m.role}
+                          onChange={(e) => handleChangeRole(m.member_id, e.target.value)}
+                          style={{
+                            borderRadius: 8,
+                            border: `1px solid ${C.cardBorder}`,
+                            padding: "4px 8px",
+                            fontSize: 12,
+                            fontWeight: 600,
+                            color: C.text,
+                            cursor: "pointer",
+                            background: C.card,
+                          }}
+                        >
+                          <option value="admin">Admin</option>
+                          <option value="editor">Editor</option>
+                          <option value="viewer">Viewer</option>
+                        </select>
+                      ) : (
+                        roleBadge(m.role)
+                      )}
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      {isAdmin && m.role !== "admin" && (
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveMember(m.member_id)}
+                          style={{
+                            background: "none",
+                            border: `1px solid rgba(220,38,38,0.3)`,
+                            borderRadius: 8,
+                            color: C.danger,
+                            padding: "5px 12px",
+                            fontSize: 11,
+                            fontWeight: 700,
+                            cursor: "pointer",
+                          }}
+                        >
+                          Remove
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div
+              style={{
+                padding: "12px 20px",
+                borderTop: `1px solid ${C.cardBorder}`,
+                fontSize: 12,
+                color: C.textSecondary,
+              }}
+            >
+              {members.length} member{members.length !== 1 ? "s" : ""} in this team
+            </div>
+          </div>
+
+          {/* Permissions reference */}
+          <div style={S.card}>
+            <div style={S.cardHeader}>
+              <span style={S.cardTitle}>Role Permissions</span>
+            </div>
+            <div style={{ padding: "16px 20px" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8, fontSize: 12 }}>
+                <div style={{ fontWeight: 700, color: C.textSecondary }}>Permission</div>
+                <div style={{ fontWeight: 700, color: "#D97706", textAlign: "center" }}>Admin</div>
+                <div style={{ fontWeight: 700, color: "#2563EB", textAlign: "center" }}>Editor</div>
+                <div style={{ fontWeight: 700, color: "#6B7280", textAlign: "center" }}>Viewer</div>
+
+                {[
+                  ["View projects", true, true, true],
+                  ["Create & edit projects", true, true, false],
+                  ["Run pipeline", true, true, false],
+                  ["Export DXF", true, true, true],
+                  ["Manage team members", true, false, false],
+                  ["Change member roles", true, false, false],
+                  ["Rename team", true, false, false],
+                ].map(([label, admin, editor, viewer], i) => (
+                  <div key={i} style={{ display: "contents" }}>
+                    <div style={{ padding: "6px 0", color: C.text, fontWeight: 500, borderTop: `1px solid ${C.cardBorder}` }}>{label as string}</div>
+                    <div style={{ padding: "6px 0", textAlign: "center", borderTop: `1px solid ${C.cardBorder}` }}>{admin ? "✓" : "—"}</div>
+                    <div style={{ padding: "6px 0", textAlign: "center", borderTop: `1px solid ${C.cardBorder}` }}>{editor ? "✓" : "—"}</div>
+                    <div style={{ padding: "6px 0", textAlign: "center", borderTop: `1px solid ${C.cardBorder}` }}>{viewer ? "✓" : "—"}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* ── Invite Member Modal ── */}
+      {showInvite && (
+        <div style={WZ.overlay} onClick={() => setShowInvite(false)}>
+          <div style={{ ...WZ.modal, maxWidth: 440 }} onClick={(e) => e.stopPropagation()}>
+            <div style={WZ.header}>
+              <span style={WZ.headerTitle}>Invite Team Member</span>
+              <button type="button" style={WZ.closeBtn} onClick={() => setShowInvite(false)}>&times;</button>
+            </div>
+            <div style={WZ.body}>
+              <div style={WZ.stepContent}>
+                <div style={WZ.fieldGroup}>
+                  <label style={WZ.label}>Email Address</label>
+                  <input
+                    value={inviteEmail}
+                    onChange={(e) => setInviteEmail(e.target.value)}
+                    placeholder="colleague@company.com"
+                    type="email"
+                    style={WZ.input}
+                    autoFocus
+                  />
+                </div>
+                <div style={WZ.fieldGroup}>
+                  <label style={WZ.label}>Role</label>
+                  <select
+                    value={inviteRole}
+                    onChange={(e) => setInviteRole(e.target.value)}
+                    style={WZ.select}
+                  >
+                    <option value="viewer">Viewer — Can view projects</option>
+                    <option value="editor">Editor — Can create & edit projects</option>
+                    <option value="admin">Admin — Full control</option>
+                  </select>
+                </div>
+                {inviteError && (
+                  <div style={{ ...S.errorBanner, fontSize: 12, padding: "8px 12px" }}>{inviteError}</div>
+                )}
+                <div style={WZ.btnRow}>
+                  <button type="button" style={WZ.secondaryBtn} onClick={() => setShowInvite(false)}>Cancel</button>
+                  <button
+                    type="button"
+                    style={WZ.primaryBtn}
+                    onClick={handleInvite}
+                    disabled={inviteLoading || !inviteEmail.trim()}
+                  >
+                    {inviteLoading ? "Inviting..." : "Invite"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Create Team Modal ── */}
+      {showCreateTeam && (
+        <div style={WZ.overlay} onClick={() => setShowCreateTeam(false)}>
+          <div style={{ ...WZ.modal, maxWidth: 440 }} onClick={(e) => e.stopPropagation()}>
+            <div style={WZ.header}>
+              <span style={WZ.headerTitle}>Create New Team</span>
+              <button type="button" style={WZ.closeBtn} onClick={() => setShowCreateTeam(false)}>&times;</button>
+            </div>
+            <div style={WZ.body}>
+              <div style={WZ.stepContent}>
+                <div style={WZ.fieldGroup}>
+                  <label style={WZ.label}>Team Name</label>
+                  <input
+                    value={newTeamName}
+                    onChange={(e) => setNewTeamName(e.target.value)}
+                    placeholder="e.g., Acme Fire Safety"
+                    style={WZ.input}
+                    autoFocus
+                    onKeyDown={(e) => e.key === "Enter" && newTeamName.trim() && handleCreateTeam()}
+                  />
+                </div>
+                <div style={WZ.btnRow}>
+                  <button type="button" style={WZ.secondaryBtn} onClick={() => setShowCreateTeam(false)}>Cancel</button>
+                  <button
+                    type="button"
+                    style={WZ.primaryBtn}
+                    onClick={handleCreateTeam}
+                    disabled={createLoading || !newTeamName.trim()}
+                  >
+                    {createLoading ? "Creating..." : "Create Team"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
 }
 
 /* ── SVG icons ────────────────────────────── */

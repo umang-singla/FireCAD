@@ -3,11 +3,12 @@ import json
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel
 from typing import Any, Dict, Optional
-from app.db import db, now
+from app.db import db, now, log_activity
 from app.storage import new_id, project_dir, relpath
 from app.schemas import ProjectOut, ProjectUpdateSettings
 from app.pipeline.run_pipeline import (
     run_pipeline_for_project,
+    continue_pipeline_after_floor_review,
     continue_pipeline_after_alignment,
     continue_pipeline_after_rooms,
     PipelineOptions,
@@ -24,13 +25,48 @@ from app.routers.auth import get_current_user
 
 router = APIRouter(tags=["projects"])
 
+
+def _authorize_project(con, project_id: str, user: dict):
+    """Fetch a project row and verify the caller has access (owner or tenant member).
+    Raises 404 if not found / not authorized.
+    """
+    r = con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+    if not r:
+        raise HTTPException(404, "project not found")
+    # Owner always has access
+    if r["owner_id"] == user["id"]:
+        return r
+    # Tenant member access
+    tid = r["tenant_id"] if "tenant_id" in r.keys() else None
+    if tid and tid == user.get("active_tenant_id"):
+        return r
+    raise HTTPException(404, "project not found")
+
+
+def _authorize_project_write(con, project_id: str, user: dict):
+    """Like _authorize_project, but also checks the user has write permissions (admin/editor)."""
+    r = _authorize_project(con, project_id, user)
+    if user.get("tenant_role") == "viewer":
+        raise HTTPException(403, "Viewers have read-only access")
+    return r
+
+
 @router.get("/projects", response_model=list[ProjectOut])
 def list_projects(user=Depends(get_current_user)):
+    tid = user.get("active_tenant_id")
     with db() as con:
-        rows = con.execute(
-            "SELECT * FROM projects WHERE owner_id=? ORDER BY updated_at DESC, created_at DESC",
-            (user["id"],),
-        ).fetchall()
+        if tid:
+            # Show all projects belonging to the active tenant
+            rows = con.execute(
+                "SELECT * FROM projects WHERE tenant_id=? ORDER BY updated_at DESC, created_at DESC",
+                (tid,),
+            ).fetchall()
+        else:
+            # Legacy fallback: user's own projects
+            rows = con.execute(
+                "SELECT * FROM projects WHERE owner_id=? ORDER BY updated_at DESC, created_at DESC",
+                (user["id"],),
+            ).fetchall()
     return [_project_row_to_out(r) for r in rows]
 
 def _project_row_to_out(r) -> ProjectOut:
@@ -109,6 +145,10 @@ class ProjectCreateWithNBC(BaseModel):
 
 @router.post("/projects", response_model=ProjectOut)
 def create_project(payload: ProjectCreateWithNBC, user=Depends(get_current_user)):
+    # Viewers cannot create projects
+    if user.get("tenant_role") == "viewer":
+        raise HTTPException(403, "Viewers cannot create projects")
+
     nbc_result = evaluate_building(payload.nbc_answers)
     settings = {
         "nbc_answers": payload.nbc_answers,
@@ -116,41 +156,37 @@ def create_project(payload: ProjectCreateWithNBC, user=Depends(get_current_user)
     }
     pid = new_id()
     project_dir(pid)
+    tid = user.get("active_tenant_id")
     with db() as con:
         con.execute(
             """INSERT INTO projects
-                (id,owner_id,name,status,created_at,updated_at,settings_json)
-                VALUES (?,?,?,?,?,?,?)""",
-            (pid, user["id"], payload.name, "created", now(), now(), json.dumps(settings)),
+                (id,owner_id,tenant_id,name,status,created_at,updated_at,settings_json)
+                VALUES (?,?,?,?,?,?,?,?)""",
+            (pid, user["id"], tid, payload.name, "created", now(), now(), json.dumps(settings)),
         )
+        log_activity(con, user, "created_project", "project", pid, payload.name)
         r = con.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
     return _project_row_to_out(r)
 
 @router.get("/projects/{project_id}", response_model=ProjectOut)
 def get_project(project_id: str, user=Depends(get_current_user)):
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project(con, project_id, user)
     return _project_row_to_out(r)
 
 @router.post("/projects/{project_id}/settings", response_model=ProjectOut)
 def update_settings(project_id: str, payload: ProjectUpdateSettings, user=Depends(get_current_user)):
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
         con.execute("UPDATE projects SET settings_json=?, updated_at=? WHERE id=?",
                     (json.dumps(payload.settings), now(), project_id))
-        r2 = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        r2 = _authorize_project(con, project_id, user)
     return _project_row_to_out(r2)
 
 @router.post("/projects/{project_id}/upload", response_model=ProjectOut)
 async def upload(project_id: str, file: UploadFile = File(...), user=Depends(get_current_user)):
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
 
     filename = (file.filename or "upload").strip()
     ext = os.path.splitext(filename.lower())[1]
@@ -172,7 +208,8 @@ async def upload(project_id: str, file: UploadFile = File(...), user=Depends(get
             "UPDATE projects SET status=?, error=NULL, input_filename=?, input_path=?, updated_at=? WHERE id=?",
             ("uploaded", filename, in_path, now(), project_id),
         )
-        r2 = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        log_activity(con, user, "uploaded_file", "project", project_id, filename)
+        r2 = _authorize_project(con, project_id, user)
 
     return _project_row_to_out(r2)
 
@@ -180,32 +217,29 @@ async def upload(project_id: str, file: UploadFile = File(...), user=Depends(get
 def run_pipeline(project_id: str, bg: BackgroundTasks, user=Depends(get_current_user)):
     # Run in background thread (simple MVP). For production use a real queue.
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
         if r["status"] in ("running",):
             raise HTTPException(409, "pipeline already running")
         con.execute("UPDATE projects SET status=?, error=NULL, updated_at=? WHERE id=?",
                     ("running", now(), project_id))
+        log_activity(con, user, "ran_pipeline", "project", project_id, r["name"])
 
     # Load options from env + saved settings
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        r = _authorize_project(con, project_id, user)
         settings = json.loads(r["settings_json"] or "{}")
 
     opts = PipelineOptions.from_env().merge_settings(settings)
     bg.add_task(run_pipeline_for_project, project_id, opts)
 
     with db() as con:
-        r2 = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        r2 = _authorize_project(con, project_id, user)
     return _project_row_to_out(r2)
 
 @router.post("/projects/{project_id}/aligned_mask", response_model=ProjectOut)
 async def upload_aligned_mask(project_id: str, file: UploadFile = File(...), user=Depends(get_current_user)):
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
 
     filename = (file.filename or "aligned_mask").strip().lower()
     ext = os.path.splitext(filename)[1]
@@ -225,16 +259,116 @@ async def upload_aligned_mask(project_id: str, file: UploadFile = File(...), use
             "UPDATE projects SET aligned_mask_path=?, status=?, error=NULL, updated_at=? WHERE id=?",
             (aligned_path, "awaiting_alignment_review", now(), project_id),
         )
-        r2 = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        r2 = _authorize_project(con, project_id, user)
 
     return _project_row_to_out(r2)
+
+@router.post("/projects/{project_id}/continue_floor_review", response_model=ProjectOut)
+def continue_floor_review(project_id: str, bg: BackgroundTasks, user=Depends(get_current_user)):
+    """Resume pipeline after user has reviewed / confirmed floor plan splits."""
+    with db() as con:
+        r = _authorize_project_write(con, project_id, user)
+        if r["status"] in ("running",):
+            raise HTTPException(409, "pipeline already running")
+        if r["status"] not in ("awaiting_floor_review", "split"):
+            raise HTTPException(409, "project is not awaiting floor plan review")
+
+        con.execute("UPDATE projects SET status=?, error=NULL, updated_at=? WHERE id=?",
+                    ("running", now(), project_id))
+
+    with db() as con:
+        r = _authorize_project(con, project_id, user)
+        settings = json.loads(r["settings_json"] or "{}")
+
+    opts = PipelineOptions.from_env().merge_settings(settings)
+    bg.add_task(continue_pipeline_after_floor_review, project_id, opts)
+
+    with db() as con:
+        r2 = _authorize_project(con, project_id, user)
+    return _project_row_to_out(r2)
+
+
+@router.post("/projects/{project_id}/floor_plans")
+def add_floor_plan(project_id: str, payload: dict, user=Depends(get_current_user)):
+    """Add a user-defined floor plan block by specifying pixel bounding box on the master render.
+
+    Payload: {"pixel_bbox": [x0, y0, x1, y1]}
+    Converts pixel bbox to world coords and inserts into DB.
+    Block rendering is deferred until the user confirms the floor plan review.
+    """
+    from app.pipeline.floor_plan_split import _pixel_to_dxf
+    import uuid as _uuid
+
+    with db() as con:
+        r = _authorize_project_write(con, project_id, user)
+
+    pixel_bbox = payload.get("pixel_bbox")
+    if not pixel_bbox or len(pixel_bbox) != 4:
+        raise HTTPException(400, "pixel_bbox must be [x0, y0, x1, y1]")
+
+    bx0, by0, bx1, by1 = [int(v) for v in pixel_bbox]
+    if bx1 <= bx0 or by1 <= by0:
+        raise HTTPException(400, "invalid bounding box dimensions")
+
+    master_mapping_path = r["mapping_json_path"]
+    if not master_mapping_path or not os.path.exists(master_mapping_path):
+        raise HTTPException(400, "master mapping not available")
+
+    with open(master_mapping_path, "r", encoding="utf-8") as f:
+        master_map = json.load(f)
+
+    # Convert pixel bbox to world coords
+    dxf_tl_x, dxf_tl_y = _pixel_to_dxf(bx0, by0, master_map)
+    dxf_br_x, dxf_br_y = _pixel_to_dxf(bx1, by1, master_map)
+    wxmin = min(dxf_tl_x, dxf_br_x)
+    wxmax = max(dxf_tl_x, dxf_br_x)
+    wymin = min(dxf_tl_y, dxf_br_y)
+    wymax = max(dxf_tl_y, dxf_br_y)
+
+    # Find next block index
+    with db() as con:
+        max_idx_row = con.execute(
+            "SELECT MAX(block_index) FROM floor_plans WHERE project_id=?",
+            (project_id,),
+        ).fetchone()
+    next_idx = (max_idx_row[0] + 1) if max_idx_row and max_idx_row[0] is not None else 0
+
+    fp_id = str(_uuid.uuid4())
+    with db() as con:
+        con.execute(
+            """INSERT INTO floor_plans
+                (id, project_id, block_index, world_bbox_json, pixel_bbox_json,
+                 render_png_path, mapping_json_path, status, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                fp_id, project_id, next_idx,
+                json.dumps({"xmin": wxmin, "ymin": wymin, "xmax": wxmax, "ymax": wymax}),
+                json.dumps([bx0, by0, bx1, by1]),
+                None, None,
+                "created", now(), now(),
+            ),
+        )
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=?", (fp_id,)).fetchone()
+    return _floor_plan_row_to_dict(fp)
+
+
+@router.delete("/projects/{project_id}/floor_plans/{fp_id}")
+def delete_floor_plan(project_id: str, fp_id: str, user=Depends(get_current_user)):
+    """Delete a floor plan block."""
+    with db() as con:
+        r = _authorize_project_write(con, project_id, user)
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
+        if not fp:
+            raise HTTPException(404, "floor plan block not found")
+        con.execute("DELETE FROM floor_plans WHERE id=?", (fp_id,))
+        con.execute("DELETE FROM detectors WHERE project_id=? AND floor_plan_id=?", (project_id, fp_id))
+    return {"ok": True}
+
 
 @router.post("/projects/{project_id}/continue", response_model=ProjectOut)
 def continue_pipeline(project_id: str, bg: BackgroundTasks, user=Depends(get_current_user)):
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
         if r["status"] in ("running",):
             raise HTTPException(409, "pipeline already running")
         if r["status"] not in ("awaiting_alignment_review", "aligned"):
@@ -244,14 +378,14 @@ def continue_pipeline(project_id: str, bg: BackgroundTasks, user=Depends(get_cur
                     ("running", now(), project_id))
 
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        r = _authorize_project(con, project_id, user)
         settings = json.loads(r["settings_json"] or "{}")
 
     opts = PipelineOptions.from_env().merge_settings(settings)
     bg.add_task(continue_pipeline_after_alignment, project_id, opts)
 
     with db() as con:
-        r2 = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        r2 = _authorize_project(con, project_id, user)
     return _project_row_to_out(r2)
 
 # ── Rooms review endpoints ──────────────────────────────────
@@ -260,9 +394,7 @@ def continue_pipeline(project_id: str, bg: BackgroundTasks, user=Depends(get_cur
 def get_rooms(project_id: str, user=Depends(get_current_user)):
     """Return the extracted rooms JSON for the project."""
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project(con, project_id, user)
     rooms_path = r["rooms_json_path"]
     if not rooms_path or not os.path.exists(rooms_path):
         raise HTTPException(404, "rooms not yet extracted")
@@ -274,9 +406,7 @@ def get_rooms(project_id: str, user=Depends(get_current_user)):
 def update_rooms(project_id: str, payload: dict, user=Depends(get_current_user)):
     """Overwrite rooms JSON (user edits: rename, split, delete, re-draw)."""
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
     rooms_path = r["rooms_json_path"]
     if not rooms_path:
         rooms_path = os.path.join(project_dir(project_id), "rooms_from_image.json")
@@ -304,9 +434,7 @@ def auto_place_detectors(project_id: str, payload: dict = None, user=Depends(get
         equipment_type = "smoke"
 
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
 
     rooms_path = r["rooms_json_path"]
     if not rooms_path or not os.path.exists(rooms_path):
@@ -375,9 +503,7 @@ def auto_place_detectors(project_id: str, payload: dict = None, user=Depends(get
 def continue_after_rooms(project_id: str, bg: BackgroundTasks, user=Depends(get_current_user)):
     """Resume pipeline after user has reviewed / edited rooms."""
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
         if r["status"] in ("running",):
             raise HTTPException(409, "pipeline already running")
         if r["status"] not in ("awaiting_room_review", "rooms_extracted"):
@@ -387,14 +513,14 @@ def continue_after_rooms(project_id: str, bg: BackgroundTasks, user=Depends(get_
                     ("running", now(), project_id))
 
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        r = _authorize_project(con, project_id, user)
         settings = json.loads(r["settings_json"] or "{}")
 
     opts = PipelineOptions.from_env().merge_settings(settings)
     bg.add_task(continue_pipeline_after_rooms, project_id, opts)
 
     with db() as con:
-        r2 = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        r2 = _authorize_project(con, project_id, user)
     return _project_row_to_out(r2)
 
 # ─────────────────────────────────────────────────────────────
@@ -402,12 +528,10 @@ def continue_after_rooms(project_id: str, bg: BackgroundTasks, user=Depends(get_
 @router.post("/projects/{project_id}/reset_detectors", response_model=ProjectOut)
 def reset_detectors(project_id: str, user=Depends(get_current_user)):
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
         con.execute("DELETE FROM detectors WHERE project_id=?", (project_id,))
         con.execute("UPDATE projects SET updated_at=? WHERE id=?", (now(), project_id))
-        r2 = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        r2 = _authorize_project(con, project_id, user)
     return _project_row_to_out(r2)
 
 
@@ -415,9 +539,7 @@ def reset_detectors(project_id: str, user=Depends(get_current_user)):
 def bulk_save(project_id: str, payload: dict, user=Depends(get_current_user)):
     """Save rooms, detectors, and pipes in a single call. No QCAD rendering."""
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
 
         pdir = project_dir(project_id)
         floor_plan_id = payload.get("floor_plan_id")
@@ -504,9 +626,7 @@ def bulk_save(project_id: str, payload: dict, user=Depends(get_current_user)):
 @router.post("/projects/{project_id}/save", response_model=ProjectOut)
 def save_project_layout(project_id: str, user=Depends(get_current_user)):
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
 
         dxf_path = r["dxf_path"]
         if not dxf_path or not os.path.exists(dxf_path):
@@ -529,33 +649,77 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
             for row in det_rows
         ]
 
+        settings = json.loads(r["settings_json"] or "{}")
+        opts = PipelineOptions.from_env().merge_settings(settings)
+
+        # Build world_bbox from floor-plan blocks or mapping.json
+        world_bbox = None
+        fp_bbox_rows = con.execute(
+            "SELECT world_bbox_json FROM floor_plans WHERE project_id=? ORDER BY block_index ASC",
+            (project_id,),
+        ).fetchall()
+        if fp_bbox_rows:
+            xs_min, ys_min, xs_max, ys_max = [], [], [], []
+            for row in fp_bbox_rows:
+                wb = json.loads(row["world_bbox_json"]) if row["world_bbox_json"] else None
+                if wb:
+                    xs_min.append(float(wb["xmin"])); ys_min.append(float(wb["ymin"]))
+                    xs_max.append(float(wb["xmax"])); ys_max.append(float(wb["ymax"]))
+            if xs_min:
+                world_bbox = {"xmin": min(xs_min), "ymin": min(ys_min),
+                              "xmax": max(xs_max), "ymax": max(ys_max)}
+        if world_bbox is None:
+            mapping_path = r["mapping_json_path"]
+            if mapping_path and os.path.exists(mapping_path):
+                with open(mapping_path, "r", encoding="utf-8") as mf:
+                    world_bbox = json.load(mf).get("world_bbox")
+
         out_dxf = os.path.join(project_dir(project_id), "detectors_overlay.dxf")
-        write_detectors_to_dxf(dxf_path, out_dxf, dets, symbol_radius_world=150.0, text_height_world=150.0)
+        write_detectors_to_dxf(dxf_path, out_dxf, dets,
+                               world_to_m=opts.world_to_m, world_bbox=world_bbox)
 
         # Write sprinkler pipes into the DXF if they exist
+        # Collect pipes from project-level and per-floor-plan files
+        from app.pipeline.sprinkler_routing import write_sprinklers_to_dxf
+        all_pipe_segments = []
+        all_pipe_sources = []
+
         pipes_json_path = os.path.join(project_dir(project_id), "sprinkler_pipes.json")
         if os.path.exists(pipes_json_path):
-            from app.pipeline.sprinkler_routing import write_sprinklers_to_dxf
             with open(pipes_json_path, "r", encoding="utf-8") as pf:
                 pipes_data = json.load(pf)
-            sprinkler_dets = [(float(d["x"]), float(d["y"])) for d in dets if d["dtype"] == "sprinkler"]
-            pipe_segments = [
+            all_pipe_segments.extend([
                 (((p["from"][0], p["from"][1]), (p["to"][0], p["to"][1])), p["diameter"])
                 for p in pipes_data.get("pipes", [])
-            ]
-            pipe_sources = [(s["x"], s["y"]) for s in pipes_data.get("sources", [])]
-            if sprinkler_dets or pipe_segments:
-                write_sprinklers_to_dxf(
-                    out_dxf, out_dxf,
-                    sprinkler_dets, pipe_segments, pipe_sources,
-                    symbol_radius_world=150.0, text_height_world=150.0,
-                )
+            ])
+            all_pipe_sources.extend([(s["x"], s["y"]) for s in pipes_data.get("sources", [])])
+
+        # Per-floor-plan pipes
+        fp_rows = con.execute(
+            "SELECT block_index FROM floor_plans WHERE project_id=? ORDER BY block_index ASC",
+            (project_id,),
+        ).fetchall()
+        for fp_row in fp_rows:
+            fp_pipes_path = os.path.join(project_dir(project_id), f"sprinkler_pipes_{fp_row['block_index']}.json")
+            if os.path.exists(fp_pipes_path):
+                with open(fp_pipes_path, "r", encoding="utf-8") as pf:
+                    fp_pipes = json.load(pf)
+                all_pipe_segments.extend([
+                    (((p["from"][0], p["from"][1]), (p["to"][0], p["to"][1])), p["diameter"])
+                    for p in fp_pipes.get("pipes", [])
+                ])
+                all_pipe_sources.extend([(s["x"], s["y"]) for s in fp_pipes.get("sources", [])])
+
+        sprinkler_dets = [(float(d["x"]), float(d["y"])) for d in dets if d["dtype"] == "sprinkler"]
+        if sprinkler_dets or all_pipe_segments:
+            write_sprinklers_to_dxf(
+                out_dxf, out_dxf,
+                sprinkler_dets, all_pipe_segments, all_pipe_sources,
+                world_to_m=opts.world_to_m, world_bbox=world_bbox,
+            )
 
         out_png = os.path.join(project_dir(project_id), "detectors_preview.png")
         out_map = os.path.join(project_dir(project_id), "detectors_preview_mapping.json")
-
-        settings = json.loads(r["settings_json"] or "{}")
-        opts = PipelineOptions.from_env().merge_settings(settings)
 
         render_dwg_to_png_with_qcad(
             dwg_path=out_dxf,
@@ -574,7 +738,8 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
             "UPDATE projects SET output_dxf_path=?, output_preview_png_path=?, status=?, error=NULL, updated_at=? WHERE id=?",
             (out_dxf, out_png, "ready", now(), project_id),
         )
-        r2 = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
+        log_activity(con, user, "saved_project", "project", project_id, r["name"])
+        r2 = _authorize_project(con, project_id, user)
 
     return _project_row_to_out(r2)
 
@@ -585,9 +750,7 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
 def list_floor_plans(project_id: str, user=Depends(get_current_user)):
     """Return all floor-plan blocks extracted from the project's DXF."""
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project(con, project_id, user)
         rows = con.execute(
             "SELECT * FROM floor_plans WHERE project_id=? ORDER BY block_index ASC",
             (project_id,),
@@ -629,9 +792,7 @@ async def upload_floor_plan_aligned_mask(
 ):
     """Upload / replace the aligned mask for a specific floor-plan block."""
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
         fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
         if not fp:
             raise HTTPException(404, "floor plan block not found")
@@ -665,9 +826,7 @@ async def upload_floor_plan_aligned_mask(
 def get_floor_plan(project_id: str, fp_id: str, user=Depends(get_current_user)):
     """Return a single floor-plan block."""
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project(con, project_id, user)
         fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
         if not fp:
             raise HTTPException(404, "floor plan block not found")
@@ -680,9 +839,7 @@ def get_floor_plan(project_id: str, fp_id: str, user=Depends(get_current_user)):
 def get_floor_plan_rooms(project_id: str, fp_id: str, user=Depends(get_current_user)):
     """Return rooms JSON for a specific floor-plan block."""
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project(con, project_id, user)
         fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
         if not fp:
             raise HTTPException(404, "floor plan block not found")
@@ -697,9 +854,7 @@ def get_floor_plan_rooms(project_id: str, fp_id: str, user=Depends(get_current_u
 def update_floor_plan_rooms(project_id: str, fp_id: str, payload: dict, user=Depends(get_current_user)):
     """Overwrite rooms JSON for a specific floor-plan block."""
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
         fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
         if not fp:
             raise HTTPException(404, "floor plan block not found")
@@ -729,9 +884,7 @@ def auto_place_floor_plan(project_id: str, fp_id: str, payload: dict = None, use
         equipment_type = "smoke"
 
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
         fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
         if not fp:
             raise HTTPException(404, "floor plan block not found")
@@ -804,9 +957,7 @@ def auto_place_floor_plan(project_id: str, fp_id: str, payload: dict = None, use
 def get_sprinkler_pipes(project_id: str, user=Depends(get_current_user)):
     """Return sprinkler pipe routing data for the project."""
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project(con, project_id, user)
     pipes_path = os.path.join(project_dir(project_id), "sprinkler_pipes.json")
     if not os.path.exists(pipes_path):
         raise HTTPException(404, "no sprinkler pipes data")
@@ -818,9 +969,7 @@ def get_sprinkler_pipes(project_id: str, user=Depends(get_current_user)):
 def update_sprinkler_pipes(project_id: str, payload: dict, user=Depends(get_current_user)):
     """Save modified sprinkler pipe data for the project."""
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
     pipes_path = os.path.join(project_dir(project_id), "sprinkler_pipes.json")
     pipes_data = {
         "pipes": payload.get("pipes", []),
@@ -835,9 +984,7 @@ def update_sprinkler_pipes(project_id: str, payload: dict, user=Depends(get_curr
 def get_floor_plan_sprinkler_pipes(project_id: str, fp_id: str, user=Depends(get_current_user)):
     """Return sprinkler pipe routing data for a specific floor plan block."""
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project(con, project_id, user)
         fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
         if not fp:
             raise HTTPException(404, "floor plan block not found")
@@ -854,9 +1001,7 @@ def detect_sources(project_id: str, user=Depends(get_current_user)):
     from app.pipeline.sprinkler_routing import detect_sources_from_dxf, SOURCE_LABELS
 
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project(con, project_id, user)
 
     dxf_path = r["dxf_path"]
     if not dxf_path or not os.path.exists(dxf_path):
@@ -879,9 +1024,7 @@ def route_pipes_project(project_id: str, payload: dict = None, user=Depends(get_
     from app.pipeline.sprinkler_routing import route_pipes_for_sprinklers
 
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
         sprinkler_rows = con.execute(
             "SELECT x, y FROM detectors WHERE project_id=? AND dtype='sprinkler' ORDER BY created_at ASC",
             (project_id,),
@@ -943,9 +1086,7 @@ def route_pipes_floor_plan(project_id: str, fp_id: str, payload: dict = None, us
     from app.pipeline.sprinkler_routing import route_pipes_for_sprinklers
 
     with db() as con:
-        r = con.execute("SELECT * FROM projects WHERE id=? AND owner_id=?", (project_id, user["id"])).fetchone()
-        if not r:
-            raise HTTPException(404, "project not found")
+        r = _authorize_project_write(con, project_id, user)
         fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
         if not fp:
             raise HTTPException(404, "floor plan block not found")

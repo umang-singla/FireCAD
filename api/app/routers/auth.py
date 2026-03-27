@@ -17,6 +17,12 @@ SESSION_DAYS = int(os.getenv("SESSION_DAYS", "30"))
 COOKIE_NAME = "firecad_token"
 PBKDF2_ITERS = int(os.getenv("PBKDF2_ITERS", "200000"))
 
+# Tenant roles
+ROLE_ADMIN = "admin"
+ROLE_EDITOR = "editor"
+ROLE_VIEWER = "viewer"
+VALID_ROLES = {ROLE_ADMIN, ROLE_EDITOR, ROLE_VIEWER}
+
 
 class RegisterIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
@@ -73,7 +79,7 @@ def get_current_user(req: Request) -> dict:
     with db() as con:
         row = con.execute(
             """
-            SELECT u.id, u.name, u.email
+            SELECT u.id, u.name, u.email, u.active_tenant_id
             FROM sessions s
             JOIN users u ON u.id = s.user_id
             WHERE s.token = ? AND s.expires_at > ?
@@ -84,7 +90,43 @@ def get_current_user(req: Request) -> dict:
     if not row:
         raise HTTPException(status_code=401, detail="Invalid/expired token")
 
-    return {"id": row["id"], "name": row["name"], "email": row["email"]}
+    user = {"id": row["id"], "name": row["name"], "email": row["email"],
+            "active_tenant_id": row["active_tenant_id"]}
+
+    # Resolve active tenant — pick the first one if none set
+    if not user["active_tenant_id"]:
+        with db() as con:
+            tm = con.execute(
+                "SELECT tenant_id FROM tenant_members WHERE user_id=? LIMIT 1",
+                (user["id"],),
+            ).fetchone()
+            if tm:
+                user["active_tenant_id"] = tm["tenant_id"]
+
+    # Load role in active tenant
+    if user["active_tenant_id"]:
+        with db() as con:
+            mr = con.execute(
+                "SELECT role FROM tenant_members WHERE tenant_id=? AND user_id=?",
+                (user["active_tenant_id"], user["id"]),
+            ).fetchone()
+            user["tenant_role"] = mr["role"] if mr else None
+    else:
+        user["tenant_role"] = None
+
+    return user
+
+
+def require_tenant_role(*allowed_roles: str):
+    """Dependency factory: raises 403 unless user has one of the allowed roles in active tenant."""
+    from fastapi import Depends
+    def checker(user: dict = Depends(get_current_user)) -> dict:
+        if not user.get("active_tenant_id"):
+            raise HTTPException(403, "No active team")
+        if user.get("tenant_role") not in allowed_roles:
+            raise HTTPException(403, f"Requires role: {', '.join(allowed_roles)}")
+        return user
+    return Depends(checker)
 
 
 @router.post("/register")
@@ -98,20 +140,41 @@ def register(payload: RegisterIn):
         salt = _new_salt_b64()
         pw_hash = _hash_password(payload.password, salt)
 
+        # Create user
         con.execute(
             "INSERT INTO users(id, name, email, pw_salt, pw_hash, created_at) VALUES(?,?,?,?,?,?)",
             (user_id, payload.name, payload.email, salt, pw_hash, now()),
         )
 
+        # Create default personal tenant
+        tenant_id = str(uuid.uuid4())
+        tenant_name = f"{payload.name}'s Team"
+        con.execute(
+            "INSERT INTO tenants(id, name, created_by, created_at, updated_at) VALUES(?,?,?,?,?)",
+            (tenant_id, tenant_name, user_id, now(), now()),
+        )
+        con.execute(
+            "INSERT INTO tenant_members(id, tenant_id, user_id, role, created_at, updated_at) VALUES(?,?,?,?,?,?)",
+            (str(uuid.uuid4()), tenant_id, user_id, ROLE_ADMIN, now(), now()),
+        )
+        con.execute(
+            "UPDATE users SET active_tenant_id=? WHERE id=?",
+            (tenant_id, user_id),
+        )
+
     token = _create_session(user_id)
-    return {"token": token, "user": {"id": user_id, "name": payload.name, "email": payload.email}}
+    return {
+        "token": token,
+        "user": {"id": user_id, "name": payload.name, "email": payload.email},
+        "tenant": {"id": tenant_id, "name": tenant_name, "role": ROLE_ADMIN},
+    }
 
 
 @router.post("/login")
 def login(payload: LoginIn):
     with db() as con:
         row = con.execute(
-            "SELECT id, name, email, pw_salt, pw_hash FROM users WHERE email = ?",
+            "SELECT id, name, email, pw_salt, pw_hash, active_tenant_id FROM users WHERE email = ?",
             (payload.email,),
         ).fetchone()
 
@@ -122,12 +185,44 @@ def login(payload: LoginIn):
         raise HTTPException(status_code=401, detail="Invalid email/password")
 
     token = _create_session(row["id"])
-    return {"token": token, "user": {"id": row["id"], "name": row["name"], "email": row["email"]}}
+
+    # Resolve active tenant
+    tenant_info = None
+    tid = row["active_tenant_id"]
+    if not tid:
+        with db() as con:
+            tm = con.execute("SELECT tenant_id FROM tenant_members WHERE user_id=? LIMIT 1", (row["id"],)).fetchone()
+            tid = tm["tenant_id"] if tm else None
+    if tid:
+        with db() as con:
+            t = con.execute("SELECT id, name FROM tenants WHERE id=?", (tid,)).fetchone()
+            mr = con.execute("SELECT role FROM tenant_members WHERE tenant_id=? AND user_id=?",
+                             (tid, row["id"])).fetchone()
+            if t and mr:
+                tenant_info = {"id": t["id"], "name": t["name"], "role": mr["role"]}
+
+    return {
+        "token": token,
+        "user": {"id": row["id"], "name": row["name"], "email": row["email"]},
+        "tenant": tenant_info,
+    }
 
 
 @router.get("/me")
 def me(req: Request):
-    return get_current_user(req)
+    user = get_current_user(req)
+    tenant_info = None
+    if user.get("active_tenant_id"):
+        with db() as con:
+            t = con.execute("SELECT id, name FROM tenants WHERE id=?", (user["active_tenant_id"],)).fetchone()
+            if t:
+                tenant_info = {"id": t["id"], "name": t["name"], "role": user.get("tenant_role")}
+    return {
+        "id": user["id"],
+        "name": user["name"],
+        "email": user["email"],
+        "tenant": tenant_info,
+    }
 
 
 @router.post("/logout")

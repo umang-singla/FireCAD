@@ -12,6 +12,7 @@ from app.pipeline.convert import dwg_to_dxf
 from app.pipeline.render import (
     render_dwg_to_png_with_qcad,
     write_mapping_from_dxf_and_png,
+    render_master_cropped,
 )
 from app.pipeline.gemini_mask import generate_mask_image
 from app.pipeline.mask_align import align_perfect_tight_box
@@ -25,6 +26,7 @@ from app.pipeline.sprinkler_routing import (
     write_sprinklers_to_dxf,
 )
 from app.pipeline.floor_plan_split import split_floor_plans
+from app.pipeline.floor_plan_split import _render_block
 from app.ws_manager import manager as ws_manager
 
 logger = logging.getLogger("firecad.pipeline")
@@ -357,7 +359,26 @@ def _run_post_room_review_steps(
     stage_start("export_dxf")
     out_dxf = os.path.join(pdir, "detectors_overlay.dxf")
     combined_dets = all_dets + all_sprinkler_dets
-    write_detectors_to_dxf(dxf_path, out_dxf, combined_dets, symbol_radius_world=150.0, text_height_world=150.0)
+
+    # Build a combined world bbox from floor-plan blocks (or mapping.json)
+    # so symbol sizing is proportional to actual content, not whitespace.
+    combined_bbox = None
+    if fps:
+        all_xmin, all_ymin, all_xmax, all_ymax = [], [], [], []
+        for fp in fps:
+            wb = _json.loads(fp["world_bbox_json"]) if fp.get("world_bbox_json") else None
+            if wb:
+                all_xmin.append(float(wb["xmin"])); all_ymin.append(float(wb["ymin"]))
+                all_xmax.append(float(wb["xmax"])); all_ymax.append(float(wb["ymax"]))
+        if all_xmin:
+            combined_bbox = {"xmin": min(all_xmin), "ymin": min(all_ymin),
+                             "xmax": max(all_xmax), "ymax": max(all_ymax)}
+    if combined_bbox is None and os.path.exists(mapping_json):
+        with open(mapping_json, "r", encoding="utf-8") as mf:
+            combined_bbox = _json.load(mf).get("world_bbox")
+
+    write_detectors_to_dxf(dxf_path, out_dxf, combined_dets,
+                           world_to_m=opts.world_to_m, world_bbox=combined_bbox)
 
     # If sprinklers were placed, also write pipes + sources into the same DXF
     if all_sprinkler_pipes:
@@ -366,8 +387,8 @@ def _run_post_room_review_steps(
             [(d["x"], d["y"]) for d in all_sprinkler_dets],
             all_sprinkler_pipes,
             all_sprinkler_sources,
-            symbol_radius_world=150.0,
-            text_height_world=150.0,
+            world_to_m=opts.world_to_m,
+            world_bbox=combined_bbox,
         )
     stage_done("export_dxf", stage_ts, out_dxf=out_dxf)
 
@@ -454,24 +475,22 @@ def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
             dxf_path = dwg_to_dxf(in_path, pdir)
         stage_done("ensure_dxf", stage_ts, ext=ext, dxf=dxf_path)
 
-        # 2) Render full master DXF → PNG + mapping.json
+        # 2) Render full master DXF → PNG + mapping.json (cropped to content)
+        #    Produces both colored (for UI) and grayscale (for processing/splitting)
         stage_ts = time.perf_counter()
         stage_start("render_input")
         render_png = os.path.join(pdir, "render.png")
+        render_gray_png = os.path.join(pdir, "render_gray.png")
         mapping_json = os.path.join(pdir, "mapping.json")
-        render_dwg_to_png_with_qcad(
-            dwg_path=dxf_path,
-            out_png=render_png,
-            target_long_side_px=opts.target_long_side_px,
-            background="white",
-        )
-        write_mapping_from_dxf_and_png(
+        render_master_cropped(
             dxf_path=dxf_path,
-            png_path=render_png,
+            out_png=render_png,
             out_json=mapping_json,
+            target_long_side_px=opts.target_long_side_px,
             pad_frac=opts.pad_frac,
+            out_gray_png=render_gray_png,
         )
-        stage_done("render_input", stage_ts, render=render_png, mapping=mapping_json, renderer="qcad")
+        stage_done("render_input", stage_ts, render=render_png, gray=render_gray_png, mapping=mapping_json, renderer="qcad")
 
         with db() as con:
             _set_project(con, project_id,
@@ -480,13 +499,13 @@ def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
                          render_png_path=render_png,
                          mapping_json_path=mapping_json)
 
-        # 3) XY-cut: split master into floor-plan blocks
+        # 3) XY-cut: split master into floor-plan blocks (uses grayscale image)
         stage_ts = time.perf_counter()
         stage_start("split_floor_plans")
         blocks_dir = os.path.join(pdir, "blocks")
         blocks = split_floor_plans(
             dxf_path=dxf_path,
-            master_png=render_png,
+            master_png=render_gray_png,
             master_mapping_json=mapping_json,
             out_dir=blocks_dir,
             block_render_px=min(opts.target_long_side_px, 3000),
@@ -516,12 +535,106 @@ def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
             "count": len(blocks),
         })
 
-        # 4) For each block: Gemini mask
+        # ── Pause for user floor plan review ──
+        with db() as con:
+            _set_project(con, project_id, status="awaiting_floor_review", error=None)
+        logger.info(
+            "pipeline project=%s status=awaiting_floor_review blocks=%d total_elapsed=%.2fs",
+            project_id, len(blocks), time.perf_counter() - start_ts,
+        )
+
+    except Exception as e:
+        err = f"{e}\n\n{traceback.format_exc()}"
+        logger.exception("pipeline project=%s status=failed", project_id)
+        with db() as con:
+            _set_project(con, project_id, status="failed", error=err)
+
+def continue_pipeline_after_floor_review(project_id: str, opts: PipelineOptions):
+    """Resume pipeline after user has reviewed / confirmed floor plan splits.
+
+    Runs Gemini mask generation + alignment for each floor plan block,
+    then pauses for alignment review.
+    """
+    start_ts = time.perf_counter()
+
+    def stage_start(name: str):
+        logger.info("pipeline-floor-review project=%s stage=%s status=start", project_id, name)
+        ws_manager.broadcast_sync(project_id, {"type": "stage", "stage": name, "event": "start"})
+
+    def stage_done(name: str, stage_ts: float, **extra):
+        suffix = " ".join(f"{k}={v}" for k, v in extra.items())
+        if suffix:
+            suffix = f" {suffix}"
+        logger.info(
+            "pipeline-floor-review project=%s stage=%s status=done elapsed=%.2fs%s",
+            project_id, name, time.perf_counter() - stage_ts, suffix,
+        )
+        ws_manager.broadcast_sync(project_id, {
+            "type": "stage", "stage": name, "event": "done",
+            "elapsed": round(time.perf_counter() - stage_ts, 2),
+        })
+
+    logger.info("pipeline-floor-review project=%s status=start", project_id)
+    try:
+        with db() as con:
+            p = _get_project(con, project_id)
+            if not p:
+                logger.warning("pipeline-floor-review project=%s status=aborted reason=project_not_found", project_id)
+                return
+
+        pdir = project_dir(project_id)
+        blocks_dir = os.path.join(pdir, "blocks")
+        os.makedirs(blocks_dir, exist_ok=True)
+
+        dxf_path = p["dxf_path"]
+        if not dxf_path or not os.path.exists(dxf_path):
+            with db() as con:
+                _set_project(con, project_id, status="failed", error="DXF not found for floor review continue flow.")
+            return
+
+        # Render each confirmed floor plan block
+        with db() as con:
+            fps = _get_floor_plans(con, project_id)
+
+        for fp in fps:
+            idx = fp["block_index"]
+            fp_id = fp["id"]
+            wb = _json.loads(fp["world_bbox_json"]) if fp["world_bbox_json"] else None
+            if not wb:
+                logger.warning("block %d has no world bbox, skipping render", idx)
+                continue
+
+            stage_ts = time.perf_counter()
+            stage_start(f"render_block_{idx}")
+            block_png = os.path.join(blocks_dir, f"block_{idx}.png")
+            block_color_png = os.path.join(blocks_dir, f"block_{idx}_color.png")
+            block_map_json = os.path.join(blocks_dir, f"block_{idx}_mapping.json")
+
+            _render_block(
+                dxf_path=dxf_path,
+                out_png=block_png,
+                out_json=block_map_json,
+                world_bbox=(wb["xmin"], wb["ymin"], wb["xmax"], wb["ymax"]),
+                target_long_side_px=min(opts.target_long_side_px, 3000),
+                pad_frac=opts.pad_frac,
+                out_color_png=block_color_png,
+            )
+            stage_done(f"render_block_{idx}", stage_ts)
+
+            # Use colored image for UI display if available, else fall back to grayscale
+            ui_png = block_color_png if os.path.exists(block_color_png) else block_png
+
+            with db() as con:
+                _set_floor_plan(con, fp_id,
+                                render_png_path=ui_png,
+                                mapping_json_path=block_map_json)
+
+        # Gemini mask generation
         if not opts.use_gemini:
             with db() as con:
                 _set_project(con, project_id, status="ready_no_mask",
                              error="GEMINI_API_KEY not set; skipping auto-mask/rooms. You can still edit detectors manually.")
-            logger.warning("pipeline project=%s status=ready_no_mask reason=gemini_key_missing", project_id)
+            logger.warning("pipeline-floor-review project=%s status=ready_no_mask reason=gemini_key_missing", project_id)
             return
 
         with db() as con:
@@ -530,7 +643,9 @@ def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
         for fp in fps:
             idx = fp["block_index"]
             fp_id = fp["id"]
-            block_render = fp["render_png_path"]
+            # Use grayscale block render for Gemini mask (better for processing)
+            block_gray = os.path.join(blocks_dir, f"block_{idx}.png")
+            block_render = block_gray if os.path.exists(block_gray) else fp["render_png_path"]
 
             stage_ts = time.perf_counter()
             stage_start(f"gemini_mask_block_{idx}")
@@ -547,14 +662,16 @@ def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
         with db() as con:
             _set_project(con, project_id, status="masked")
 
-        # 5) For each block: auto-align mask
+        # Auto-align mask for each block
         with db() as con:
             fps = _get_floor_plans(con, project_id)
 
         for fp in fps:
             idx = fp["block_index"]
             fp_id = fp["id"]
-            block_render = fp["render_png_path"]
+            # Use grayscale block render for alignment (better for pixel matching)
+            block_gray = os.path.join(blocks_dir, f"block_{idx}.png")
+            block_render = block_gray if os.path.exists(block_gray) else fp["render_png_path"]
             block_mask = fp["mask_png_path"]
             if not block_mask or not os.path.exists(block_mask):
                 continue
@@ -573,19 +690,20 @@ def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
         with db() as con:
             _set_project(con, project_id, status="aligned")
 
-        # ── Pause for user alignment review (all blocks) ──
+        # Pause for user alignment review (all blocks)
         with db() as con:
             _set_project(con, project_id, status="awaiting_alignment_review", error=None)
         logger.info(
-            "pipeline project=%s status=awaiting_alignment_review blocks=%d total_elapsed=%.2fs",
-            project_id, len(blocks), time.perf_counter() - start_ts,
+            "pipeline-floor-review project=%s status=awaiting_alignment_review blocks=%d total_elapsed=%.2fs",
+            project_id, len(fps), time.perf_counter() - start_ts,
         )
 
     except Exception as e:
         err = f"{e}\n\n{traceback.format_exc()}"
-        logger.exception("pipeline project=%s status=failed", project_id)
+        logger.exception("pipeline-floor-review project=%s status=failed", project_id)
         with db() as con:
             _set_project(con, project_id, status="failed", error=err)
+
 
 def continue_pipeline_after_alignment(project_id: str, opts: PipelineOptions):
     start_ts = time.perf_counter()

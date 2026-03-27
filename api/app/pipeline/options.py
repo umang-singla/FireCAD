@@ -14,7 +14,7 @@ class PipelineOptions:
 
     # Sprinkler settings
     sprinkler_spacing_m: float = 3.0
-    enable_sprinklers: bool = False
+    enable_sprinklers: bool = True
     sprinkler_source_labels: list | None = None   # DXF text/block labels for pipe source detection
 
     # Room filtering

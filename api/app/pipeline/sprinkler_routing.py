@@ -578,13 +578,26 @@ def write_sprinklers_to_dxf(
     sprinklers: List[Tuple[float, float]],
     pipes: list,
     sources: List[Tuple[float, float]],
-    symbol_radius_world: float = 150.0,
-    text_height_world: float = 150.0,
+    world_to_m: float = 0.001,
+    world_bbox: dict | None = None,
+    symbol_radius_world: float | None = None,
+    text_height_world: float | None = None,
 ):
     """Write sprinkler symbols, sized pipe segments, and source markers into a DXF."""
     if not _EZDXF_OK:
         logger.warning("ezdxf not available, skipping DXF export")
         return
+
+    from app.pipeline.dxf_export import compute_symbol_sizes
+
+    if symbol_radius_world is None or text_height_world is None:
+        # build lightweight detector list for bbox calculation
+        sp_dets = [{"x": x, "y": y} for x, y in sprinklers] if sprinklers else []
+        auto_r, auto_t = compute_symbol_sizes(world_to_m, sp_dets, world_bbox)
+        if symbol_radius_world is None:
+            symbol_radius_world = auto_r
+        if text_height_world is None:
+            text_height_world = auto_t
 
     doc = ezdxf.readfile(base_dxf)
     msp = doc.modelspace()
@@ -594,12 +607,14 @@ def write_sprinklers_to_dxf(
             doc.layers.add(layer_name)
 
     pipe_text_height = text_height_world * 0.40
+    # Keep pipe thickness proportional to symbol scale while enforcing a practical minimum.
+    pipe_const_width = max(symbol_radius_world * 0.18, 0.03 / world_to_m)
 
     # Pipes
     for (pt1, pt2), label in pipes:
         msp.add_lwpolyline(
             [pt1, pt2],
-            dxfattribs={"layer": DXF_LAYER_PIPES, "color": 1, "const_width": 2.5},
+            dxfattribs={"layer": DXF_LAYER_PIPES, "color": 1, "const_width": pipe_const_width},
         )
         dx = pt2[0] - pt1[0]
         dy = pt2[1] - pt1[1]

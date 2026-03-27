@@ -15,6 +15,8 @@ const apiUrl = (path: string) => `${resolveApiBase()}${path}`;
 
 const TOKEN_KEY = "firecad_token";
 const NAME_KEY = "firecad_name";
+const TENANT_KEY = "firecad_tenant";
+const TENANT_ROLE_KEY = "firecad_tenant_role";
 
 function setCookie(name: string, value: string, maxAgeSec = 60 * 60 * 24 * 7) {
   if (typeof document === "undefined") return;
@@ -35,14 +37,18 @@ function clearCookie(name: string) {
   document.cookie = `${name}=; Path=/; Max-Age=0; SameSite=Lax`;
 }
 
-export function setAuth(token: string, name?: string) {
+export function setAuth(token: string, name?: string, tenantName?: string, tenantRole?: string) {
   setCookie(TOKEN_KEY, token);
   if (name) setCookie(NAME_KEY, name);
+  if (tenantName) setCookie(TENANT_KEY, tenantName);
+  if (tenantRole) setCookie(TENANT_ROLE_KEY, tenantRole);
 
   // optional localStorage fallback (not used by middleware)
   if (typeof window !== "undefined") {
     localStorage.setItem(TOKEN_KEY, token);
     if (name) localStorage.setItem(NAME_KEY, name);
+    if (tenantName) localStorage.setItem(TENANT_KEY, tenantName);
+    if (tenantRole) localStorage.setItem(TENANT_ROLE_KEY, tenantRole);
   }
 }
 
@@ -60,12 +66,30 @@ export function getName() {
   );
 }
 
+export function getTenantName() {
+  return (
+    getCookie(TENANT_KEY) ||
+    (typeof window !== "undefined" ? localStorage.getItem(TENANT_KEY) : null)
+  );
+}
+
+export function getTenantRole() {
+  return (
+    getCookie(TENANT_ROLE_KEY) ||
+    (typeof window !== "undefined" ? localStorage.getItem(TENANT_ROLE_KEY) : null)
+  );
+}
+
 export function clearAuth() {
   clearCookie(TOKEN_KEY);
   clearCookie(NAME_KEY);
+  clearCookie(TENANT_KEY);
+  clearCookie(TENANT_ROLE_KEY);
   if (typeof window !== "undefined") {
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(NAME_KEY);
+    localStorage.removeItem(TENANT_KEY);
+    localStorage.removeItem(TENANT_ROLE_KEY);
   }
 }
 
@@ -122,8 +146,10 @@ export async function apiRegister(name: string, email: string, password: string)
 
   const token = extractToken(payload);
   const uname = extractName(payload) || name;
+  const tenantName = payload?.tenant?.name;
+  const tenantRole = payload?.tenant?.role;
 
-  if (token) setAuth(token, uname);
+  if (token) setAuth(token, uname, tenantName, tenantRole);
   return payload;
 }
 
@@ -135,8 +161,10 @@ export async function apiLogin(email: string, password: string) {
 
   const token = extractToken(payload);
   const uname = extractName(payload);
+  const tenantName = payload?.tenant?.name;
+  const tenantRole = payload?.tenant?.role;
 
-  if (token) setAuth(token, uname || undefined);
+  if (token) setAuth(token, uname || undefined, tenantName, tenantRole);
   return payload;
 }
 

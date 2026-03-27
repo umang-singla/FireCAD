@@ -3,7 +3,7 @@
 import { use, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
-import { getToken } from "../../lib/auth";
+import { getToken, getTenantRole } from "../../lib/auth";
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
 
@@ -219,6 +219,11 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   const [nbcSettingsSaving, setNbcSettingsSaving] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
 
+  const canEdit = (() => {
+    const role = getTenantRole();
+    return role !== "viewer";
+  })();
+
   const [settings, setSettings] = useState<any>({
     detector_spacing_m: 5.0,
     wall_buffer_m: 0.5,
@@ -291,7 +296,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           if (msg.type === "status") {
             // Full refresh to pick up new files/status from the API
             refresh();
-            if (msg.status === "ready" || msg.status === "failed" || msg.status === "ready_no_mask" || msg.status === "awaiting_alignment_review") {
+            if (msg.status === "ready" || msg.status === "failed" || msg.status === "ready_no_mask" || msg.status === "awaiting_alignment_review" || msg.status === "awaiting_floor_review") {
               setPipelineStage(null);
             }
           } else if (msg.type === "stage") {
@@ -434,17 +439,37 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   }
 
   const isReady = project?.status === "ready";
+  const isAwaitingFloorReview = project?.status === "awaiting_floor_review";
   const isAwaitingAlignmentReview = project?.status === "awaiting_alignment_review";
   const isAwaitingRoomReview = project?.status === "awaiting_room_review";
   // Treat ALL intermediate pipeline statuses as "running" so the loader
   // stays visible until a review step or final output appears.
-  const IDLE_STATUSES = new Set(["created", "uploaded", "ready", "ready_no_mask", "failed", "awaiting_alignment_review", "awaiting_room_review"]);
+  const IDLE_STATUSES = new Set(["created", "uploaded", "ready", "ready_no_mask", "failed", "awaiting_alignment_review", "awaiting_room_review", "awaiting_floor_review"]);
   const isRunning = !!project && !IDLE_STATUSES.has(project.status);
   const isQuestionnaireMode = !editorOpen;
   const showGlobalLoader = project === null || networkPending > 0;
 
   async function saveLayout() {
     await authFetch(`/api/projects/${projectId}/save`, { method:"POST" });
+    await refresh();
+  }
+
+  async function continuePipelineAfterFloorReview() {
+    setPipelineStage(null);
+    await authFetch(`/api/projects/${projectId}/continue_floor_review`, { method:"POST" });
+    await refresh();
+  }
+
+  async function addFloorPlan(pixelBbox: number[]) {
+    await authFetch(`/api/projects/${projectId}/floor_plans`, {
+      method: "POST",
+      body: JSON.stringify({ pixel_bbox: pixelBbox }),
+    });
+    await refresh();
+  }
+
+  async function deleteFloorPlan(fpId: string) {
+    await authFetch(`/api/projects/${projectId}/floor_plans/${fpId}`, { method: "DELETE" });
     await refresh();
   }
 
@@ -483,20 +508,10 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   }
 
   async function saveRoomsAndContinue(rooms: any[]) {
-    const activeFp = floorPlans[activeBlockIndex];
-    if (activeFp) {
-      await authFetch(`/api/projects/${projectId}/floor_plans/${activeFp.id}/rooms`, {
-        method: "PUT",
-        body: JSON.stringify({ rooms }),
-      });
-    } else {
-      await authFetch(`/api/projects/${projectId}/rooms`, {
-        method: "PUT",
-        body: JSON.stringify({ rooms }),
-      });
-    }
     setPipelineStage(null);
-    await authFetch(`/api/projects/${projectId}/continue_rooms`, { method: "POST" });
+    // Use /save which writes the user's saved detectors & pipes to DXF
+    // (bulk_save was already called by handleContinue in RoomEditor)
+    await authFetch(`/api/projects/${projectId}/save`, { method: "POST" });
     await refresh();
   }
 
@@ -548,16 +563,24 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                 <div style={{ fontSize: 12, color: "#6B7280", marginTop: 2 }}>Project Workspace</div>
               </div>
             </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={openSettingsModal} style={{
-                padding: "8px 14px", borderRadius: 10,
-                border: "1px solid #E8EAED", background: "#FFFFFF",
-                color: "#1A1A2E", cursor: "pointer", fontSize: 12, fontWeight: 600,
-                display: "flex", alignItems: "center", gap: 6,
-              }}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6B7280" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-                Settings
-              </button>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              {!canEdit && (
+                <span style={{
+                  fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 8,
+                  background: "#FEF3C7", color: "#92400E", border: "1px solid rgba(217,119,6,0.2)",
+                }}>View Only</span>
+              )}
+              {canEdit && (
+                <button onClick={openSettingsModal} style={{
+                  padding: "8px 14px", borderRadius: 10,
+                  border: "1px solid #E8EAED", background: "#FFFFFF",
+                  color: "#1A1A2E", cursor: "pointer", fontSize: 12, fontWeight: 600,
+                  display: "flex", alignItems: "center", gap: 6,
+                }}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6B7280" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                  Settings
+                </button>
+              )}
               <button onClick={refresh} style={{
                 padding: "8px 14px", borderRadius: 10,
                 border: "1px solid #E8EAED", background: "#FFFFFF",
@@ -628,7 +651,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
               ) : null}
 
               {/* Upload new file tile */}
-              <label style={{
+              {canEdit && (<label style={{
                 padding: "16px 14px", borderRadius: 14, textAlign: "center",
                 background: "#FAFBFC", border: "2px dashed #E8EAED",
                 cursor: "pointer", transition: "border-color 0.15s, background 0.15s",
@@ -655,7 +678,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                     await uploadFile(projectId, e, refresh);
                   }}
                 />
-              </label>
+              </label>)}
             </div>
           </div>
 
@@ -670,8 +693,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                 const s = (project?.status || "").toLowerCase();
                 const done = s === "ready";
                 const fail = s === "failed";
-                const reviewing = s === "awaiting_alignment_review" || s === "awaiting_room_review";
-                const run = !["created","uploaded","ready","ready_no_mask","failed","awaiting_alignment_review","awaiting_room_review"].includes(s);
+                const reviewing = s === "awaiting_alignment_review" || s === "awaiting_room_review" || s === "awaiting_floor_review";
+                const run = !["created","uploaded","ready","ready_no_mask","failed","awaiting_alignment_review","awaiting_room_review","awaiting_floor_review"].includes(s);
                 const canOpenEditor = done || reviewing;
                 return (
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
@@ -725,10 +748,10 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                             <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
                             <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
                           </svg>
-                          Open Editor
+                          {canEdit ? "Open Editor" : "View Editor"}
                         </button>
                       ) : null}
-                      {!run && !canOpenEditor ? (
+                      {canEdit && !run && !canOpenEditor ? (
                         <button onClick={runPipeline} style={{
                           padding: "10px 20px", borderRadius: 12,
                           border: "none",
@@ -910,7 +933,18 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           <span style={{ fontSize: 13, color: "#6B7280" }}>{project?.name || "Project"}</span>
         </div>
         <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
-        {isAwaitingAlignmentReview ? (
+        {isAwaitingFloorReview && project?.files?.render_png && mapping ? (
+          <FloorPlanReview
+            renderUrl={apiUrl(project.files.render_png)}
+            mapping={mapping}
+            floorPlans={floorPlans}
+            onConfirm={continuePipelineAfterFloorReview}
+            onAddFloorPlan={addFloorPlan}
+            onDeleteFloorPlan={deleteFloorPlan}
+            onRefresh={refresh}
+            canEdit={canEdit}
+          />
+        ) : isAwaitingAlignmentReview ? (
           floorPlans.length > 0 ? (
             /* ── Floor-plan-based alignment review ── */
             <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
@@ -954,6 +988,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                         onUploadAlignedMask={uploadAlignedMaskFile}
                         onRefresh={refresh}
                         blockLabel={floorPlans.length > 1 ? `Block ${fp.block_index + 1} of ${floorPlans.length}` : undefined}
+                        canEdit={canEdit}
                       />
                     );
                   }
@@ -973,6 +1008,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
               onContinue={continuePipelineAfterAlignment}
               onUploadAlignedMask={uploadAlignedMaskFile}
               onRefresh={refresh}
+              canEdit={canEdit}
             />
           ) : (
             <div style={styles.emptyState}>
@@ -1027,6 +1063,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                       nbcEquipment={project?.nbc_evaluation?.equipment || []}
                       onSave={saveRoomsOnly}
                       onContinue={saveRoomsAndContinue}
+                      canEdit={canEdit}
                     />
                   );
                 })()}
@@ -1040,6 +1077,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
               nbcEquipment={project?.nbc_evaluation?.equipment || []}
               onSave={saveRoomsOnly}
               onContinue={saveRoomsAndContinue}
+              canEdit={canEdit}
             />
           )
         ) : !project?.files?.render_png || !mapping ? (
@@ -1097,6 +1135,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                       exportPngUrl={project?.files?.output_preview_png ? apiUrl(project.files.output_preview_png) : null}
                       onSave={saveLayout}
                       onChanged={refresh}
+                      canEdit={canEdit}
                     />
                   );
                 })()}
@@ -1114,6 +1153,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
               exportPngUrl={project?.files?.output_preview_png ? apiUrl(project.files.output_preview_png) : null}
               onSave={saveLayout}
               onChanged={refresh}
+              canEdit={canEdit}
             />
           )
         )}
@@ -1264,6 +1304,360 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   );
 }
 
+// ─── Floor Plan Review Component ─────────────────────────────────────────────
+
+function FloorPlanReview({
+  renderUrl,
+  mapping,
+  floorPlans,
+  onConfirm,
+  onAddFloorPlan,
+  onDeleteFloorPlan,
+  onRefresh,
+  canEdit = true,
+}: {
+  renderUrl: string;
+  mapping: Mapping;
+  floorPlans: FloorPlan[];
+  onConfirm: () => Promise<void>;
+  onAddFloorPlan: (pixelBbox: number[]) => Promise<void>;
+  onDeleteFloorPlan: (fpId: string) => Promise<void>;
+  onRefresh: () => Promise<void>;
+  canEdit?: boolean;
+}) {
+  const [imgDims, setImgDims] = useState<{ w: number; h: number } | null>(null);
+  const [isConfirming, setIsConfirming] = useState(false);
+  const [drawMode, setDrawMode] = useState(false);
+  const [drawStart, setDrawStart] = useState<{ px: number; py: number } | null>(null);
+  const [drawEnd, setDrawEnd] = useState<{ px: number; py: number } | null>(null);
+  const [hoveredFp, setHoveredFp] = useState<string | null>(null);
+  const [isAdding, setIsAdding] = useState(false);
+  const svgRef = useRef<SVGSVGElement>(null);
+
+  const COLORS = ["#2563EB", "#DC2626", "#059669", "#D97706", "#7C3AED", "#DB2777", "#0891B2", "#65A30D"];
+
+  function fpColor(index: number) {
+    return COLORS[index % COLORS.length];
+  }
+
+  function worldBboxToPixelRect(wb: { xmin: number; ymin: number; xmax: number; ymax: number }) {
+    const tl = worldToPixel(mapping, wb.xmin, wb.ymax);
+    const br = worldToPixel(mapping, wb.xmax, wb.ymin);
+    return {
+      x: Math.min(tl.px, br.px),
+      y: Math.min(tl.py, br.py),
+      width: Math.abs(br.px - tl.px),
+      height: Math.abs(br.py - tl.py),
+    };
+  }
+
+  function toImagePoint(e: React.MouseEvent<SVGSVGElement>) {
+    const svg = svgRef.current;
+    if (!svg || !imgDims) return null;
+    const rect = svg.getBoundingClientRect();
+    const scaleX = imgDims.w / rect.width;
+    const scaleY = imgDims.h / rect.height;
+    return {
+      px: (e.clientX - rect.left) * scaleX,
+      py: (e.clientY - rect.top) * scaleY,
+    };
+  }
+
+  async function handleConfirm() {
+    setIsConfirming(true);
+    try {
+      await onConfirm();
+    } finally {
+      setIsConfirming(false);
+    }
+  }
+
+  async function handleFinishDraw() {
+    if (!drawStart || !drawEnd) return;
+    const x0 = Math.round(Math.min(drawStart.px, drawEnd.px));
+    const y0 = Math.round(Math.min(drawStart.py, drawEnd.py));
+    const x1 = Math.round(Math.max(drawStart.px, drawEnd.px));
+    const y1 = Math.round(Math.max(drawStart.py, drawEnd.py));
+    if (x1 - x0 < 10 || y1 - y0 < 10) return;
+    setIsAdding(true);
+    try {
+      await onAddFloorPlan([x0, y0, x1, y1]);
+      setDrawStart(null);
+      setDrawEnd(null);
+      setDrawMode(false);
+    } finally {
+      setIsAdding(false);
+    }
+  }
+
+  const drawRect = drawStart && drawEnd
+    ? {
+        x: Math.min(drawStart.px, drawEnd.px),
+        y: Math.min(drawStart.py, drawEnd.py),
+        width: Math.abs(drawEnd.px - drawStart.px),
+        height: Math.abs(drawEnd.py - drawStart.py),
+      }
+    : null;
+
+  return (
+    <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column" }}>
+      {/* Toolbar */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 10, padding: "10px 14px",
+        borderBottom: "1px solid #E8EAED", background: "#FAFBFC", flexShrink: 0,
+        flexWrap: "wrap",
+      }}>
+        <span style={{ fontSize: 14, fontWeight: 700, color: "#1A1A2E" }}>
+          Review Floor Plans
+        </span>
+        <span style={{ fontSize: 12, color: "#6B7280" }}>
+          {floorPlans.length} floor plan{floorPlans.length !== 1 ? "s" : ""} detected
+        </span>
+        <div style={{ flex: 1 }} />
+        {canEdit && (
+        <button
+          onClick={() => {
+            setDrawMode(!drawMode);
+            setDrawStart(null);
+            setDrawEnd(null);
+          }}
+          style={{
+            padding: "7px 14px", borderRadius: 10, fontSize: 12, fontWeight: 600,
+            cursor: "pointer",
+            border: drawMode ? "2px solid #2D6A4F" : "1px solid #E8EAED",
+            background: drawMode ? "#D8F3DC" : "#FFFFFF",
+            color: drawMode ? "#1A3C34" : "#1A1A2E",
+            display: "flex", alignItems: "center", gap: 6,
+          }}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+          {drawMode ? "Drawing..." : "Add Floor Plan"}
+        </button>
+        )}
+        <button onClick={onRefresh} style={{
+          padding: "7px 14px", borderRadius: 10, border: "1px solid #E8EAED",
+          background: "#FFFFFF", color: "#1A1A2E", cursor: "pointer",
+          fontSize: 12, fontWeight: 600,
+        }}>Refresh</button>
+        {canEdit && (
+        <button
+          onClick={handleConfirm}
+          disabled={isConfirming || floorPlans.length === 0}
+          style={{
+            padding: "7px 18px", borderRadius: 10, border: "none",
+            background: "#2D6A4F", color: "#fff", cursor: "pointer",
+            fontSize: 12, fontWeight: 700,
+            boxShadow: "0 4px 12px rgba(45,106,79,0.3)",
+            opacity: isConfirming || floorPlans.length === 0 ? 0.6 : 1,
+          }}
+        >
+          {isConfirming ? "Confirming..." : "Confirm & Continue"}
+        </button>
+        )}
+      </div>
+
+      {/* Content area: image + sidebar legend */}
+      <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+        {/* Image area */}
+        <div style={{ flex: 1, overflow: "auto", padding: 12, background: "#F0F2F5" }}>
+          <div style={{ position: "relative", display: "inline-block" }}>
+            <img
+              src={renderUrl}
+              alt="Master render"
+              onLoad={(e) => {
+                const img = e.currentTarget;
+                setImgDims({ w: img.naturalWidth, h: img.naturalHeight });
+              }}
+              style={{ display: "block", userSelect: "none", pointerEvents: "none", maxWidth: "100%" }}
+              draggable={false}
+            />
+            {imgDims && (
+              <svg
+                ref={svgRef}
+                width="100%"
+                height="100%"
+                viewBox={`0 0 ${imgDims.w} ${imgDims.h}`}
+                style={{
+                  position: "absolute", left: 0, top: 0,
+                  cursor: drawMode ? "crosshair" : "default",
+                }}
+                onMouseDown={(e) => {
+                  if (!drawMode) return;
+                  const pt = toImagePoint(e);
+                  if (pt) {
+                    setDrawStart(pt);
+                    setDrawEnd(pt);
+                  }
+                }}
+                onMouseMove={(e) => {
+                  if (!drawMode || !drawStart) return;
+                  const pt = toImagePoint(e);
+                  if (pt) setDrawEnd(pt);
+                }}
+                onMouseUp={() => {
+                  if (!drawMode || !drawStart || !drawEnd) return;
+                  // Keep the rectangle drawn, user clicks "Add" button or we auto-add
+                  handleFinishDraw();
+                }}
+              >
+                {/* Existing floor plan bounding boxes */}
+                {floorPlans.map((fp, i) => {
+                  if (!fp.world_bbox) return null;
+                  const rect = worldBboxToPixelRect(fp.world_bbox);
+                  const color = fpColor(i);
+                  const isHovered = hoveredFp === fp.id;
+                  return (
+                    <g key={fp.id}
+                      onMouseEnter={() => setHoveredFp(fp.id)}
+                      onMouseLeave={() => setHoveredFp(null)}
+                    >
+                      <rect
+                        x={rect.x} y={rect.y} width={rect.width} height={rect.height}
+                        fill={isHovered ? `${color}22` : `${color}11`}
+                        stroke={color} strokeWidth={isHovered ? 4 : 2.5}
+                        strokeDasharray={isHovered ? "none" : "8 4"}
+                        rx={4}
+                      />
+                      {/* Label */}
+                      <rect
+                        x={rect.x} y={rect.y - 24}
+                        width={Math.max(80, 16 + (`Floor ${i + 1}`).length * 8)}
+                        height={22} rx={4}
+                        fill={color} opacity={0.9}
+                      />
+                      <text
+                        x={rect.x + 8} y={rect.y - 8}
+                        fill="#fff" fontSize={13} fontWeight={700}
+                        fontFamily="system-ui, sans-serif"
+                      >
+                        Floor {i + 1}
+                      </text>
+                    </g>
+                  );
+                })}
+
+                {/* Drawing rectangle */}
+                {drawMode && drawRect && (
+                  <rect
+                    x={drawRect.x} y={drawRect.y}
+                    width={drawRect.width} height={drawRect.height}
+                    fill="rgba(45,106,79,0.12)"
+                    stroke="#2D6A4F" strokeWidth={3}
+                    strokeDasharray="8 4"
+                    rx={4}
+                  />
+                )}
+              </svg>
+            )}
+            {isAdding && (
+              <div style={{
+                position: "absolute", inset: 0,
+                background: "rgba(0,0,0,0.15)",
+                display: "grid", placeItems: "center",
+              }}>
+                <div style={{
+                  padding: "12px 24px", borderRadius: 12,
+                  background: "#fff", boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
+                  fontSize: 13, fontWeight: 600, color: "#1A1A2E",
+                }}>Adding floor plan...</div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Sidebar legend */}
+        <div style={{
+          width: 260, flexShrink: 0, borderLeft: "1px solid #E8EAED",
+          background: "#FFFFFF", padding: "14px", overflow: "auto",
+        }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#1A1A2E", marginBottom: 12 }}>
+            Detected Floor Plans
+          </div>
+          {floorPlans.length === 0 ? (
+            <div style={{ fontSize: 12, color: "#9CA3AF", padding: "8px 0" }}>
+              No floor plans detected. Use "Add Floor Plan" to mark areas manually.
+            </div>
+          ) : null}
+          {floorPlans.map((fp, i) => {
+            const color = fpColor(i);
+            return (
+              <div
+                key={fp.id}
+                onMouseEnter={() => setHoveredFp(fp.id)}
+                onMouseLeave={() => setHoveredFp(null)}
+                style={{
+                  display: "flex", alignItems: "center", gap: 10,
+                  padding: "8px 10px", borderRadius: 10, marginBottom: 6,
+                  background: hoveredFp === fp.id ? "#F0FDF4" : "#FAFBFC",
+                  border: hoveredFp === fp.id ? `1px solid ${color}40` : "1px solid #E8EAED",
+                  transition: "background 0.15s, border 0.15s",
+                }}
+              >
+                <div style={{
+                  width: 14, height: 14, borderRadius: 4,
+                  background: color, flexShrink: 0,
+                }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "#1A1A2E" }}>
+                    Floor {i + 1}
+                  </div>
+                  <div style={{ fontSize: 10, color: "#9CA3AF" }}>
+                    Block {fp.block_index}
+                  </div>
+                </div>
+                {fp.files?.render_png && (
+                  <img
+                    src={fp.files.render_png.startsWith("/") ? `${resolveApiBase()}${fp.files.render_png}` : fp.files.render_png}
+                    alt={`Floor ${i + 1}`}
+                    style={{ width: 40, height: 40, objectFit: "contain", borderRadius: 6, border: "1px solid #E8EAED" }}
+                  />
+                )}
+                {canEdit && (
+                <button
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    await onDeleteFloorPlan(fp.id);
+                  }}
+                  title="Remove floor plan"
+                  style={{
+                    background: "none", border: "none", cursor: "pointer",
+                    color: "#DC2626", fontSize: 16, padding: "2px 6px",
+                    borderRadius: 6, lineHeight: 1,
+                  }}
+                >
+                  &times;
+                </button>
+                )}
+              </div>
+            );
+          })}
+
+          {drawMode && (
+            <div style={{
+              marginTop: 12, padding: "10px", borderRadius: 10,
+              background: "#EFF6FF", border: "1px solid rgba(37,99,235,0.2)",
+              fontSize: 12, color: "#1E40AF", lineHeight: 1.5,
+            }}>
+              Click and drag on the image to draw a rectangle around a floor plan.
+            </div>
+          )}
+
+          <div style={{
+            marginTop: 16, padding: "10px", borderRadius: 10,
+            background: "#FEFCE8", border: "1px solid rgba(217,119,6,0.2)",
+            fontSize: 11, color: "#92400E", lineHeight: 1.5,
+          }}>
+            Review the detected floor plans. You can add more by clicking "Add Floor Plan" and drawing a box, or remove incorrect ones by clicking &times;.
+            When satisfied, click "Confirm & Continue".
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AlignmentReview({
   originalUrl,
   alignedUrl,
@@ -1271,6 +1665,7 @@ function AlignmentReview({
   onUploadAlignedMask,
   onRefresh,
   blockLabel,
+  canEdit = true,
 }: {
   originalUrl: string;
   alignedUrl: string;
@@ -1278,6 +1673,7 @@ function AlignmentReview({
   onUploadAlignedMask: (e: any) => Promise<void>;
   onRefresh: () => Promise<void>;
   blockLabel?: string;
+  canEdit?: boolean;
 }) {
   const [origDims, setOrigDims] = useState<{w:number; h:number} | null>(null);
   const [maskDims, setMaskDims] = useState<{w:number; h:number} | null>(null);
@@ -1479,6 +1875,8 @@ function AlignmentReview({
         <span style={{ fontSize: 12, color: "#D8F3DC" }}>{Math.round(viewZoom * 100)}%</span>
 
         <button onClick={() => { setOffsetX(0); setOffsetY(0); setScale(1); setViewZoom(1); setBoxScaleX(1); setBoxScaleY(1); }} style={toolBtn(false)}>Reset</button>
+        {canEdit && (
+        <>
         <label style={{ fontSize: 12, color: "#D8F3DC", marginLeft: 6 }}>Replace mask</label>
         <input
           type="file"
@@ -1486,10 +1884,14 @@ function AlignmentReview({
           onChange={onUploadAlignedMask}
           style={{ width: 220 }}
         />
+        </>
+        )}
         <button onClick={onRefresh} style={toolBtn(false)}>Refresh</button>
+        {canEdit && (
         <button onClick={continueWithAdjustedMask} style={toolBtn(true)} disabled={isContinuing}>
           {isContinuing ? "Continuing..." : "Continue Pipeline"}
         </button>
+        )}
       </div>
 
       <div
@@ -1674,7 +2076,7 @@ type NBCEquipmentItem = {
 
 /* ── Wrapper: loads floor-plan mapping then renders RoomEditor ── */
 function FloorPlanRoomEditor({
-  renderUrl, mappingUrl, projectId, floorPlanId, nbcEquipment, onSave, onContinue,
+  renderUrl, mappingUrl, projectId, floorPlanId, nbcEquipment, onSave, onContinue, canEdit = true,
 }: {
   renderUrl: string;
   mappingUrl: string;
@@ -1683,6 +2085,7 @@ function FloorPlanRoomEditor({
   nbcEquipment: NBCEquipmentItem[];
   onSave: (rooms: Room[]) => Promise<void>;
   onContinue: (rooms: Room[]) => Promise<void>;
+  canEdit?: boolean;
 }) {
   const [fpMapping, setFpMapping] = useState<Mapping | null>(null);
   useEffect(() => {
@@ -1703,13 +2106,14 @@ function FloorPlanRoomEditor({
       nbcEquipment={nbcEquipment}
       onSave={onSave}
       onContinue={onContinue}
+      canEdit={canEdit}
     />
   );
 }
 
 /* ── Wrapper: loads floor-plan mapping + detectors then renders Editor ── */
 function FloorPlanEditor({
-  renderUrl, mappingUrl, projectId, floorPlanId, floorPlan, isReady, exportDxfUrl, exportPngUrl, onSave, onChanged,
+  renderUrl, mappingUrl, projectId, floorPlanId, floorPlan, isReady, exportDxfUrl, exportPngUrl, onSave, onChanged, canEdit = true,
 }: {
   renderUrl: string;
   mappingUrl: string;
@@ -1721,6 +2125,7 @@ function FloorPlanEditor({
   exportPngUrl: string | null;
   onSave: () => void;
   onChanged: () => void;
+  canEdit?: boolean;
 }) {
   const [fpMapping, setFpMapping] = useState<Mapping | null>(null);
   const [fpDetectors, setFpDetectors] = useState<Detector[]>([]);
@@ -1762,6 +2167,7 @@ function FloorPlanEditor({
       exportPngUrl={exportPngUrl}
       onSave={onSave}
       onChanged={() => { loadData(); onChanged(); }}
+      canEdit={canEdit}
     />
   );
 }
@@ -1774,6 +2180,7 @@ function RoomEditor({
   floorPlanId,
   onSave,
   onContinue,
+  canEdit = true,
 }: {
   renderUrl: string;
   mapping: Mapping;
@@ -1782,6 +2189,7 @@ function RoomEditor({
   floorPlanId?: string | null;
   onSave: (rooms: Room[]) => Promise<void>;
   onContinue: (rooms: Room[]) => Promise<void>;
+  canEdit?: boolean;
 }) {
   // ── Room state ──
   const [rooms, setRooms] = useState<Room[]>([]);
@@ -1899,17 +2307,20 @@ function RoomEditor({
   useEffect(() => { loadDetectors(); }, [projectId, floorPlanId]);
   useEffect(() => { loadPipesData(); }, [projectId, floorPlanId]);
 
-  // ── Keyboard shortcuts for pipe editing ──
+  // ── Keyboard shortcuts for pipe editing & bulk delete ──
   useEffect(() => {
     function handleKey(e: KeyboardEvent) {
       if (e.key === "Delete" || e.key === "Backspace") {
         if ((editorMode === "pipe_select" || editorMode === "pipe_draw") && selectedPipeIdx !== null) {
           deletePipe(selectedPipeIdx);
+        } else if (selectedDetectorIds.length > 0 && canEdit) {
+          deleteDetectorsMany(selectedDetectorIds);
         }
       }
       if (e.key === "Escape") {
         if (pipeDrawStart) { setPipeDrawStart(null); setPipeDrawEnd(null); }
         if (selectedPipeIdx !== null) setSelectedPipeIdx(null);
+        if (selectedDetectorIds.length > 0) setSelectedDetectorIds([]);
       }
     }
     window.addEventListener("keydown", handleKey);
@@ -2033,6 +2444,13 @@ function RoomEditor({
 
   function deleteDetector(detId: string) {
     setDetectors(prev => prev.filter(d => d.id !== detId));
+  }
+
+  function deleteDetectorsMany(ids: string[]) {
+    if (!ids.length) return;
+    const idSet = new Set(ids);
+    setDetectors(prev => prev.filter(d => !idSet.has(d.id)));
+    setSelectedDetectorIds(prev => prev.filter(id => !idSet.has(id)));
   }
 
   function moveDetectorsToMany(nextPxById: Record<string, {px:number; py:number}>) {
@@ -2245,7 +2663,24 @@ function RoomEditor({
   // ── Save & Continue ──
   async function handleContinue() {
     setIsContinuing(true);
-    try { await onContinue(rooms); } finally { setIsContinuing(false); }
+    try {
+      // Save all user state (rooms + detectors + pipes) before finalizing
+      const payload: any = {
+        rooms,
+        detectors: detectors.map(d => ({
+          id: d.id, x: d.x, y: d.y, z: d.z,
+          dtype: d.dtype, locked: d.locked,
+          floor_plan_id: d.floor_plan_id,
+        })),
+        pipes: pipesData || undefined,
+        floor_plan_id: floorPlanId || undefined,
+      };
+      await authFetch(`/api/projects/${projectId}/bulk_save`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+      await onContinue(rooms);
+    } finally { setIsContinuing(false); }
   }
 
   async function handleSaveRooms() {
@@ -2335,17 +2770,22 @@ function RoomEditor({
                   </button>
                   <div style={{ width: 1, height: 20, background: "#E8EAED" }} />
                   <button onClick={() => { setEditorMode("select"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "select")}>Select</button>
-                  <button onClick={() => { setEditorMode("add"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "add")}>Add</button>
-                  <button onClick={() => { setEditorMode("erase"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "erase")}>Erase</button>
+                  {canEdit && <button onClick={() => { setEditorMode("add"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "add")}>Add</button>}
+                  {canEdit && <button onClick={() => { setEditorMode("erase"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "erase")}>Erase</button>}
                   <button onClick={() => { setEditorMode("pan"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "pan")}>Pan</button>
+                  {canEdit && (
+                  <>
                   <div style={{ width: 1, height: 20, background: "#E8EAED" }} />
                   <button onClick={() => { setEditorMode("pipe_draw"); setSplitMode(false); resetSplitState(); setSelectedPipeIdx(null); setPipeDrawStart(null); setPipeDrawEnd(null); }} style={ceToolBtn(editorMode === "pipe_draw" || editorMode === "pipe_select")}>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
                     Pipes
                   </button>
+                  </>
+                  )}
                   {selectedDetectorIds.length > 0 ? (
                     <>
                       <span style={{ fontSize: 12, color: "#6B7280", marginLeft: 4 }}>Selected: {selectedDetectorIds.length}</span>
+                      {canEdit && <button onClick={() => deleteDetectorsMany(selectedDetectorIds)} style={{ ...ceToolBtn(false), color: "#DC2626", borderColor: "#FECACA" }}>Delete Selected</button>}
                       <button onClick={() => setSelectedDetectorIds([])} style={ceToolBtn(false)}>Clear</button>
                     </>
                   ) : null}
@@ -2481,8 +2921,12 @@ function RoomEditor({
                           } else { setMarquee({ sx: px, sy: py, ex: px, ey: py }); }
                           return;
                         }
-                        if (editorMode === "add") { addDetectorAt(px, py); return; }
-                        if (editorMode === "erase" && detId) { deleteDetector(detId); }
+                        if (editorMode === "add") { if (canEdit) addDetectorAt(px, py); return; }
+                        if (editorMode === "erase") {
+                          if (detId) { if (canEdit) deleteDetector(detId); }
+                          else { setMarquee({ sx: px, sy: py, ex: px, ey: py }); }
+                          return;
+                        }
                       }}
                       onMouseMove={(e) => {
                         const point = toImagePoint(e);
@@ -2498,7 +2942,7 @@ function RoomEditor({
                           setPipeDrawEnd(point);
                           return;
                         }
-                        if (editorMode !== "select") return;
+                        if (editorMode !== "select" && editorMode !== "erase") return;
                         if (marquee) { setMarquee({ ...marquee, ex: point.px, ey: point.py }); return; }
                         if (!groupDrag) return;
                         const dx = point.px - groupDrag.start.px;
@@ -2527,10 +2971,15 @@ function RoomEditor({
                           setPipeDrawEnd(null);
                           return;
                         }
-                        if (editorMode !== "select") return;
+                        if (editorMode !== "select" && editorMode !== "erase") return;
                         if (marquee) {
                           const rect = rectFromPoints({ px: marquee.sx, py: marquee.sy }, { px: marquee.ex, py: marquee.ey });
-                          setSelectedDetectorIds(idsInRect(rect));
+                          if (editorMode === "erase" && canEdit) {
+                            const ids = idsInRect(rect);
+                            deleteDetectorsMany(ids);
+                          } else {
+                            setSelectedDetectorIds(idsInRect(rect));
+                          }
                           setMarquee(null);
                           return;
                         }
@@ -2550,6 +2999,7 @@ function RoomEditor({
                       }}
                       onContextMenu={(e) => {
                         e.preventDefault();
+                        if (!canEdit) return;
                         if (editorMode === "rooms") return;
                         const point = toImagePoint(e);
                         if (!point) return;
@@ -2706,10 +3156,13 @@ function RoomEditor({
                       {/* Marquee selection */}
                       {marquee ? (() => {
                         const rect = rectFromPoints({ px: marquee.sx, py: marquee.sy }, { px: marquee.ex, py: marquee.ey });
+                        const isEraseMarquee = editorMode === "erase";
                         return (
                           <rect x={rect.left} y={rect.top}
                             width={Math.max(1, rect.right - rect.left)} height={Math.max(1, rect.bottom - rect.top)}
-                            fill="rgba(45,106,79,0.12)" stroke="#2D6A4F" strokeWidth={2} strokeDasharray="6 4" />
+                            fill={isEraseMarquee ? "rgba(220,38,38,0.15)" : "rgba(45,106,79,0.12)"}
+                            stroke={isEraseMarquee ? "#DC2626" : "#2D6A4F"}
+                            strokeWidth={2} strokeDasharray="6 4" />
                         );
                       })() : null}
 
@@ -2802,7 +3255,7 @@ function RoomEditor({
                       )}
                       <span style={{ fontSize: 11, color: "#9CA3AF" }}>{room.polygon_px.length} pts</span>
                     </div>
-                    {isSelected ? (
+                    {isSelected && canEdit ? (
                       <div style={{ marginTop: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
                         <button onClick={(e) => { e.stopPropagation(); handleRenameStart(room); }} style={ceRoomBtn}>Rename</button>
                         <button onClick={(e) => { e.stopPropagation(); resetSplitState(); setSplitMode(true); setEditorMode("rooms"); }} style={ceRoomBtn}>Split</button>
@@ -2818,11 +3271,14 @@ function RoomEditor({
           <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
             <div style={{ padding: "10px 14px 6px" }}>
               <p style={{ margin: 0, fontSize: 12, color: "#6B7280", lineHeight: 1.4 }}>
-                Auto-place equipment based on NBC rules, or manually place using the toolbar.
+                {canEdit
+                  ? "Auto-place equipment based on NBC rules, or manually place using the toolbar."
+                  : "Equipment placement (view only). You need editor or admin role to modify."}
               </p>
             </div>
 
             {/* Per-equipment auto-place buttons */}
+            {canEdit && (
             <div style={{ padding: "6px 14px", display: "flex", flexDirection: "column", gap: 6 }}>
               {(() => {
                 const EQUIPMENT_BUTTONS: { key: string; dtype: string; label: string; icon: React.ReactNode }[] = [
@@ -2930,9 +3386,10 @@ function RoomEditor({
                 });
               })()}
             </div>
+            )}
 
             {/* Connect Pipes button */}
-            {(() => {
+            {canEdit && (() => {
               const sprinklerCount = detectors.filter(d => d.dtype === "sprinkler").length;
               if (sprinklerCount === 0) return null;
               return (
@@ -3109,6 +3566,7 @@ function RoomEditor({
         ) : null}
 
         {/* Bottom action bar */}
+        {canEdit && (
         <div style={{ padding: "12px 14px", borderTop: "1px solid #E8EAED", display: "flex", gap: 8, flexShrink: 0 }}>
           {splitMode ? (
             <button onClick={() => { setSplitMode(false); resetSplitState(); }} style={{ ...ceRoomBtn, flex: 1, background: "rgba(220,38,38,0.06)" }}>
@@ -3149,6 +3607,7 @@ function RoomEditor({
             {isContinuing ? "Finalizing..." : "Finalize & Export"}
           </button>
         </div>
+        )}
       </div>
     </div>
   );
@@ -3409,7 +3868,7 @@ async function uploadFile(projectId: string, e: any, refresh: ()=>void) {
 }
 
 function Editor({
-  renderUrl, mapping, detectors: detectorsProp, projectId, isReady, pipesData: pipesProp, floorPlanId, exportDxfUrl, exportPngUrl, onSave, onChanged
+  renderUrl, mapping, detectors: detectorsProp, projectId, isReady, pipesData: pipesProp, floorPlanId, exportDxfUrl, exportPngUrl, onSave, onChanged, canEdit = true,
 }: {
   renderUrl: string;
   mapping: Mapping;
@@ -3422,9 +3881,11 @@ function Editor({
   exportPngUrl: string | null;
   onSave: ()=>void;
   onChanged: ()=>void;
+  canEdit?: boolean;
 }) {
   const [imgDims, setImgDims] = useState<{w:number;h:number}|null>(null);
-  const [tool, setTool] = useState<"select"|"add"|"erase"|"pan">("select");
+  const readOnly = isReady;
+  const [tool, setTool] = useState<"select"|"add"|"erase"|"pan">(isReady ? "pan" : "select");
   const [addType, setAddType] = useState<ObjectType>("smoke");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [marquee, setMarquee] = useState<{sx:number; sy:number; ex:number; ey:number} | null>(null);
@@ -3615,6 +4076,13 @@ function Editor({
     setDetectors(prev => prev.filter(d => d.id !== detId));
   }
 
+  function deleteDetectorsMany(ids: string[]) {
+    if (!ids.length) return;
+    const idSet = new Set(ids);
+    setDetectors(prev => prev.filter(d => !idSet.has(d.id)));
+    setSelectedIds(prev => prev.filter(id => !idSet.has(id)));
+  }
+
   function toImagePoint(e: any): { px: number; py: number } | null {
     if (!imgDims) return null;
     const rect = (e.currentTarget as any).getBoundingClientRect();
@@ -3710,10 +4178,11 @@ function Editor({
                 backdropFilter: "blur(8px)"
               }}
             >
-              <button onClick={() => setTool("select")} style={toolBtn(tool === "select")}>Select</button>
-              <button onClick={() => setTool("add")} style={toolBtn(tool === "add")}>Add</button>
-              <button onClick={() => setTool("erase")} style={toolBtn(tool === "erase")}>Erase</button>
+              {!readOnly && <button onClick={() => setTool("select")} style={toolBtn(tool === "select")}>Select</button>}
+              {!readOnly && canEdit && <button onClick={() => setTool("add")} style={toolBtn(tool === "add")}>Add</button>}
+              {!readOnly && canEdit && <button onClick={() => setTool("erase")} style={toolBtn(tool === "erase")}>Erase</button>}
               <button onClick={() => setTool("pan")} style={toolBtn(tool === "pan")}>Pan</button>
+              {!readOnly && canEdit && (
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 2 }}>
                 {OBJECT_TYPES.map((otype) => {
                   const active = addType === otype;
@@ -3733,21 +4202,26 @@ function Editor({
                   );
                 })}
               </div>
-              <span style={{ fontSize: 12, color: "#D8F3DC", marginLeft: 2 }}>
-                Selected: {selectedIds.length}
-              </span>
-              {selectedIds.length > 0 ? (
-                <button onClick={() => setSelectedIds([])} style={toolBtn(false)}>Clear</button>
-              ) : null}
-              {isReady ? (
+              )}
+              {!readOnly && (
+              <>
+                <span style={{ fontSize: 12, color: "#D8F3DC", marginLeft: 2 }}>
+                  Selected: {selectedIds.length}
+                </span>
+                {selectedIds.length > 0 ? (
+                  <>
+                    {canEdit && <button onClick={() => deleteDetectorsMany(selectedIds)} style={{ ...toolBtn(false), color: "#FF6B6B" }}>Delete Selected</button>}
+                    <button onClick={() => setSelectedIds([])} style={toolBtn(false)}>Clear</button>
+                  </>
+                ) : null}
+              </>
+              )}
+              {isReady && canEdit ? (
                 <>
-                  <button onClick={saveEdits} style={toolBtn(true)} disabled={isSaving}>
-                    {isSaving ? "Saving..." : "Save"}
-                  </button>
                   {exportDxfUrl ? (
                     <button
                       onClick={() => exportLatest("dxf")}
-                      disabled={isSaving || isExporting !== null}
+                      disabled={isExporting !== null}
                       style={{ ...toolBtn(false), textDecoration: "none", display: "inline-flex", alignItems: "center", justifyContent: "center" }}
                     >
                       {isExporting === "dxf" ? "Exporting DXF..." : "Export DXF"}
@@ -3756,7 +4230,7 @@ function Editor({
                   {exportPngUrl ? (
                     <button
                       onClick={() => exportLatest("png")}
-                      disabled={isSaving || isExporting !== null}
+                      disabled={isExporting !== null}
                       style={{ ...toolBtn(false), textDecoration: "none", display: "inline-flex", alignItems: "center", justifyContent: "center" }}
                     >
                       {isExporting === "png" ? "Exporting PNG..." : "Export PNG"}
@@ -3818,8 +4292,8 @@ function Editor({
                     width={imgDims.w}
                     height={imgDims.h}
                     viewBox={`0 0 ${imgDims.w} ${imgDims.h}`}
-                    style={{ position:"absolute", left:0, top:0, cursor: canvasCursor() }}
-                    onMouseDown={(e)=> {
+                    style={{ position:"absolute", left:0, top:0, cursor: readOnly ? "default" : canvasCursor() }}
+                    onMouseDown={readOnly ? undefined : (e)=> {
                       const point = toImagePoint(e);
                       if (!point) return;
                       const { px, py } = point;
@@ -3838,18 +4312,20 @@ function Editor({
                         return;
                       }
                       if (tool === "add") {
-                        addDetectorAt(px, py);
+                        if (canEdit) addDetectorAt(px, py);
                         return;
                       }
-                      if (tool === "erase" && id) {
-                        deleteDetector(id);
+                      if (tool === "erase") {
+                        if (id) { if (canEdit) deleteDetector(id); }
+                        else { setMarquee({ sx: px, sy: py, ex: px, ey: py }); }
+                        return;
                       }
                     }}
-                    onMouseMove={(e)=> {
+                    onMouseMove={readOnly ? undefined : (e)=> {
                       const point = toImagePoint(e);
                       if (!point) return;
                       setHoverPoint(point);
-                      if (tool !== "select") return;
+                      if (tool !== "select" && tool !== "erase") return;
                       if (marquee) {
                         setMarquee({ ...marquee, ex: point.px, ey: point.py });
                         return;
@@ -3865,13 +4341,17 @@ function Editor({
                       }
                       setGroupPreview(next);
                     }}
-                    onMouseUp={(e)=> {
-                      if (tool !== "select") return;
+                    onMouseUp={readOnly ? undefined : (e)=> {
+                      if (tool !== "select" && tool !== "erase") return;
                       if (marquee) {
                         const p1 = { px: marquee.sx, py: marquee.sy };
                         const p2 = { px: marquee.ex, py: marquee.ey };
                         const rect = rectFromPoints(p1, p2);
-                        setSelectedIds(idsInRect(rect));
+                        if (tool === "erase" && canEdit) {
+                          deleteDetectorsMany(idsInRect(rect));
+                        } else {
+                          setSelectedIds(idsInRect(rect));
+                        }
                         setMarquee(null);
                         return;
                       }
@@ -3880,7 +4360,7 @@ function Editor({
                       setGroupDrag(null);
                       setGroupPreview(null);
                     }}
-                    onMouseLeave={()=> {
+                    onMouseLeave={readOnly ? undefined : ()=> {
                       setHoverPoint(null);
                       if (marquee) setMarquee(null);
                       if (groupDrag) setGroupDrag(null);
@@ -3888,11 +4368,7 @@ function Editor({
                     }}
                     onContextMenu={(e)=> {
                       e.preventDefault();
-                      const point = toImagePoint(e);
-                      if (!point) return;
-                      const { px, py } = point;
-                      const id = hitTest(px, py);
-                      if (id) deleteDetector(id);
+                      if (readOnly || !canEdit) return;
                     }}
                   >
                     {/* Sprinkler pipes */}
@@ -3935,14 +4411,15 @@ function Editor({
                     })}
                     {marquee ? (() => {
                       const rect = rectFromPoints({ px: marquee.sx, py: marquee.sy }, { px: marquee.ex, py: marquee.ey });
+                      const isEraseMarquee = tool === "erase";
                       return (
                         <rect
                           x={rect.left}
                           y={rect.top}
                           width={Math.max(1, rect.right - rect.left)}
                           height={Math.max(1, rect.bottom - rect.top)}
-                          fill="rgba(82, 183, 136, 0.15)"
-                          stroke="#52B788"
+                          fill={isEraseMarquee ? "rgba(220,38,38,0.15)" : "rgba(82, 183, 136, 0.15)"}
+                          stroke={isEraseMarquee ? "#DC2626" : "#52B788"}
                           strokeWidth={2}
                           strokeDasharray="6 4"
                         />
