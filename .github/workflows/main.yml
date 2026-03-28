@@ -30,7 +30,7 @@ jobs:
     # 4. Build the Docker image and push it to the registry
     - name: Build and push Docker image
       run: |
-        docker build . -t ${{ secrets.REGISTRY_LOGIN_SERVER }}/firecad-api:${{ github.sha }}
+        docker build ./api -t ${{ secrets.REGISTRY_LOGIN_SERVER }}/firecad-api:${{ github.sha }}
         docker push ${{ secrets.REGISTRY_LOGIN_SERVER }}/firecad-api:${{ github.sha }}
 
     # 5. Tell the Container Instance to pull the new image and restart
