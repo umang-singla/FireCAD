@@ -66,7 +66,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY api/app /app/app
 
 # Copy .env so python-dotenv can load it at runtime
-COPY .env /app/.env
+#COPY .env /app/.env
 
 ENV PYTHONUNBUFFERED=1
 ENV ODA_PATH=/opt/oda/ODAFileConverter
