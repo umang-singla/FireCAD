@@ -1,46 +1,65 @@
-name: Build and Deploy FireCAD to ACI
+name: Deploy ACI
 
 on:
   push:
     branches:
-      - main # Change this if your main working branch is named differently
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RESOURCE_GROUP: FireCAD
+  LOCATION: eastus
+  ACR_NAME: firecadregistry
+  ACR_LOGIN_SERVER: firecadregistry.azurecr.io
+  IMAGE_NAME: firecad-api
+  CONTAINER_GROUP_NAME: firecad-api
+  ACR_PULL_ID: /subscriptions/11fa53d4-8489-49f7-8076-1c1cea18c2e1/resourceGroups/FireCAD/providers/Microsoft.ManagedIdentity/userAssignedIdentities/firecad-identity
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
-    # 1. Grab your latest code
-    - name: Checkout GitHub Action
-      uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    # 2. Log into your Azure account
-    - name: Login via Azure CLI
-      uses: azure/login@v1
-      with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Azure login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-    # 3. Log into your Container Registry
-    - name: Login to Azure Container Registry
-      uses: azure/docker-login@v1
-      with:
-        login-server: ${{ secrets.REGISTRY_LOGIN_SERVER }}
-        username: ${{ secrets.REGISTRY_USERNAME }}
-        password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Login to ACR
+        run: az acr login --name $ACR_NAME
 
-    # 4. Build the Docker image and push it to the registry
-    - name: Build and push Docker image
-      run: |
-        docker build ./api -t ${{ secrets.REGISTRY_LOGIN_SERVER }}/firecad-api:${{ github.sha }}
-        docker push ${{ secrets.REGISTRY_LOGIN_SERVER }}/firecad-api:${{ github.sha }}
+      - name: Build and push image
+        run: |
+          docker build -t $ACR_LOGIN_SERVER/$IMAGE_NAME:${GITHUB_SHA} .
+          docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:${GITHUB_SHA}
 
-    # 5. Tell the Container Instance to pull the new image and restart
-    - name: Deploy to Azure Container Instances
-      uses: azure/aci-deploy@v1
-      with:
-        resource-group: FireCAD
-        name: firecad-api
-        image: ${{ secrets.REGISTRY_LOGIN_SERVER }}/firecad-api:${{ github.sha }}
-        registry-login-server: ${{ secrets.REGISTRY_LOGIN_SERVER }}
-        registry-username: ${{ secrets.REGISTRY_USERNAME }}
-        registry-password: ${{ secrets.REGISTRY_PASSWORD }}
-        location: eastus
+      - name: Delete existing container group if present
+        run: |
+          az container delete \
+            --resource-group $RESOURCE_GROUP \
+            --name $CONTAINER_GROUP_NAME \
+            --yes || true
+
+      - name: Create ACI
+        run: |
+          az container create \
+            --resource-group $RESOURCE_GROUP \
+            --name $CONTAINER_GROUP_NAME \
+            --location $LOCATION \
+            --image $ACR_LOGIN_SERVER/$IMAGE_NAME:${GITHUB_SHA} \
+            --assign-identity $ACR_PULL_ID \
+            --acr-identity $ACR_PULL_ID \
+            --ip-address Public \
+            --dns-name-label ${CONTAINER_GROUP_NAME}-${GITHUB_RUN_NUMBER} \
+            --ports 80 8000\
+            --os-type Linux \
+            --cpu 1 \
+            --memory 1.5
