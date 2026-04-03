@@ -124,6 +124,7 @@ export default function Dashboard() {
   const [wizardStepIdx, setWizardStepIdx] = useState(0);
   // step 0: project name + DWG upload (required), step 1: common questions, step 2: followup questions, step 3: evaluation result
   const [wizardProjectName, setWizardProjectName] = useState("New Building");
+  const [wizardUnit, setWizardUnit] = useState("mm");
   const [nbcQuestions, setNbcQuestions] = useState<NBCQuestion[]>([]);
   const [nbcFollowups, setNbcFollowups] = useState<NBCQuestion[]>([]);
   const [nbcAnswers, setNbcAnswers] = useState<Record<string, any>>({});
@@ -159,6 +160,7 @@ export default function Dashboard() {
     setShowWizard(true);
     setWizardStepIdx(0);
     setWizardProjectName("New Building");
+    setWizardUnit("mm");
     setNbcAnswers({});
     setNbcFollowups([]);
     setNbcEvaluation(null);
@@ -206,7 +208,7 @@ export default function Dashboard() {
     try {
       const j: Project = await apiFetch("/api/projects", {
         method: "POST",
-        body: JSON.stringify({ name: wizardProjectName, nbc_answers: nbcAnswers }),
+        body: JSON.stringify({ name: wizardProjectName, nbc_answers: nbcAnswers, unit: wizardUnit }),
       });
       setProjects((prev) => [j, ...prev]);
       setShowWizard(false);
@@ -611,6 +613,19 @@ export default function Dashboard() {
                     style={WZ.input}
                     autoFocus
                   />
+                  <div style={{ marginTop: 8 }}>
+                    <label style={WZ.label}>Drawing Unit <span style={{ color: C.danger }}>*</span></label>
+                    <select
+                      value={wizardUnit}
+                      onChange={(e) => setWizardUnit(e.target.value)}
+                      style={WZ.select}
+                    >
+                      <option value="m">Meters (m)</option>
+                      <option value="mm">Millimeters (mm)</option>
+                      <option value="in">Inches (in)</option>
+                      <option value="ft">Feet (ft)</option>
+                    </select>
+                  </div>
                   <div style={{ marginTop: 8 }}>
                     <label style={WZ.label}>Upload DWG/DXF Drawing <span style={{ color: C.danger }}>*</span></label>
                     <div style={{

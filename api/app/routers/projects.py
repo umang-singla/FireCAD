@@ -139,9 +139,12 @@ def nbc_evaluate(payload: NBCEvaluatePayload):
 
 # ── Project CRUD ────────────────────────────────────────────
 
+from typing import Optional, Any, Dict, List
+
 class ProjectCreateWithNBC(BaseModel):
     name: str
     nbc_answers: Dict[str, Any]
+    unit: Optional[str] = "mm"
 
 @router.post("/projects", response_model=ProjectOut)
 def create_project(payload: ProjectCreateWithNBC, user=Depends(get_current_user)):
@@ -154,6 +157,10 @@ def create_project(payload: ProjectCreateWithNBC, user=Depends(get_current_user)
         "nbc_answers": payload.nbc_answers,
         "nbc_evaluation": nbc_result,
     }
+    if payload.unit:
+        settings["units"] = payload.unit
+        settings["qcad_input_unit"] = payload.unit
+
     pid = new_id()
     project_dir(pid)
     tid = user.get("active_tenant_id")
