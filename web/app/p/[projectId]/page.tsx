@@ -2532,11 +2532,19 @@ function RoomEditor({
         body: JSON.stringify({ equipment_type: equipmentType }),
       });
       const placed: Detector[] = await res.json();
-      // Merge: keep detectors of other types, replace this type with placed result
-      setDetectors(prev => [
-        ...prev.filter(d => d.dtype !== equipmentType),
-        ...placed.filter(d => d.dtype === equipmentType),
-      ]);
+
+      if (equipmentType === "mcp_hooter") {
+        setDetectors(prev => [
+          ...prev.filter(d => d.dtype !== "mcb" && d.dtype !== "hooter"),
+          ...placed.filter(d => d.dtype === "mcb" || d.dtype === "hooter"),
+        ]);
+      } else {
+        // Merge: keep detectors of other types, replace this type with placed result
+        setDetectors(prev => [
+          ...prev.filter(d => d.dtype !== equipmentType),
+          ...placed.filter(d => d.dtype === equipmentType),
+        ]);
+      }
     } catch (e) { console.error("Auto-place failed", e); }
     finally { setIsAutoPlacing(null); }
   }
@@ -2636,6 +2644,10 @@ function RoomEditor({
   }
 
   function clearEquipmentType(equipmentType: string) {
+    if (equipmentType === "mcp_hooter") {
+      setDetectors(prev => prev.filter(d => d.dtype !== "mcb" && d.dtype !== "hooter"));
+      return;
+    }
     setDetectors(prev => prev.filter(d => d.dtype !== equipmentType));
     if (equipmentType === "sprinkler") {
       setPipesData(null);
@@ -3284,6 +3296,24 @@ function RoomEditor({
               </p>
             </div>
 
+            {canEdit && (
+            <div style={{ padding: "0 14px 6px" }}>
+              <button
+                onClick={() => autoPlaceEquipment(addType === "mcb" || addType === "hooter" ? "mcp_hooter" : addType)}
+                disabled={!!isAutoPlacing || rooms.length === 0}
+                style={{
+                  width: "100%", padding: "8px 10px", borderRadius: 8,
+                  border: "none", background: "#2D6A4F", color: "#fff",
+                  fontWeight: 700, fontSize: 12,
+                  cursor: (!!isAutoPlacing || rooms.length === 0) ? "wait" : "pointer",
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                }}
+              >
+                {!!isAutoPlacing ? "Auto-placing..." : `Auto-place Selected (${addType === "mcb" || addType === "hooter" ? "MCP & Hooter" : addType})`}
+              </button>
+            </div>
+            )}
+
             {/* Per-equipment auto-place buttons */}
             {canEdit && (
             <div style={{ padding: "6px 14px", display: "flex", flexDirection: "column", gap: 6 }}>
@@ -3310,8 +3340,8 @@ function RoomEditor({
                     icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="6" y="4" width="12" height="16" rx="2"/><line x1="10" y1="2" x2="14" y2="2"/><line x1="12" y1="8" x2="12" y2="14"/></svg>,
                   },
                   {
-                    key: "manual_fire_alarm", dtype: "hooter",
-                    label: "Manual Fire Alarms",
+                    key: "manual_fire_alarm", dtype: "mcp_hooter",
+                    label: "MCP & Hooter",
                     icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>,
                   },
                 ];
@@ -3326,7 +3356,9 @@ function RoomEditor({
                   const nbcInfo = nbcMap[btn.key];
                   const isRequired = nbcInfo?.required ?? false;
                   const isPlacing = isAutoPlacing === btn.dtype;
-                  const placedCount = detCounts[btn.dtype] || 0;
+                  const placedCount = btn.dtype === "mcp_hooter"
+                    ? (detCounts["mcb"] || 0) + (detCounts["hooter"] || 0)
+                    : (detCounts[btn.dtype] || 0);
 
                   return (
                     <div key={btn.key} style={{

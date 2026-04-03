@@ -25,6 +25,7 @@ from app.pipeline.sprinkler_routing import (
     place_sprinklers_from_rooms_json,
     write_sprinklers_to_dxf,
 )
+from app.pipeline.mcp_hooter_placement import place_mcp_hooter_from_rooms_payload
 from app.pipeline.floor_plan_split import split_floor_plans
 from app.pipeline.floor_plan_split import _render_block
 from app.ws_manager import manager as ws_manager
@@ -100,6 +101,67 @@ def _replace_detectors(con, project_id: str, dets: list[dict], floor_plan_id: st
              int(d.get("locked",0)), d.get("floor_plan_id", floor_plan_id), now(), now())
         )
 
+def _replace_detectors_of_types(
+    con,
+    project_id: str,
+    dets: list[dict],
+    dtypes: list[str],
+    floor_plan_id: str | None = None,
+):
+    if not dtypes:
+        return
+    placeholders = ",".join(["?"] * len(dtypes))
+    args = [project_id]
+    where = "project_id=?"
+    if floor_plan_id:
+        where += " AND floor_plan_id=?"
+        args.append(floor_plan_id)
+    where += f" AND dtype IN ({placeholders})"
+    args.extend(dtypes)
+    con.execute(f"DELETE FROM detectors WHERE {where}", args)
+
+    for d in dets:
+        con.execute(
+            """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,floor_plan_id,created_at,updated_at)
+                 VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                d["id"], project_id, float(d["x"]), float(d["y"]), float(d.get("z", 0.0)),
+                d.get("dtype", "smoke"), int(d.get("locked", 0)), d.get("floor_plan_id", floor_plan_id),
+                now(), now(),
+            ),
+        )
+
+
+def _to_mcp_hooter_detectors(
+    station_points: list[tuple[float, float]],
+    world_to_m: float,
+    floor_plan_id: str | None = None,
+) -> list[dict]:
+    out: list[dict] = []
+    # Keep MCP/Hooter as a compact left/right pair around each station.
+    offset = 0.45 / max(float(world_to_m), 1e-9)
+    for x, y in station_points:
+        half = offset * 0.5
+        out.append({
+            "id": str(uuid.uuid4())[:8],
+            "x": float(x - half),
+            "y": float(y),
+            "z": 0.0,
+            "dtype": "mcb",
+            "locked": 0,
+            "floor_plan_id": floor_plan_id,
+        })
+        out.append({
+            "id": str(uuid.uuid4())[:8],
+            "x": float(x + half),
+            "y": float(y),
+            "z": 0.0,
+            "dtype": "hooter",
+            "locked": 0,
+            "floor_plan_id": floor_plan_id,
+        })
+    return out
+
 def _centroid(poly_world: list[list[float]]):
     # simple polygon centroid
     xs = [p[0] for p in poly_world]; ys = [p[1] for p in poly_world]
@@ -141,6 +203,26 @@ def _run_post_alignment_steps(
     stage_done("extract_rooms", stage_ts, rooms=len(rooms), rooms_json=rooms_json)
     with db() as con:
         _set_project(con, project_id, rooms_json_path=rooms_json, status="rooms_extracted")
+
+    # 6.5) Place MCP + Hooter stations before room confirmation stage.
+    stage_ts = time.perf_counter()
+    stage_start("place_mcp_hooter")
+    placed_mcp_hooter = 0
+    try:
+        with open(rooms_json, "r", encoding="utf-8") as f:
+            rooms_payload = _json.load(f)
+        stations = place_mcp_hooter_from_rooms_payload(
+            rooms_payload if isinstance(rooms_payload, dict) else {"rooms": rooms_payload},
+            world_to_m=opts.world_to_m,
+            gemini_model=opts.gemini_model,
+        )
+        dets = _to_mcp_hooter_detectors(stations, opts.world_to_m)
+        with db() as con:
+            _replace_detectors_of_types(con, project_id, dets, ["mcb", "hooter"])
+        placed_mcp_hooter = len(stations)
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        logger.exception("mcp/hooter placement failed for project=%s", project_id)
+    stage_done("place_mcp_hooter", stage_ts, stations=placed_mcp_hooter)
 
     # ── Pause for user room review ──
     with db() as con:
@@ -206,6 +288,7 @@ def _run_multi_block_post_alignment(
             _set_floor_plan(con, fp_id, rooms_json_path=rooms_json, status="rooms_extracted")
 
         # Read block JSON to aggregate extracted entities.
+        block_data = None
         block_rooms: list = []
         block_doors: list = []
         block_staircases: list = []
@@ -216,8 +299,27 @@ def _run_multi_block_post_alignment(
                 block_rooms = block_data.get("rooms", []) or []
                 block_doors = block_data.get("doors", []) or []
                 block_staircases = block_data.get("staircases", []) or []
-        except Exception:
+        except (OSError, ValueError, TypeError, KeyError):
             block_rooms = rooms
+
+        # Place MCP + Hooter stations per block before room review.
+        stage_ts = time.perf_counter()
+        stage_start(f"place_mcp_hooter_block_{idx}")
+        placed_mcp_hooter = 0
+        try:
+            payload = block_data if isinstance(block_data, dict) else {"rooms": block_rooms}
+            stations = place_mcp_hooter_from_rooms_payload(
+                payload,
+                world_to_m=opts.world_to_m,
+                gemini_model=opts.gemini_model,
+            )
+            dets = _to_mcp_hooter_detectors(stations, opts.world_to_m, floor_plan_id=fp_id)
+            with db() as con:
+                _replace_detectors_of_types(con, project_id, dets, ["mcb", "hooter"], floor_plan_id=fp_id)
+            placed_mcp_hooter = len(stations)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+            logger.exception("mcp/hooter placement failed for project=%s block=%s", project_id, idx)
+        stage_done(f"place_mcp_hooter_block_{idx}", stage_ts, stations=placed_mcp_hooter)
 
         # Tag each extracted entity with its block index for traceability.
         for d in block_doors:
@@ -307,7 +409,7 @@ def _run_post_room_review_steps(
                 for (x, y) in placed
             ]
             with db() as con:
-                _replace_detectors(con, project_id, fp_dets, floor_plan_id=fp_id)
+                _replace_detectors_of_types(con, project_id, fp_dets, ["smoke"], floor_plan_id=fp_id)
             all_dets.extend(fp_dets)
             stage_done(f"place_detectors_block_{idx}", stage_ts, detectors=len(fp_dets))
 
@@ -329,13 +431,7 @@ def _run_post_room_review_steps(
                     for x, y in sp_points
                 ]
                 with db() as con:
-                    for d in fp_sp_dets:
-                        con.execute(
-                            """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,floor_plan_id,created_at,updated_at)
-                                 VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                            (d["id"], project_id, float(d["x"]), float(d["y"]), 0.0,
-                             "sprinkler", 0, fp_id, now(), now()),
-                        )
+                    _replace_detectors_of_types(con, project_id, fp_sp_dets, ["sprinkler"], floor_plan_id=fp_id)
                 all_sprinkler_dets.extend(fp_sp_dets)
                 all_sprinkler_pipes.extend(sp_pipes)
                 all_sprinkler_sources.extend(sp_sources)
@@ -364,7 +460,7 @@ def _run_post_room_review_steps(
         )
         all_dets = [{"id": str(uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0, "dtype": "smoke", "locked": 0} for (x,y) in placed]
         with db() as con:
-            _replace_detectors(con, project_id, all_dets)
+            _replace_detectors_of_types(con, project_id, all_dets, ["smoke"])
         stage_done("place_detectors", stage_ts, detectors=len(all_dets))
 
         if opts.enable_sprinklers:
@@ -382,20 +478,30 @@ def _run_post_room_review_steps(
             all_sprinkler_pipes = sp_pipes
             all_sprinkler_sources = sp_sources
             with db() as con:
-                for d in all_sprinkler_dets:
-                    con.execute(
-                        """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,created_at,updated_at)
-                             VALUES (?,?,?,?,?,?,?,?,?)""",
-                        (d["id"], project_id, float(d["x"]), float(d["y"]), 0.0,
-                         "sprinkler", 0, now(), now()),
-                    )
+                _replace_detectors_of_types(con, project_id, all_sprinkler_dets, ["sprinkler"])
             stage_done("place_sprinklers", stage_ts, sprinklers=len(all_sprinkler_dets))
 
     # 9) Export DXF with all detectors across all floor plans
     stage_ts = time.perf_counter()
     stage_start("export_dxf")
     out_dxf = os.path.join(pdir, "detectors_overlay.dxf")
-    combined_dets = all_dets + all_sprinkler_dets
+    with db() as con:
+        existing = con.execute(
+            "SELECT id, x, y, z, dtype, locked, floor_plan_id FROM detectors WHERE project_id=? ORDER BY created_at ASC",
+            (project_id,),
+        ).fetchall()
+    combined_dets = [
+        {
+            "id": r["id"],
+            "x": float(r["x"]),
+            "y": float(r["y"]),
+            "z": float(r["z"]),
+            "dtype": r["dtype"],
+            "locked": int(r["locked"]),
+            "floor_plan_id": r["floor_plan_id"],
+        }
+        for r in existing
+    ]
 
     # Build a combined world bbox from floor-plan blocks (or mapping.json)
     # so symbol sizing is proportional to actual content, not whitespace.

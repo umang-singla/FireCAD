@@ -25,6 +25,9 @@ from app.routers.auth import get_current_user
 
 router = APIRouter(tags=["projects"])
 
+# Keep MCP and Hooter as a tight side-by-side pair.
+MCP_HOOTER_PAIR_OFFSET_M = 0.45
+
 
 def _normalize_data_path(p: str | None) -> str | None:
     """Normalize persisted file paths to be rooted under DATA_DIR.
@@ -480,12 +483,13 @@ def auto_place_detectors(project_id: str, payload: dict = None, user=Depends(get
     If not given, replace all with smoke detectors.
     """
     from app.pipeline.place_detectors_advanced import place_detectors_from_rooms_json
+    from app.pipeline.mcp_hooter_placement import place_mcp_hooter_from_rooms_payload
     from app.pipeline.sprinkler_routing import place_sprinklers_only
     import uuid as _uuid
 
     equipment_type = (payload or {}).get("equipment_type", "smoke") if payload else "smoke"
     # Validate
-    ALLOWED_TYPES = {"smoke", "sprinkler", "fire_hose", "panel", "hooter", "mcb"}
+    ALLOWED_TYPES = {"smoke", "sprinkler", "fire_hose", "panel", "hooter", "mcb", "mcp_hooter"}
     if equipment_type not in ALLOWED_TYPES:
         equipment_type = "smoke"
 
@@ -521,6 +525,20 @@ def auto_place_detectors(project_id: str, payload: dict = None, user=Depends(get
             {"id": str(_uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0, "dtype": "sprinkler", "locked": 0}
             for x, y in sp_points
         ]
+    elif equipment_type == "mcp_hooter":
+        rooms_payload = rooms_data if isinstance(rooms_data, dict) else {"rooms": rooms}
+        stations = place_mcp_hooter_from_rooms_payload(
+            rooms_payload,
+            world_to_m=opts.world_to_m,
+            gemini_model=opts.gemini_model,
+        )
+        # Place a centered left/right pair around each station.
+        offset = MCP_HOOTER_PAIR_OFFSET_M / max(float(opts.world_to_m), 1e-9)
+        new_dets = []
+        for x, y in stations:
+            half = offset * 0.5
+            new_dets.append({"id": str(_uuid.uuid4())[:8], "x": x - half, "y": y, "z": 0.0, "dtype": "mcb", "locked": 0})
+            new_dets.append({"id": str(_uuid.uuid4())[:8], "x": x + half, "y": y, "z": 0.0, "dtype": "hooter", "locked": 0})
     else:
         placed, _regions = place_detectors_from_rooms_json(
             rooms,
@@ -536,8 +554,11 @@ def auto_place_detectors(project_id: str, payload: dict = None, user=Depends(get
         ]
 
     with db() as con:
-        # Delete only detectors of this type, keep others
-        con.execute("DELETE FROM detectors WHERE project_id=? AND dtype=?", (project_id, equipment_type))
+        # Delete only detectors of this type, keep others.
+        if equipment_type == "mcp_hooter":
+            con.execute("DELETE FROM detectors WHERE project_id=? AND dtype IN ('mcb','hooter')", (project_id,))
+        else:
+            con.execute("DELETE FROM detectors WHERE project_id=? AND dtype=?", (project_id, equipment_type))
         for d in new_dets:
             con.execute(
                 """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,created_at,updated_at)
@@ -966,10 +987,11 @@ def update_floor_plan_rooms(project_id: str, fp_id: str, payload: dict, user=Dep
 def auto_place_floor_plan(project_id: str, fp_id: str, payload: dict = None, user=Depends(get_current_user)):
     """Auto-place detectors for a specific floor-plan block using its rooms."""
     from app.pipeline.place_detectors_advanced import place_detectors_from_rooms_json
+    from app.pipeline.mcp_hooter_placement import place_mcp_hooter_from_rooms_payload
     import uuid as _uuid
 
     equipment_type = (payload or {}).get("equipment_type", "smoke") if payload else "smoke"
-    ALLOWED_TYPES = {"smoke", "sprinkler", "fire_hose", "panel", "hooter", "mcb"}
+    ALLOWED_TYPES = {"smoke", "sprinkler", "fire_hose", "panel", "hooter", "mcb", "mcp_hooter"}
     if equipment_type not in ALLOWED_TYPES:
         equipment_type = "smoke"
 
@@ -1007,6 +1029,25 @@ def auto_place_floor_plan(project_id: str, fp_id: str, payload: dict = None, use
              "dtype": "sprinkler", "locked": 0, "floor_plan_id": fp_id}
             for x, y in sp_points
         ]
+    elif equipment_type == "mcp_hooter":
+        rooms_payload = rooms_data if isinstance(rooms_data, dict) else {"rooms": rooms}
+        stations = place_mcp_hooter_from_rooms_payload(
+            rooms_payload,
+            world_to_m=opts.world_to_m,
+            gemini_model=opts.gemini_model,
+        )
+        offset = MCP_HOOTER_PAIR_OFFSET_M / max(float(opts.world_to_m), 1e-9)
+        new_dets = []
+        for x, y in stations:
+            half = offset * 0.5
+            new_dets.append({
+                "id": str(_uuid.uuid4())[:8], "x": x - half, "y": y, "z": 0.0,
+                "dtype": "mcb", "locked": 0, "floor_plan_id": fp_id,
+            })
+            new_dets.append({
+                "id": str(_uuid.uuid4())[:8], "x": x + half, "y": y, "z": 0.0,
+                "dtype": "hooter", "locked": 0, "floor_plan_id": fp_id,
+            })
     else:
         placed, _regions = place_detectors_from_rooms_json(
             rooms,
@@ -1024,8 +1065,14 @@ def auto_place_floor_plan(project_id: str, fp_id: str, payload: dict = None, use
 
     with db() as con:
         # Delete only detectors of this type for this floor plan
-        con.execute("DELETE FROM detectors WHERE project_id=? AND dtype=? AND floor_plan_id=?",
-                    (project_id, equipment_type, fp_id))
+        if equipment_type == "mcp_hooter":
+            con.execute(
+                "DELETE FROM detectors WHERE project_id=? AND dtype IN ('mcb','hooter') AND floor_plan_id=?",
+                (project_id, fp_id),
+            )
+        else:
+            con.execute("DELETE FROM detectors WHERE project_id=? AND dtype=? AND floor_plan_id=?",
+                        (project_id, equipment_type, fp_id))
         for d in new_dets:
             con.execute(
                 """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,floor_plan_id,created_at,updated_at)
