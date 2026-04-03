@@ -514,11 +514,11 @@ def visualize_global_snapping_debug(
     for (dx, dy) in detectors_after:
         px, py = to_px(dx, dy)
         if 0 <= px < w_px and 0 <= py < h_px:
-            cv2.circle(img, (px, py), 5, (0, 0, 255), -1, cv2.LINE_AA)
-            cv2.circle(img, (px, py), 7, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.circle(img, (px, py), 7, (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.putText(img, "S", (px - 4, py + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
 
     cv2.putText(img, "Global snapping debug", (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (230, 230, 230), 2, cv2.LINE_AA)
-    cv2.putText(img, "orange ring = before snap, red dot = after snap", (20, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (210, 210, 210), 1, cv2.LINE_AA)
+    cv2.putText(img, "orange ring = before snap, red S circle = after snap", (20, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (210, 210, 210), 1, cv2.LINE_AA)
     cv2.putText(img, "yellow vertical / blue horizontal = inferred global snap lines", (20, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (210, 210, 210), 1, cv2.LINE_AA)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -629,11 +629,12 @@ def visualize_global_snapping_overlay(
 
     for (x, y) in detectors_after:
         px, py = _world_to_pixel_from_mapping(x, y, mapping)
-        cv2.circle(img, (int(round(px)), int(round(py))), 5, (0, 0, 255), -1, cv2.LINE_AA)
-        cv2.circle(img, (int(round(px)), int(round(py))), 7, (255, 255, 255), 1, cv2.LINE_AA)
+        cx, cy = int(round(px)), int(round(py))
+        cv2.circle(img, (cx, cy), 7, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, "S", (cx - 4, cy + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
 
     cv2.putText(img, "Global snapping overlay", (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (30, 30, 30), 2, cv2.LINE_AA)
-    cv2.putText(img, "orange ring=before, red dot=after, yellow/blue=snap lines", (20, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (30, 30, 30), 1, cv2.LINE_AA)
+    cv2.putText(img, "orange ring=before, red S circle=after, yellow/blue=snap lines", (20, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (30, 30, 30), 1, cv2.LINE_AA)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     cv2.imwrite(output_path, img)
 
@@ -747,7 +748,8 @@ def visualize_results(all_regions, all_detectors, output_path):
     for (dx, dy) in all_detectors:
         px, py = to_px(dx, dy)
         if 0 <= px < w_px and 0 <= py < h_px:
-            cv2.circle(img, (px, py), 6, (0, 0, 255), -1)
+            cv2.circle(img, (px, py), 6, (0, 0, 255), 2)
+            cv2.putText(img, "S", (px - 4, py + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
             cv2.circle(img, (px, py), 8, (255, 255, 255), 2)
 
     cv2.imwrite(output_path, img)

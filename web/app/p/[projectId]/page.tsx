@@ -1,9 +1,9 @@
-"use client";
+﻿"use client";
 
 import { use, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
-import { getToken } from "../../lib/auth";
+import { getToken, getTenantRole } from "../../lib/auth";
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
 
@@ -97,6 +97,52 @@ type Project = {
   status: string;
   error?: string | null;
   files: Record<string, string | null>;
+  input_filename?: string | null;
+  nbc_evaluation?: {
+    matched_rule_id?: string;
+    matched_category?: string;
+    equipment?: Array<{
+      key: string;
+      label: string;
+      required: boolean;
+      supported: boolean;
+      notes: string[];
+    }>;
+    water_pump_requirements?: any;
+    warnings?: string[];
+  } | null;
+  nbc_answers?: Record<string, any> | null;
+  floor_plans_count?: number;
+};
+
+type FloorPlan = {
+  id: string;
+  project_id: string;
+  block_index: number;
+  status: string;
+  world_bbox: { xmin: number; ymin: number; xmax: number; ymax: number } | null;
+  pixel_bbox: number[] | null;
+  files: Record<string, string | null>;
+};
+
+type PipeSegment = {
+  from: [number, number];
+  to: [number, number];
+  diameter: string;
+};
+
+type PipeSource = { x: number; y: number };
+
+type PipesData = {
+  pipes: PipeSegment[];
+  sources: PipeSource[];
+};
+
+type NBCSettingsQuestion = {
+  id: string;
+  type: "select" | "number" | "boolean";
+  label: string;
+  options?: string[];
 };
 
 type Detector = {
@@ -107,11 +153,12 @@ type Detector = {
   z: number;
   dtype: string;
   locked: boolean;
+  floor_plan_id?: string | null;
 };
 
-type ObjectType = "smoke" | "panel" | "hooter" | "mcb";
+type ObjectType = "smoke" | "panel" | "hooter" | "mcb" | "sprinkler";
 
-const OBJECT_TYPES: ObjectType[] = ["smoke", "panel", "hooter", "mcb"];
+const OBJECT_TYPES: ObjectType[] = ["smoke", "panel", "hooter", "mcb", "sprinkler"];
 
 type Mapping = {
   width_px: number;
@@ -159,8 +206,23 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   const [project, setProject] = useState<Project | null>(null);
   const [detectors, setDetectors] = useState<Detector[]>([]);
   const [mapping, setMapping] = useState<Mapping | null>(null);
+  const [pipesData, setPipesData] = useState<PipesData | null>(null);
+  const [floorPlans, setFloorPlans] = useState<FloorPlan[]>([]);
+  const [activeBlockIndex, setActiveBlockIndex] = useState(0);
   const [networkPending, setNetworkPending] = useState(0);
   const [wizardStep, setWizardStep] = useState(1);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [nbcSettingsQuestions, setNbcSettingsQuestions] = useState<NBCSettingsQuestion[]>([]);
+  const [nbcSettingsFollowups, setNbcSettingsFollowups] = useState<NBCSettingsQuestion[]>([]);
+  const [nbcSettingsAnswers, setNbcSettingsAnswers] = useState<Record<string, any>>({});
+  const [nbcSettingsLabels, setNbcSettingsLabels] = useState<Record<string, string>>({});
+  const [nbcSettingsSaving, setNbcSettingsSaving] = useState(false);
+  const [editorOpen, setEditorOpen] = useState(false);
+
+  const canEdit = (() => {
+    const role = getTenantRole();
+    return role !== "viewer";
+  })();
 
   const [settings, setSettings] = useState<any>({
     detector_spacing_m: 5.0,
@@ -174,6 +236,9 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     ceiling_height_unit: "m",
 
   });
+
+  // Current pipeline stage for live progress display
+  const [pipelineStage, setPipelineStage] = useState<string | null>(null);
 
   async function refresh() {
     const p: Project = await (await authFetch(`/api/projects/${projectId}`)).json();
@@ -189,9 +254,80 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     } else {
       setMapping(null);
     }
+
+    // Fetch sprinkler pipes if available
+    if (p.files?.sprinkler_pipes) {
+      try {
+        const pd: PipesData = await (await trackedFetch(apiUrl(p.files.sprinkler_pipes), { cache: "no-store" })).json();
+        setPipesData(pd);
+      } catch { setPipesData(null); }
+    } else {
+      setPipesData(null);
+    }
+
+    // Fetch floor plans if any
+    if (p.floor_plans_count && p.floor_plans_count > 0) {
+      try {
+        const fps: FloorPlan[] = await (await authFetch(`/api/projects/${projectId}/floor_plans`)).json();
+        setFloorPlans(fps);
+      } catch { setFloorPlans([]); }
+    } else {
+      setFloorPlans([]);
+    }
   }
 
   useEffect(() => { refresh(); }, []);
+
+  // Real-time pipeline status via WebSocket
+  useEffect(() => {
+    const base = resolveApiBase().replace(/^http/, "ws");
+    const wsUrl = `${base}/api/projects/${projectId}/ws`;
+    let ws: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let cancelled = false;
+
+    function connect() {
+      if (cancelled) return;
+      ws = new WebSocket(wsUrl);
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "status") {
+            // Full refresh to pick up new files/status from the API
+            refresh();
+            if (msg.status === "ready" || msg.status === "failed" || msg.status === "ready_no_mask" || msg.status === "awaiting_alignment_review" || msg.status === "awaiting_floor_review") {
+              setPipelineStage(null);
+            }
+          } else if (msg.type === "stage") {
+            if (msg.event === "start") {
+              setPipelineStage(msg.stage);
+            }
+          } else if (msg.type === "floor_plans") {
+            refresh();
+          }
+        } catch {}
+      };
+
+      ws.onclose = () => {
+        if (!cancelled) {
+          reconnectTimer = setTimeout(connect, 3000);
+        }
+      };
+
+      ws.onerror = () => {
+        ws?.close();
+      };
+    }
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      ws?.close();
+    };
+  }, [projectId]);
 
   useEffect(() => {
     setNetworkPending(getNetworkPendingCount());
@@ -215,10 +351,76 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     });
   }, [project]);
 
+  async function openSettingsModal() {
+    setShowSettingsModal(true);
+    // Load current NBC answers from project
+    setNbcSettingsAnswers(project?.nbc_answers || {});
+    try {
+      const [qs, labels] = await Promise.all([
+        (await authFetch("/api/nbc/questions")).json(),
+        (await authFetch("/api/nbc/occupancy_types")).json(),
+      ]);
+      setNbcSettingsQuestions(qs);
+      setNbcSettingsLabels(labels);
+      // Load followups if occupancy is already selected
+      const occ = project?.nbc_answers?.occupancy_subtype;
+      if (occ) {
+        const followups: NBCSettingsQuestion[] = await (await authFetch(`/api/nbc/followup_fields?occupancy_subtype=${encodeURIComponent(occ)}`)).json();
+        setNbcSettingsFollowups(followups);
+      }
+    } catch {}
+  }
+
+  async function nbcSettingsSelectOccupancy(subtype: string) {
+    setNbcSettingsAnswers((prev: Record<string, any>) => ({ ...prev, occupancy_subtype: subtype }));
+    try {
+      const followups: NBCSettingsQuestion[] = await (await authFetch(`/api/nbc/followup_fields?occupancy_subtype=${encodeURIComponent(subtype)}`)).json();
+      setNbcSettingsFollowups(followups);
+    } catch {
+      setNbcSettingsFollowups([]);
+    }
+  }
+
+  function setNbcSettingsAnswer(id: string, value: any) {
+    setNbcSettingsAnswers((prev: Record<string, any>) => ({ ...prev, [id]: value }));
+  }
+
+  async function saveNbcSettings() {
+    setNbcSettingsSaving(true);
+    try {
+      // Re-evaluate NBC with updated answers
+      const evalResult = await (await authFetch("/api/nbc/evaluate", {
+        method: "POST",
+        body: JSON.stringify({ answers: nbcSettingsAnswers }),
+      })).json();
+      // Save to project settings
+      const normalizedSettings = {
+        ...settings,
+        world_to_m: deriveWorldToMFromUnits(String(settings.units || "mm")),
+        nbc_answers: nbcSettingsAnswers,
+        nbc_evaluation: evalResult,
+      };
+      await authFetch(`/api/projects/${projectId}/settings`, {
+        method: "POST",
+        body: JSON.stringify({ settings: normalizedSettings }),
+      });
+      setSettings(normalizedSettings);
+      setShowSettingsModal(false);
+      await refresh();
+    } catch (e: any) {
+      console.error("Failed to save NBC settings:", e);
+    } finally {
+      setNbcSettingsSaving(false);
+    }
+  }
+
   async function saveSettings() {
     const normalizedSettings = {
       ...settings,
       world_to_m: deriveWorldToMFromUnits(String(settings.units || "mm")),
+      // Preserve NBC data in settings_json
+      nbc_answers: settings.nbc_answers,
+      nbc_evaluation: project?.nbc_evaluation || settings.nbc_evaluation,
     };
 
     await authFetch(`/api/projects/${projectId}/settings`, {
@@ -231,14 +433,20 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
 
   async function runPipeline() {
     await saveSettings();
+    setPipelineStage(null);
     await authFetch(`/api/projects/${projectId}/run`, { method:"POST" });
     await refresh();
   }
 
   const isReady = project?.status === "ready";
+  const isAwaitingFloorReview = project?.status === "awaiting_floor_review";
   const isAwaitingAlignmentReview = project?.status === "awaiting_alignment_review";
-  const isRunning = project?.status === "running";
-  const isQuestionnaireMode = !isReady && !isAwaitingAlignmentReview && !isRunning;
+  const isAwaitingRoomReview = project?.status === "awaiting_room_review";
+  // Treat ALL intermediate pipeline statuses as "running" so the loader
+  // stays visible until a review step or final output appears.
+  const IDLE_STATUSES = new Set(["created", "uploaded", "ready", "ready_no_mask", "failed", "awaiting_alignment_review", "awaiting_room_review", "awaiting_floor_review"]);
+  const isRunning = !!project && !IDLE_STATUSES.has(project.status);
+  const isQuestionnaireMode = !editorOpen;
   const showGlobalLoader = project === null || networkPending > 0;
 
   async function saveLayout() {
@@ -246,12 +454,40 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     await refresh();
   }
 
+  async function continuePipelineAfterFloorReview() {
+    setPipelineStage(null);
+    await authFetch(`/api/projects/${projectId}/continue_floor_review`, { method:"POST" });
+    await refresh();
+  }
+
+  async function addFloorPlan(pixelBbox: number[]) {
+    await authFetch(`/api/projects/${projectId}/floor_plans`, {
+      method: "POST",
+      body: JSON.stringify({ pixel_bbox: pixelBbox }),
+    });
+    await refresh();
+  }
+
+  async function deleteFloorPlan(fpId: string) {
+    await authFetch(`/api/projects/${projectId}/floor_plans/${fpId}`, { method: "DELETE" });
+    await refresh();
+  }
+
   async function continuePipelineAfterAlignment(adjustedMaskBlob?: Blob) {
     if (adjustedMaskBlob) {
-      const fd = new FormData();
-      fd.append("file", adjustedMaskBlob, "mask_aligned_adjusted.png");
-      await authFetch(`/api/projects/${projectId}/aligned_mask`, { method:"POST", body: fd });
+      // If multi-block, upload to the active block; otherwise project-level
+      const activeFp = floorPlans[activeBlockIndex];
+      if (activeFp) {
+        const fd = new FormData();
+        fd.append("file", adjustedMaskBlob, "mask_aligned_adjusted.png");
+        await authFetch(`/api/projects/${projectId}/floor_plans/${activeFp.id}/aligned_mask`, { method:"POST", body: fd });
+      } else {
+        const fd = new FormData();
+        fd.append("file", adjustedMaskBlob, "mask_aligned_adjusted.png");
+        await authFetch(`/api/projects/${projectId}/aligned_mask`, { method:"POST", body: fd });
+      }
     }
+    setPipelineStage(null);
     await authFetch(`/api/projects/${projectId}/continue`, { method:"POST" });
     await refresh();
   }
@@ -261,7 +497,37 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     if (!f) return;
     const fd = new FormData();
     fd.append("file", f);
-    await authFetch(`/api/projects/${projectId}/aligned_mask`, { method:"POST", body: fd });
+    // Upload to active block if multi-block, otherwise project-level
+    const activeFp = floorPlans[activeBlockIndex];
+    if (activeFp) {
+      await authFetch(`/api/projects/${projectId}/floor_plans/${activeFp.id}/aligned_mask`, { method:"POST", body: fd });
+    } else {
+      await authFetch(`/api/projects/${projectId}/aligned_mask`, { method:"POST", body: fd });
+    }
+    await refresh();
+  }
+
+  async function saveRoomsAndContinue(rooms: any[]) {
+    setPipelineStage(null);
+    // Use /save which writes the user's saved detectors & pipes to DXF
+    // (bulk_save was already called by handleContinue in RoomEditor)
+    await authFetch(`/api/projects/${projectId}/save`, { method: "POST" });
+    await refresh();
+  }
+
+  async function saveRoomsOnly(rooms: any[]) {
+    const activeFp = floorPlans[activeBlockIndex];
+    if (activeFp) {
+      await authFetch(`/api/projects/${projectId}/floor_plans/${activeFp.id}/rooms`, {
+        method: "PUT",
+        body: JSON.stringify({ rooms }),
+      });
+    } else {
+      await authFetch(`/api/projects/${projectId}/rooms`, {
+        method: "PUT",
+        body: JSON.stringify({ rooms }),
+      });
+    }
     await refresh();
   }
 
@@ -276,154 +542,473 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
       <div style={styles.bgGlowBottom} />
 
       {isQuestionnaireMode ? (
-        <section style={styles.questionnaireCenterWrap}>
-          <div style={styles.questionnaireCard}>
-            <div style={styles.sidebarTopRow}>
-              <div>
-                <div style={styles.sidebarLabel}>Project</div>
-                <strong style={styles.projectTitle}>{project?.name || "Loading..."}</strong>
+        <section style={{ zIndex: 1, padding: 24, overflow: "auto", minHeight: "calc(100vh - 28px)" }}>
+          {/* ── Top bar ────────────────────────── */}
+          <div style={{
+            display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12,
+            padding: "14px 20px", borderRadius: 16,
+            background: "#FFFFFF", border: "1px solid #E8EAED",
+            boxShadow: "0 2px 8px rgba(0,0,0,0.06)", marginBottom: 20,
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{
+                width: 38, height: 38, borderRadius: 10,
+                background: "#2D6A4F",
+                display: "grid", placeItems: "center", fontSize: 18, flexShrink: 0,
+              }}>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
               </div>
-              <button onClick={refresh} style={btn(false, true)}>Refresh</button>
+              <div>
+                <div style={{ fontSize: 18, fontWeight: 800, color: "#1A1A2E" }}>{project?.name || "Project"}</div>
+                <div style={{ fontSize: 12, color: "#6B7280", marginTop: 2 }}>Project Workspace</div>
+              </div>
             </div>
-
-            <div style={styles.statusRow}>
-              <span>Status</span>
-              <span style={styles.statusValue}>{project?.status || "-"}</span>
-            </div>
-
-            {project?.error ? (
-              <pre style={styles.errorBox}>
-{project.error}
-              </pre>
-            ) : null}
-
-            <h4 style={{ ...styles.sectionTitle, marginTop: 16 }}>Setup questionnaire</h4>
-            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
-              Step {wizardStep} of 4
-            </div>
-
-            <div key={`wizard-step-${wizardStep}`} className="wizardStepPanel">
-              {wizardStep === 1 ? (
-                <>
-                  <Field label="Input DWG/DXF drawing">
-                    <input
-                      type="file"
-                      accept=".dxf,.dwg"
-                      onChange={async (e) => {
-                        await uploadFile(projectId, e, refresh);
-                        setWizardStep(2);
-                      }}
-                    />
-                  </Field>
-                  <div style={{ display:"flex", gap: 10, marginTop: 14 }}>
-                    <button
-                      onClick={() => setWizardStep(2)}
-                      disabled={!project?.files?.input}
-                      style={btn(true)}
-                    >
-                      Continue
-                    </button>
-                  </div>
-                </>
-              ) : null}
-
-              {wizardStep === 2 ? (
-                <>
-                  <Field label="What type of building is this?">
-                    <select value={settings.building_type} onChange={(e)=>setSettings({...settings, building_type: e.target.value})}>
-                      <option value="residential">Residential</option>
-                      <option value="commercial">Commercial</option>
-                      <option value="industrial">Industrial</option>
-                      <option value="hospital">Hospital</option>
-                      <option value="school">School</option>
-                    </select>
-                  </Field>
-                  <div style={{ display:"flex", gap: 10, marginTop: 14 }}>
-                    <button onClick={() => setWizardStep(1)} style={btn(false)}>Back</button>
-                    <button onClick={() => setWizardStep(3)} style={btn(true)}>Next</button>
-                  </div>
-                </>
-              ) : null}
-
-              {wizardStep === 3 ? (
-                <>
-                  <Field label="What units is this drawing in?">
-                    <select value={settings.units} onChange={(e)=>setSettings({...settings, units: e.target.value})}>
-                      <option value="mm">mm</option>
-                      <option value="cm">cm</option>
-                      <option value="m">m</option>
-                      <option value="inch">inch</option>
-                      <option value="ft">ft</option>
-                    </select>
-                  </Field>
-                  <div style={{ display:"flex", gap: 10, marginTop: 14 }}>
-                    <button onClick={() => setWizardStep(2)} style={btn(false)}>Back</button>
-                    <button onClick={() => setWizardStep(4)} style={btn(true)}>Next</button>
-                  </div>
-                </>
-              ) : null}
-
-              {wizardStep === 4 ? (
-                <>
-                  <Field label="What’s the typical ceiling height?">
-                    <div style={{ display: "flex", gap: 8 }}>
-                      <input
-                        type="number"
-                        min={0}
-                        step="0.1"
-                        value={settings.typical_ceiling_height}
-                        onChange={(e)=>setSettings({...settings, typical_ceiling_height: Number(e.target.value)})}
-                      />
-                      <select
-                        value={settings.ceiling_height_unit}
-                        onChange={(e)=>setSettings({...settings, ceiling_height_unit: e.target.value})}
-                        style={{ width: 92 }}
-                      >
-                        <option value="m">m</option>
-                        <option value="ft">ft</option>
-                      </select>
-                    </div>
-                  </Field>
-                  <div style={{ display:"flex", gap: 10, marginTop: 14 }}>
-                    <button onClick={() => setWizardStep(3)} style={btn(false)}>Back</button>
-                    <button onClick={runPipeline} style={btn(true)}>Run Auto-Placement</button>
-                  </div>
-                </>
-              ) : null}
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              {!canEdit && (
+                <span style={{
+                  fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 8,
+                  background: "#FEF3C7", color: "#92400E", border: "1px solid rgba(217,119,6,0.2)",
+                }}>View Only</span>
+              )}
+              {canEdit && (
+                <button onClick={openSettingsModal} style={{
+                  padding: "8px 14px", borderRadius: 10,
+                  border: "1px solid #E8EAED", background: "#FFFFFF",
+                  color: "#1A1A2E", cursor: "pointer", fontSize: 12, fontWeight: 600,
+                  display: "flex", alignItems: "center", gap: 6,
+                }}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6B7280" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                  Settings
+                </button>
+              )}
+              <button onClick={refresh} style={{
+                padding: "8px 14px", borderRadius: 10,
+                border: "1px solid #E8EAED", background: "#FFFFFF",
+                color: "#1A1A2E", cursor: "pointer", fontSize: 12, fontWeight: 600,
+              }}>Refresh</button>
             </div>
           </div>
+
+          {project?.error ? (
+            <pre style={styles.errorBox}>{project.error}</pre>
+          ) : null}
+
+          {/* ── NBC Evaluation banner ────────── */}
+          {project?.nbc_evaluation?.matched_category ? (
+            <div style={{
+              padding: "12px 18px", borderRadius: 14, marginBottom: 20,
+              background: "#ECFDF5",
+              border: "1px solid rgba(5,150,105,0.2)",
+              display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap",
+            }}>
+              <div style={{ fontSize: 13, color: "#1A1A2E" }}>
+                <strong>NBC Category:</strong> {project.nbc_evaluation.matched_category}
+              </div>
+              {(project.nbc_evaluation.equipment || []).filter(eq => eq.required).map(eq => (
+                <span key={eq.key} style={{
+                  fontSize: 10, fontWeight: 700, padding: "3px 10px", borderRadius: 8,
+                  background: eq.supported ? "#ECFDF5" : "#FEF3C7",
+                  color: eq.supported ? "#059669" : "#D97706",
+                  border: eq.supported ? "1px solid rgba(5,150,105,0.2)" : "1px solid rgba(217,119,6,0.2)",
+                }}>{eq.label}: {eq.supported ? "Supported" : "Coming Soon"}</span>
+              ))}
+            </div>
+          ) : null}
+
+          {/* ── Files grid ──────────────────── */}
+          <div style={{
+            padding: "20px", borderRadius: 16,
+            background: "#FFFFFF",
+            border: "1px solid #E8EAED",
+            marginBottom: 20,
+          }}>
+            <div style={{ fontSize: 14, fontWeight: 800, color: "#1A1A2E", marginBottom: 14 }}>Files</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: 12 }}>
+              {/* Uploaded DWG tile */}
+              {project?.files?.input ? (
+                <div style={{
+                  padding: "16px 14px", borderRadius: 14, textAlign: "center",
+                  background: "#FAFBFC", border: "1px solid #E8EAED",
+                  transition: "border-color 0.15s",
+                }}>
+                  <div style={{
+                    width: 52, height: 52, margin: "0 auto 10px", borderRadius: 12,
+                    background: "#2D6A4F",
+                    display: "grid", placeItems: "center",
+                  }}>
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                      <polyline points="14 2 14 8 20 8"/>
+                      <line x1="16" y1="13" x2="8" y2="13"/>
+                      <line x1="16" y1="17" x2="8" y2="17"/>
+                    </svg>
+                  </div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: "#1A1A2E", wordBreak: "break-all" }}>
+                    {project.input_filename || "drawing.dwg"}
+                  </div>
+                  <div style={{ fontSize: 10, color: "#9CA3AF", marginTop: 4 }}>DWG/DXF</div>
+                </div>
+              ) : null}
+
+              {/* Upload new file tile */}
+              {canEdit && (<label style={{
+                padding: "16px 14px", borderRadius: 14, textAlign: "center",
+                background: "#FAFBFC", border: "2px dashed #E8EAED",
+                cursor: "pointer", transition: "border-color 0.15s, background 0.15s",
+                display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8,
+                minHeight: 120,
+              }}>
+                <div style={{
+                  width: 40, height: 40, borderRadius: 10,
+                  background: "#D8F3DC", border: "1px solid rgba(5,150,105,0.15)",
+                  display: "grid", placeItems: "center",
+                }}>
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#2D6A4F" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+                  </svg>
+                </div>
+                <div style={{ fontSize: 11, fontWeight: 600, color: "#6B7280" }}>
+                  {project?.files?.input ? "Replace file" : "Upload DWG/DXF"}
+                </div>
+                <input
+                  type="file"
+                  accept=".dxf,.dwg"
+                  style={{ display: "none" }}
+                  onChange={async (e) => {
+                    await uploadFile(projectId, e, refresh);
+                  }}
+                />
+              </label>)}
+            </div>
+          </div>
+
+          {/* ── Edit Drawing ───────────────────── */}
+          {project?.files?.input ? (
+            <div style={{
+              padding: "20px", borderRadius: 16,
+              background: "#FFFFFF",
+              border: "1px solid #E8EAED",
+            }}>
+              {(() => {
+                const s = (project?.status || "").toLowerCase();
+                const done = s === "ready";
+                const fail = s === "failed";
+                const reviewing = s === "awaiting_alignment_review" || s === "awaiting_room_review" || s === "awaiting_floor_review";
+                const run = !["created","uploaded","ready","ready_no_mask","failed","awaiting_alignment_review","awaiting_room_review","awaiting_floor_review"].includes(s);
+                const canOpenEditor = done || reviewing;
+                return (
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                      <div style={{
+                        width: 42, height: 42, borderRadius: 12,
+                        background: done ? "#ECFDF5" : run ? "#EFF6FF" : fail ? "#FEF2F2" : reviewing ? "#EFF6FF" : "#F3F4F6",
+                        border: done ? "1px solid rgba(5,150,105,0.2)" : run ? "1px solid rgba(37,99,235,0.2)" : fail ? "1px solid rgba(220,38,38,0.2)" : reviewing ? "1px solid rgba(37,99,235,0.2)" : "1px solid #E8EAED",
+                        display: "grid", placeItems: "center", flexShrink: 0,
+                      }}>
+                        {run ? (
+                          <div style={{
+                            width: 20, height: 20, borderRadius: "50%",
+                            border: "3px solid #E8EAED", borderTopColor: "#2563EB",
+                            animation: "spin 1s linear infinite",
+                          }} />
+                        ) : (
+                          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={done ? "#059669" : fail ? "#DC2626" : reviewing ? "#2563EB" : "#6B7280"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            {done ? (
+                              <><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></>
+                            ) : fail ? (
+                              <><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></>
+                            ) : reviewing ? (
+                              <><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></>
+                            ) : (
+                              <><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></>
+                            )}
+                          </svg>
+                        )}
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 14, fontWeight: 700, color: "#1A1A2E" }}>
+                          {done ? "Drawing Complete" : fail ? "Drawing Failed" : run ? "Processing Drawing" : reviewing ? "Awaiting Review" : "Edit Drawing"}
+                        </div>
+                        <div style={{ fontSize: 12, color: "#6B7280", marginTop: 2 }}>
+                          {done ? "Detectors placed successfully." : fail ? (project?.error || "An error occurred. Click to retry.") : run ? (pipelineStage ? pipelineStage.replace(/_/g, " ") : "Pipeline is running\u2026") : reviewing ? "Review is pending. Open the editor to continue." : "Run the placement pipeline on your uploaded drawing."}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      {canOpenEditor ? (
+                        <button onClick={() => setEditorOpen(true)} style={{
+                          padding: "10px 20px", borderRadius: 12,
+                          border: "none", background: "#2D6A4F", color: "#fff",
+                          cursor: "pointer", fontSize: 13, fontWeight: 700,
+                          display: "flex", alignItems: "center", gap: 8,
+                          boxShadow: "0 4px 12px rgba(45,106,79,0.3)",
+                          whiteSpace: "nowrap",
+                        }}>
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                          </svg>
+                          {canEdit ? "Open Editor" : "View Editor"}
+                        </button>
+                      ) : null}
+                      {canEdit && !run && !canOpenEditor ? (
+                        <button onClick={runPipeline} style={{
+                          padding: "10px 20px", borderRadius: 12,
+                          border: "none",
+                          background: "#2D6A4F",
+                          color: "#fff",
+                          cursor: "pointer", fontSize: 13, fontWeight: 700,
+                          display: "flex", alignItems: "center", gap: 8,
+                          boxShadow: "0 4px 12px rgba(45,106,79,0.3)",
+                          whiteSpace: "nowrap",
+                        }}>
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <polygon points="5 3 19 12 5 21 5 3"/>
+                          </svg>
+                          {fail ? "Retry Pipeline" : "Run Pipeline"}
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          ) : null}
+
+          {/* ── Settings modal (NBC Questions) ── */}
+          {showSettingsModal ? (
+            <div style={{
+              position: "fixed", inset: 0, zIndex: 50,
+              background: "rgba(0,0,0,0.35)", backdropFilter: "blur(4px)",
+              display: "grid", placeItems: "center",
+            }} onClick={() => setShowSettingsModal(false)}>
+              <div onClick={e => e.stopPropagation()} style={{
+                width: "min(620px, calc(100% - 32px))", borderRadius: 20,
+                background: "#FFFFFF",
+                border: "1px solid #E8EAED", boxShadow: "0 20px 60px rgba(0,0,0,0.15)",
+                padding: 0, maxHeight: "90vh", overflow: "hidden",
+                display: "flex", flexDirection: "column",
+              }}>
+                <div style={{
+                  display: "flex", justifyContent: "space-between", alignItems: "center",
+                  padding: "18px 24px", borderBottom: "1px solid #E8EAED",
+                }}>
+                  <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: "#1A1A2E" }}>Project Settings — NBC Rules</h3>
+                  <button onClick={() => setShowSettingsModal(false)} style={{
+                    background: "none", border: "none", fontSize: 22, color: "#9CA3AF",
+                    cursor: "pointer", padding: "4px 8px", lineHeight: 1,
+                  }}>&times;</button>
+                </div>
+
+                <div style={{ padding: "0 24px 24px", overflowY: "auto", flex: 1 }}>
+                  {/* NBC common questions */}
+                  {nbcSettingsQuestions.map((q) => (
+                    <div key={q.id} style={{ marginTop: 16 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: "#6B7280", marginBottom: 6 }}>{q.label}</div>
+                      {q.type === "select" && q.options && (
+                        <select
+                          value={nbcSettingsAnswers[q.id] ?? ""}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setNbcSettingsAnswer(q.id, val);
+                            if (q.id === "occupancy_subtype") nbcSettingsSelectOccupancy(val);
+                          }}
+                          style={{ width: "100%", borderRadius: 10, border: "1px solid #E8EAED", padding: "10px 14px", fontSize: 13, color: "#1A1A2E", background: "#fff", outline: "none", cursor: "pointer" }}
+                        >
+                          <option value="">— Select —</option>
+                          {q.options.map((opt) => (
+                            <option key={opt} value={opt}>
+                              {nbcSettingsLabels[opt] || opt.replace(/_/g, " ")}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      {q.type === "number" && (
+                        <input
+                          type="number"
+                          value={nbcSettingsAnswers[q.id] ?? ""}
+                          onChange={(e) => setNbcSettingsAnswer(q.id, e.target.value === "" ? "" : Number(e.target.value))}
+                          style={{ width: "100%", borderRadius: 10, border: "1px solid #E8EAED", padding: "10px 14px", fontSize: 13, color: "#1A1A2E", background: "#fff", outline: "none" }}
+                          placeholder="0"
+                        />
+                      )}
+                      {q.type === "boolean" && (
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <button type="button" onClick={() => setNbcSettingsAnswer(q.id, true)} style={{
+                            borderRadius: 8, border: "1px solid #E8EAED", padding: "8px 20px", fontSize: 12, fontWeight: 700, cursor: "pointer",
+                            background: nbcSettingsAnswers[q.id] === true ? "#2D6A4F" : "#fff",
+                            color: nbcSettingsAnswers[q.id] === true ? "#fff" : "#6B7280",
+                            borderColor: nbcSettingsAnswers[q.id] === true ? "#2D6A4F" : "#E8EAED",
+                          }}>Yes</button>
+                          <button type="button" onClick={() => setNbcSettingsAnswer(q.id, false)} style={{
+                            borderRadius: 8, border: "1px solid #E8EAED", padding: "8px 20px", fontSize: 12, fontWeight: 700, cursor: "pointer",
+                            background: nbcSettingsAnswers[q.id] === false ? "#2D6A4F" : "#fff",
+                            color: nbcSettingsAnswers[q.id] === false ? "#fff" : "#6B7280",
+                            borderColor: nbcSettingsAnswers[q.id] === false ? "#2D6A4F" : "#E8EAED",
+                          }}>No</button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+
+                  {/* NBC followup questions */}
+                  {nbcSettingsFollowups.length > 0 && (
+                    <>
+                      <div style={{ margin: "20px 0 0", padding: "10px 0 0", borderTop: "1px solid #E8EAED" }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: "#9CA3AF", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>
+                          Additional Details for {nbcSettingsLabels[nbcSettingsAnswers.occupancy_subtype] || nbcSettingsAnswers.occupancy_subtype}
+                        </div>
+                      </div>
+                      {nbcSettingsFollowups.map((q) => (
+                        <div key={q.id} style={{ marginTop: 14 }}>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: "#6B7280", marginBottom: 6 }}>{q.label}</div>
+                          {q.type === "number" && (
+                            <input
+                              type="number"
+                              value={nbcSettingsAnswers[q.id] ?? ""}
+                              onChange={(e) => setNbcSettingsAnswer(q.id, e.target.value === "" ? "" : Number(e.target.value))}
+                              style={{ width: "100%", borderRadius: 10, border: "1px solid #E8EAED", padding: "10px 14px", fontSize: 13, color: "#1A1A2E", background: "#fff", outline: "none" }}
+                              placeholder="0"
+                            />
+                          )}
+                          {q.type === "boolean" && (
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <button type="button" onClick={() => setNbcSettingsAnswer(q.id, true)} style={{
+                                borderRadius: 8, border: "1px solid #E8EAED", padding: "8px 20px", fontSize: 12, fontWeight: 700, cursor: "pointer",
+                                background: nbcSettingsAnswers[q.id] === true ? "#2D6A4F" : "#fff",
+                                color: nbcSettingsAnswers[q.id] === true ? "#fff" : "#6B7280",
+                                borderColor: nbcSettingsAnswers[q.id] === true ? "#2D6A4F" : "#E8EAED",
+                              }}>Yes</button>
+                              <button type="button" onClick={() => setNbcSettingsAnswer(q.id, false)} style={{
+                                borderRadius: 8, border: "1px solid #E8EAED", padding: "8px 20px", fontSize: 12, fontWeight: 700, cursor: "pointer",
+                                background: nbcSettingsAnswers[q.id] === false ? "#2D6A4F" : "#fff",
+                                color: nbcSettingsAnswers[q.id] === false ? "#fff" : "#6B7280",
+                                borderColor: nbcSettingsAnswers[q.id] === false ? "#2D6A4F" : "#E8EAED",
+                              }}>No</button>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </>
+                  )}
+
+                  {/* Current matched category */}
+                  {project?.nbc_evaluation?.matched_category && (
+                    <div style={{
+                      marginTop: 20, padding: "10px 14px", borderRadius: 12,
+                      background: "#ECFDF5", border: "1px solid rgba(5,150,105,0.2)",
+                      fontSize: 12, color: "#1A1A2E",
+                    }}>
+                      <strong>Current NBC Category:</strong> {project.nbc_evaluation.matched_category}
+                    </div>
+                  )}
+
+                  <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+                    <button onClick={() => setShowSettingsModal(false)} style={btn(false)}>Cancel</button>
+                    <button onClick={saveNbcSettings} disabled={nbcSettingsSaving || !nbcSettingsAnswers.occupancy_subtype} style={btn(true)}>
+                      {nbcSettingsSaving ? "Saving..." : "Save & Re-evaluate"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </section>
       ) : null}
 
-      {isRunning ? (
-      <section style={styles.questionnaireCenterWrap}>
-        <div style={styles.runningCard}>
-          <div className="runningOrb" />
-          <div className="runningRing" />
-          <h3 style={{ margin: "0 0 8px 0", fontSize: 24 }}>Processing your drawing</h3>
-          <p style={{ margin: 0, opacity: 0.8, textAlign: "center", maxWidth: 460 }}>
-            Pipeline is running. We’re extracting rooms, placing detectors, and preparing outputs. This usually takes a moment.
-          </p>
-          <div style={{ marginTop: 14, fontSize: 12, opacity: 0.75 }}>
-            Status: {project?.status || "running"}
-          </div>
-          <div style={{ marginTop: 14, display: "flex", gap: 10 }}>
-            <button onClick={refresh} style={btn(false, true)}>Refresh status</button>
-          </div>
-        </div>
-      </section>
-      ) : null}
 
-      {!isQuestionnaireMode && !isRunning ? (
-      <section style={styles.canvasPanel}>
-        {isAwaitingAlignmentReview ? (
-          project?.files?.aligned_mask && project?.files?.render_png ? (
+
+      {editorOpen ? (
+      <section style={{ ...styles.canvasPanel, display: "flex", flexDirection: "column" }}>
+        {/* ── Back to workspace button ── */}
+        <div style={{ padding: "10px 14px", borderBottom: "1px solid #E8EAED", display: "flex", alignItems: "center", gap: 10, background: "#FAFBFC", flexShrink: 0 }}>
+          <button onClick={() => setEditorOpen(false)} style={{
+            padding: "6px 14px", borderRadius: 8, border: "1px solid #E8EAED",
+            background: "#FFFFFF", color: "#1A1A2E", cursor: "pointer",
+            fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6,
+          }}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+            Back to Workspace
+          </button>
+          <span style={{ fontSize: 13, color: "#6B7280" }}>{project?.name || "Project"}</span>
+        </div>
+        <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
+        {isAwaitingFloorReview && project?.files?.render_png && mapping ? (
+          <FloorPlanReview
+            renderUrl={apiUrl(project.files.render_png)}
+            mapping={mapping}
+            floorPlans={floorPlans}
+            onConfirm={continuePipelineAfterFloorReview}
+            onAddFloorPlan={addFloorPlan}
+            onDeleteFloorPlan={deleteFloorPlan}
+            onRefresh={refresh}
+            canEdit={canEdit}
+          />
+        ) : isAwaitingAlignmentReview ? (
+          floorPlans.length > 0 ? (
+            /* ── Floor-plan-based alignment review ── */
+            <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+              {/* Block selector tabs */}
+              {floorPlans.length > 1 && (
+              <div style={{
+                display: "flex", alignItems: "center", gap: 6, padding: "8px 12px",
+                borderBottom: "1px solid #E8EAED", background: "#F8FAF9", flexShrink: 0, flexWrap: "wrap",
+              }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: "#1A3C34", marginRight: 4 }}>Floor Plans:</span>
+                {floorPlans.map((fp, i) => (
+                  <button
+                    key={fp.id}
+                    onClick={() => setActiveBlockIndex(i)}
+                    style={{
+                      padding: "5px 12px", borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                      border: activeBlockIndex === i ? "2px solid #2D6A4F" : "1px solid #D1D5DB",
+                      background: activeBlockIndex === i ? "#D8F3DC" : "#FFFFFF",
+                      color: activeBlockIndex === i ? "#1A3C34" : "#4B5563",
+                    }}
+                  >
+                    Block {fp.block_index + 1}
+                    {fp.status === "aligned" ? " \u2713" : ""}
+                  </button>
+                ))}
+              </div>
+              )}
+              <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
+                {(() => {
+                  const fp = floorPlans[activeBlockIndex];
+                  if (!fp) return null;
+                  const blockRender = fp.files?.render_png;
+                  const blockMask = fp.files?.aligned_mask || fp.files?.mask_png;
+                  if (blockRender && blockMask) {
+                    return (
+                      <AlignmentReview
+                        key={fp.id}
+                        originalUrl={apiUrl(blockRender)}
+                        alignedUrl={apiUrl(blockMask)}
+                        onContinue={continuePipelineAfterAlignment}
+                        onUploadAlignedMask={uploadAlignedMaskFile}
+                        onRefresh={refresh}
+                        blockLabel={floorPlans.length > 1 ? `Block ${fp.block_index + 1} of ${floorPlans.length}` : undefined}
+                        canEdit={canEdit}
+                      />
+                    );
+                  }
+                  return (
+                    <div style={styles.emptyState}>
+                      <h3 style={styles.emptyTitle}>Block {fp.block_index + 1} mask not available</h3>
+                      <p style={styles.emptySubtitle}>Upload an aligned mask for this block.</p>
+                    </div>
+                  );
+                })()}
+              </div>
+            </div>
+          ) : project?.files?.aligned_mask && project?.files?.render_png ? (
             <AlignmentReview
               originalUrl={apiUrl(project.files.render_png)}
               alignedUrl={apiUrl(project.files.aligned_mask)}
               onContinue={continuePipelineAfterAlignment}
               onUploadAlignedMask={uploadAlignedMaskFile}
               onRefresh={refresh}
+              canEdit={canEdit}
             />
           ) : (
             <div style={styles.emptyState}>
@@ -431,24 +1016,148 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
               <p style={styles.emptySubtitle}>Upload an aligned mask from the sidebar to continue.</p>
             </div>
           )
+        ) : isAwaitingRoomReview && project?.files?.render_png && mapping ? (
+          floorPlans.length > 0 ? (
+            /* ── Multi-block room review ── */
+            <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+              <div style={{
+                display: "flex", alignItems: "center", gap: 6, padding: "8px 12px",
+                borderBottom: "1px solid #E8EAED", background: "#F8FAF9", flexShrink: 0, flexWrap: "wrap",
+              }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: "#1A3C34", marginRight: 4 }}>Floor Plans:</span>
+                {floorPlans.map((fp, i) => (
+                  <button
+                    key={fp.id}
+                    onClick={() => setActiveBlockIndex(i)}
+                    style={{
+                      padding: "5px 12px", borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                      border: activeBlockIndex === i ? "2px solid #2D6A4F" : "1px solid #D1D5DB",
+                      background: activeBlockIndex === i ? "#D8F3DC" : "#FFFFFF",
+                      color: activeBlockIndex === i ? "#1A3C34" : "#4B5563",
+                    }}
+                  >
+                    Block {fp.block_index + 1}
+                  </button>
+                ))}
+              </div>
+              <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
+                {(() => {
+                  const fp = floorPlans[activeBlockIndex];
+                  if (!fp) return null;
+                  const fpRender = fp.files?.render_png;
+                  const fpMapping = fp.files?.mapping_json;
+                  if (!fpRender || !fpMapping) {
+                    return (
+                      <div style={styles.emptyState}>
+                        <h3 style={styles.emptyTitle}>Block {fp.block_index + 1} not ready</h3>
+                      </div>
+                    );
+                  }
+                  return (
+                    <FloorPlanRoomEditor
+                      key={fp.id}
+                      renderUrl={apiUrl(fpRender)}
+                      mappingUrl={apiUrl(fpMapping)}
+                      projectId={projectId}
+                      floorPlanId={fp.id}
+                      nbcEquipment={project?.nbc_evaluation?.equipment || []}
+                      onSave={saveRoomsOnly}
+                      onContinue={saveRoomsAndContinue}
+                      canEdit={canEdit}
+                    />
+                  );
+                })()}
+              </div>
+            </div>
+          ) : (
+            <RoomEditor
+              renderUrl={apiUrl(project.files.render_png)}
+              mapping={mapping}
+              projectId={projectId}
+              nbcEquipment={project?.nbc_evaluation?.equipment || []}
+              onSave={saveRoomsOnly}
+              onContinue={saveRoomsAndContinue}
+              canEdit={canEdit}
+            />
+          )
         ) : !project?.files?.render_png || !mapping ? (
           <div style={styles.emptyState}>
             <h3 style={styles.emptyTitle}>No preview yet</h3>
             <p style={styles.emptySubtitle}>Upload a DXF/DWG and run auto-placement to generate your interactive view.</p>
           </div>
         ) : (
-          <Editor
-            renderUrl={apiUrl(project.files.render_png)}
-            mapping={mapping}
-            detectors={detectors}
-            projectId={projectId}
-            isReady={isReady}
-            exportDxfUrl={project?.files?.output_dxf ? apiUrl(project.files.output_dxf) : null}
-            exportPngUrl={project?.files?.output_preview_png ? apiUrl(project.files.output_preview_png) : null}
-            onSave={saveLayout}
-            onChanged={refresh}
-          />
+          floorPlans.length > 0 ? (
+            /* ── Multi-block editor ── */
+            <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+              <div style={{
+                display: "flex", alignItems: "center", gap: 6, padding: "8px 12px",
+                borderBottom: "1px solid #E8EAED", background: "#F8FAF9", flexShrink: 0, flexWrap: "wrap",
+              }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: "#1A3C34", marginRight: 4 }}>Floor Plans:</span>
+                {floorPlans.map((fp, i) => (
+                  <button
+                    key={fp.id}
+                    onClick={() => setActiveBlockIndex(i)}
+                    style={{
+                      padding: "5px 12px", borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                      border: activeBlockIndex === i ? "2px solid #2D6A4F" : "1px solid #D1D5DB",
+                      background: activeBlockIndex === i ? "#D8F3DC" : "#FFFFFF",
+                      color: activeBlockIndex === i ? "#1A3C34" : "#4B5563",
+                    }}
+                  >
+                    Block {fp.block_index + 1}
+                  </button>
+                ))}
+              </div>
+              <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
+                {(() => {
+                  const fp = floorPlans[activeBlockIndex];
+                  if (!fp) return null;
+                  const fpRender = fp.files?.render_png;
+                  const fpMapping = fp.files?.mapping_json;
+                  if (!fpRender || !fpMapping) {
+                    return (
+                      <div style={styles.emptyState}>
+                        <h3 style={styles.emptyTitle}>Block {fp.block_index + 1} not ready</h3>
+                      </div>
+                    );
+                  }
+                  return (
+                    <FloorPlanEditor
+                      key={fp.id}
+                      renderUrl={apiUrl(fpRender)}
+                      mappingUrl={apiUrl(fpMapping)}
+                      projectId={projectId}
+                      floorPlanId={fp.id}
+                      floorPlan={fp}
+                      isReady={isReady}
+                      exportDxfUrl={project?.files?.output_dxf ? apiUrl(project.files.output_dxf) : null}
+                      exportPngUrl={project?.files?.output_preview_png ? apiUrl(project.files.output_preview_png) : null}
+                      onSave={saveLayout}
+                      onChanged={refresh}
+                      canEdit={canEdit}
+                    />
+                  );
+                })()}
+              </div>
+            </div>
+          ) : (
+            <Editor
+              renderUrl={apiUrl(project.files.render_png)}
+              mapping={mapping}
+              detectors={detectors}
+              projectId={projectId}
+              isReady={isReady}
+              pipesData={pipesData}
+              exportDxfUrl={project?.files?.output_dxf ? apiUrl(project.files.output_dxf) : null}
+              exportPngUrl={project?.files?.output_preview_png ? apiUrl(project.files.output_preview_png) : null}
+              onSave={saveLayout}
+              onChanged={refresh}
+              canEdit={canEdit}
+            />
+          )
         )}
+        </div>
       </section>
       ) : null}
 
@@ -474,24 +1183,31 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
         select {
           width: 100%;
           border-radius: 12px;
-          border: 1px solid rgba(255, 255, 255, 0.2);
-          background: rgba(13, 30, 20, 0.85);
-          color: #F0FFF4;
+          border: 1px solid #E8EAED;
+          background: #FFFFFF;
+          color: #1A1A2E;
           padding: 10px 12px;
           outline: none;
+        }
+
+        input[type="text"]:focus,
+        input[type="number"]:focus,
+        select:focus {
+          border-color: #2D6A4F;
+          box-shadow: 0 0 0 2px rgba(45, 106, 79, 0.12);
         }
 
         input[type="file"] {
           width: 100%;
           border-radius: 12px;
-          border: 1px solid rgba(255, 255, 255, 0.2);
-          background: rgba(13, 30, 20, 0.7);
-          color: #D8F3DC;
+          border: 1px solid #E8EAED;
+          background: #FAFBFC;
+          color: #1A1A2E;
           padding: 8px;
         }
 
         option {
-          color: #111827;
+          color: #1A1A2E;
           background: #ffffff;
         }
 
@@ -503,8 +1219,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           width: 58px;
           height: 58px;
           border-radius: 999px;
-          background: radial-gradient(circle at 35% 35%, #95D5B2 0%, #52B788 45%, #2D6A4F 100%);
-          box-shadow: 0 10px 28px rgba(45, 106, 79, 0.55);
+          background: radial-gradient(circle at 35% 35%, #D8F3DC 0%, #52B788 45%, #2D6A4F 100%);
+          box-shadow: 0 6px 20px rgba(45, 106, 79, 0.25);
           animation: pulseOrb 1.6s ease-in-out infinite;
           z-index: 2;
           margin-bottom: 12px;
@@ -517,8 +1233,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           width: 126px;
           height: 126px;
           border-radius: 999px;
-          border: 2px solid rgba(82, 183, 136, 0.45);
-          border-top-color: rgba(255, 255, 255, 0.95);
+          border: 2px solid rgba(45, 106, 79, 0.15);
+          border-top-color: #2D6A4F;
           transform: translateX(-50%);
           animation: spinRing 1.2s linear infinite;
           pointer-events: none;
@@ -528,8 +1244,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           width: 44px;
           height: 44px;
           border-radius: 999px;
-          border: 3px solid rgba(180, 230, 200, 0.38);
-          border-top-color: rgba(255, 255, 255, 0.98);
+          border: 3px solid #E8EAED;
+          border-top-color: #2D6A4F;
           animation: spinRing 0.9s linear infinite;
           margin-bottom: 8px;
         }
@@ -565,8 +1281,380 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
             opacity: 1;
           }
         }
+
+        .stageDot {
+          display: inline-block;
+          width: 8px;
+          height: 8px;
+          border-radius: 999px;
+          background: #52B788;
+          animation: stagePulse 1s ease-in-out infinite;
+        }
+
+        @keyframes stagePulse {
+          0%, 100% { opacity: 0.5; transform: scale(0.9); }
+          50% { opacity: 1; transform: scale(1.2); }
+        }
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
       `}</style>
     </main>
+  );
+}
+
+// ─── Floor Plan Review Component ─────────────────────────────────────────────
+
+function FloorPlanReview({
+  renderUrl,
+  mapping,
+  floorPlans,
+  onConfirm,
+  onAddFloorPlan,
+  onDeleteFloorPlan,
+  onRefresh,
+  canEdit = true,
+}: {
+  renderUrl: string;
+  mapping: Mapping;
+  floorPlans: FloorPlan[];
+  onConfirm: () => Promise<void>;
+  onAddFloorPlan: (pixelBbox: number[]) => Promise<void>;
+  onDeleteFloorPlan: (fpId: string) => Promise<void>;
+  onRefresh: () => Promise<void>;
+  canEdit?: boolean;
+}) {
+  const [imgDims, setImgDims] = useState<{ w: number; h: number } | null>(null);
+  const [isConfirming, setIsConfirming] = useState(false);
+  const [drawMode, setDrawMode] = useState(false);
+  const [drawStart, setDrawStart] = useState<{ px: number; py: number } | null>(null);
+  const [drawEnd, setDrawEnd] = useState<{ px: number; py: number } | null>(null);
+  const [hoveredFp, setHoveredFp] = useState<string | null>(null);
+  const [isAdding, setIsAdding] = useState(false);
+  const svgRef = useRef<SVGSVGElement>(null);
+
+  const COLORS = ["#2563EB", "#DC2626", "#059669", "#D97706", "#7C3AED", "#DB2777", "#0891B2", "#65A30D"];
+
+  function fpColor(index: number) {
+    return COLORS[index % COLORS.length];
+  }
+
+  function worldBboxToPixelRect(wb: { xmin: number; ymin: number; xmax: number; ymax: number }) {
+    const tl = worldToPixel(mapping, wb.xmin, wb.ymax);
+    const br = worldToPixel(mapping, wb.xmax, wb.ymin);
+    return {
+      x: Math.min(tl.px, br.px),
+      y: Math.min(tl.py, br.py),
+      width: Math.abs(br.px - tl.px),
+      height: Math.abs(br.py - tl.py),
+    };
+  }
+
+  function toImagePoint(e: React.MouseEvent<SVGSVGElement>) {
+    const svg = svgRef.current;
+    if (!svg || !imgDims) return null;
+    const rect = svg.getBoundingClientRect();
+    const scaleX = imgDims.w / rect.width;
+    const scaleY = imgDims.h / rect.height;
+    return {
+      px: (e.clientX - rect.left) * scaleX,
+      py: (e.clientY - rect.top) * scaleY,
+    };
+  }
+
+  async function handleConfirm() {
+    setIsConfirming(true);
+    try {
+      await onConfirm();
+    } finally {
+      setIsConfirming(false);
+    }
+  }
+
+  async function handleFinishDraw() {
+    if (!drawStart || !drawEnd) return;
+    const x0 = Math.round(Math.min(drawStart.px, drawEnd.px));
+    const y0 = Math.round(Math.min(drawStart.py, drawEnd.py));
+    const x1 = Math.round(Math.max(drawStart.px, drawEnd.px));
+    const y1 = Math.round(Math.max(drawStart.py, drawEnd.py));
+    if (x1 - x0 < 10 || y1 - y0 < 10) return;
+    setIsAdding(true);
+    try {
+      await onAddFloorPlan([x0, y0, x1, y1]);
+      setDrawStart(null);
+      setDrawEnd(null);
+      setDrawMode(false);
+    } finally {
+      setIsAdding(false);
+    }
+  }
+
+  const drawRect = drawStart && drawEnd
+    ? {
+        x: Math.min(drawStart.px, drawEnd.px),
+        y: Math.min(drawStart.py, drawEnd.py),
+        width: Math.abs(drawEnd.px - drawStart.px),
+        height: Math.abs(drawEnd.py - drawStart.py),
+      }
+    : null;
+
+  return (
+    <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column" }}>
+      {/* Toolbar */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 10, padding: "10px 14px",
+        borderBottom: "1px solid #E8EAED", background: "#FAFBFC", flexShrink: 0,
+        flexWrap: "wrap",
+      }}>
+        <span style={{ fontSize: 14, fontWeight: 700, color: "#1A1A2E" }}>
+          Review Floor Plans
+        </span>
+        <span style={{ fontSize: 12, color: "#6B7280" }}>
+          {floorPlans.length} floor plan{floorPlans.length !== 1 ? "s" : ""} detected
+        </span>
+        <div style={{ flex: 1 }} />
+        {canEdit && (
+        <button
+          onClick={() => {
+            setDrawMode(!drawMode);
+            setDrawStart(null);
+            setDrawEnd(null);
+          }}
+          style={{
+            padding: "7px 14px", borderRadius: 10, fontSize: 12, fontWeight: 600,
+            cursor: "pointer",
+            border: drawMode ? "2px solid #2D6A4F" : "1px solid #E8EAED",
+            background: drawMode ? "#D8F3DC" : "#FFFFFF",
+            color: drawMode ? "#1A3C34" : "#1A1A2E",
+            display: "flex", alignItems: "center", gap: 6,
+          }}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+          {drawMode ? "Drawing..." : "Add Floor Plan"}
+        </button>
+        )}
+        <button onClick={onRefresh} style={{
+          padding: "7px 14px", borderRadius: 10, border: "1px solid #E8EAED",
+          background: "#FFFFFF", color: "#1A1A2E", cursor: "pointer",
+          fontSize: 12, fontWeight: 600,
+        }}>Refresh</button>
+        {canEdit && (
+        <button
+          onClick={handleConfirm}
+          disabled={isConfirming || floorPlans.length === 0}
+          style={{
+            padding: "7px 18px", borderRadius: 10, border: "none",
+            background: "#2D6A4F", color: "#fff", cursor: "pointer",
+            fontSize: 12, fontWeight: 700,
+            boxShadow: "0 4px 12px rgba(45,106,79,0.3)",
+            opacity: isConfirming || floorPlans.length === 0 ? 0.6 : 1,
+          }}
+        >
+          {isConfirming ? "Confirming..." : "Confirm & Continue"}
+        </button>
+        )}
+      </div>
+
+      {/* Content area: image + sidebar legend */}
+      <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+        {/* Image area */}
+        <div style={{ flex: 1, overflow: "auto", padding: 12, background: "#F0F2F5" }}>
+          <div style={{ position: "relative", display: "inline-block" }}>
+            <img
+              src={renderUrl}
+              alt="Master render"
+              onLoad={(e) => {
+                const img = e.currentTarget;
+                setImgDims({ w: img.naturalWidth, h: img.naturalHeight });
+              }}
+              style={{ display: "block", userSelect: "none", pointerEvents: "none", maxWidth: "100%" }}
+              draggable={false}
+            />
+            {imgDims && (
+              <svg
+                ref={svgRef}
+                width="100%"
+                height="100%"
+                viewBox={`0 0 ${imgDims.w} ${imgDims.h}`}
+                style={{
+                  position: "absolute", left: 0, top: 0,
+                  cursor: drawMode ? "crosshair" : "default",
+                }}
+                onMouseDown={(e) => {
+                  if (!drawMode) return;
+                  const pt = toImagePoint(e);
+                  if (pt) {
+                    setDrawStart(pt);
+                    setDrawEnd(pt);
+                  }
+                }}
+                onMouseMove={(e) => {
+                  if (!drawMode || !drawStart) return;
+                  const pt = toImagePoint(e);
+                  if (pt) setDrawEnd(pt);
+                }}
+                onMouseUp={() => {
+                  if (!drawMode || !drawStart || !drawEnd) return;
+                  // Keep the rectangle drawn, user clicks "Add" button or we auto-add
+                  handleFinishDraw();
+                }}
+              >
+                {/* Existing floor plan bounding boxes */}
+                {floorPlans.map((fp, i) => {
+                  if (!fp.world_bbox) return null;
+                  const rect = worldBboxToPixelRect(fp.world_bbox);
+                  const color = fpColor(i);
+                  const isHovered = hoveredFp === fp.id;
+                  return (
+                    <g key={fp.id}
+                      onMouseEnter={() => setHoveredFp(fp.id)}
+                      onMouseLeave={() => setHoveredFp(null)}
+                    >
+                      <rect
+                        x={rect.x} y={rect.y} width={rect.width} height={rect.height}
+                        fill={isHovered ? `${color}22` : `${color}11`}
+                        stroke={color} strokeWidth={isHovered ? 4 : 2.5}
+                        strokeDasharray={isHovered ? "none" : "8 4"}
+                        rx={4}
+                      />
+                      {/* Label */}
+                      <rect
+                        x={rect.x} y={rect.y - 24}
+                        width={Math.max(80, 16 + (`Floor ${i + 1}`).length * 8)}
+                        height={22} rx={4}
+                        fill={color} opacity={0.9}
+                      />
+                      <text
+                        x={rect.x + 8} y={rect.y - 8}
+                        fill="#fff" fontSize={13} fontWeight={700}
+                        fontFamily="system-ui, sans-serif"
+                      >
+                        Floor {i + 1}
+                      </text>
+                    </g>
+                  );
+                })}
+
+                {/* Drawing rectangle */}
+                {drawMode && drawRect && (
+                  <rect
+                    x={drawRect.x} y={drawRect.y}
+                    width={drawRect.width} height={drawRect.height}
+                    fill="rgba(45,106,79,0.12)"
+                    stroke="#2D6A4F" strokeWidth={3}
+                    strokeDasharray="8 4"
+                    rx={4}
+                  />
+                )}
+              </svg>
+            )}
+            {isAdding && (
+              <div style={{
+                position: "absolute", inset: 0,
+                background: "rgba(0,0,0,0.15)",
+                display: "grid", placeItems: "center",
+              }}>
+                <div style={{
+                  padding: "12px 24px", borderRadius: 12,
+                  background: "#fff", boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
+                  fontSize: 13, fontWeight: 600, color: "#1A1A2E",
+                }}>Adding floor plan...</div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Sidebar legend */}
+        <div style={{
+          width: 260, flexShrink: 0, borderLeft: "1px solid #E8EAED",
+          background: "#FFFFFF", padding: "14px", overflow: "auto",
+        }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#1A1A2E", marginBottom: 12 }}>
+            Detected Floor Plans
+          </div>
+          {floorPlans.length === 0 ? (
+            <div style={{ fontSize: 12, color: "#9CA3AF", padding: "8px 0" }}>
+              No floor plans detected. Use "Add Floor Plan" to mark areas manually.
+            </div>
+          ) : null}
+          {floorPlans.map((fp, i) => {
+            const color = fpColor(i);
+            return (
+              <div
+                key={fp.id}
+                onMouseEnter={() => setHoveredFp(fp.id)}
+                onMouseLeave={() => setHoveredFp(null)}
+                style={{
+                  display: "flex", alignItems: "center", gap: 10,
+                  padding: "8px 10px", borderRadius: 10, marginBottom: 6,
+                  background: hoveredFp === fp.id ? "#F0FDF4" : "#FAFBFC",
+                  border: hoveredFp === fp.id ? `1px solid ${color}40` : "1px solid #E8EAED",
+                  transition: "background 0.15s, border 0.15s",
+                }}
+              >
+                <div style={{
+                  width: 14, height: 14, borderRadius: 4,
+                  background: color, flexShrink: 0,
+                }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "#1A1A2E" }}>
+                    Floor {i + 1}
+                  </div>
+                  <div style={{ fontSize: 10, color: "#9CA3AF" }}>
+                    Block {fp.block_index}
+                  </div>
+                </div>
+                {fp.files?.render_png && (
+                  <img
+                    src={fp.files.render_png.startsWith("/") ? `${resolveApiBase()}${fp.files.render_png}` : fp.files.render_png}
+                    alt={`Floor ${i + 1}`}
+                    style={{ width: 40, height: 40, objectFit: "contain", borderRadius: 6, border: "1px solid #E8EAED" }}
+                  />
+                )}
+                {canEdit && (
+                <button
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    await onDeleteFloorPlan(fp.id);
+                  }}
+                  title="Remove floor plan"
+                  style={{
+                    background: "none", border: "none", cursor: "pointer",
+                    color: "#DC2626", fontSize: 16, padding: "2px 6px",
+                    borderRadius: 6, lineHeight: 1,
+                  }}
+                >
+                  &times;
+                </button>
+                )}
+              </div>
+            );
+          })}
+
+          {drawMode && (
+            <div style={{
+              marginTop: 12, padding: "10px", borderRadius: 10,
+              background: "#EFF6FF", border: "1px solid rgba(37,99,235,0.2)",
+              fontSize: 12, color: "#1E40AF", lineHeight: 1.5,
+            }}>
+              Click and drag on the image to draw a rectangle around a floor plan.
+            </div>
+          )}
+
+          <div style={{
+            marginTop: 16, padding: "10px", borderRadius: 10,
+            background: "#FEFCE8", border: "1px solid rgba(217,119,6,0.2)",
+            fontSize: 11, color: "#92400E", lineHeight: 1.5,
+          }}>
+            Review the detected floor plans. You can add more by clicking "Add Floor Plan" and drawing a box, or remove incorrect ones by clicking &times;.
+            When satisfied, click "Confirm & Continue".
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -576,12 +1664,16 @@ function AlignmentReview({
   onContinue,
   onUploadAlignedMask,
   onRefresh,
+  blockLabel,
+  canEdit = true,
 }: {
   originalUrl: string;
   alignedUrl: string;
   onContinue: (adjustedMaskBlob: Blob) => Promise<void>;
   onUploadAlignedMask: (e: any) => Promise<void>;
   onRefresh: () => Promise<void>;
+  blockLabel?: string;
+  canEdit?: boolean;
 }) {
   const [origDims, setOrigDims] = useState<{w:number; h:number} | null>(null);
   const [maskDims, setMaskDims] = useState<{w:number; h:number} | null>(null);
@@ -744,6 +1836,9 @@ function AlignmentReview({
           flexWrap: "wrap",
         }}
       >
+        {blockLabel && (
+          <span style={{ fontSize: 13, fontWeight: 700, color: "#52B788", marginRight: 8 }}>{blockLabel}</span>
+        )}
         <span style={{ fontSize: 12, color: "#D8F3DC" }}>Opacity</span>
         <input
           type="range"
@@ -780,6 +1875,8 @@ function AlignmentReview({
         <span style={{ fontSize: 12, color: "#D8F3DC" }}>{Math.round(viewZoom * 100)}%</span>
 
         <button onClick={() => { setOffsetX(0); setOffsetY(0); setScale(1); setViewZoom(1); setBoxScaleX(1); setBoxScaleY(1); }} style={toolBtn(false)}>Reset</button>
+        {canEdit && (
+        <>
         <label style={{ fontSize: 12, color: "#D8F3DC", marginLeft: 6 }}>Replace mask</label>
         <input
           type="file"
@@ -787,10 +1884,14 @@ function AlignmentReview({
           onChange={onUploadAlignedMask}
           style={{ width: 220 }}
         />
+        </>
+        )}
         <button onClick={onRefresh} style={toolBtn(false)}>Refresh</button>
+        {canEdit && (
         <button onClick={continueWithAdjustedMask} style={toolBtn(true)} disabled={isContinuing}>
           {isContinuing ? "Continuing..." : "Continue Pipeline"}
         </button>
+        )}
       </div>
 
       <div
@@ -944,27 +2045,1622 @@ function btn(primary=false, compact=false): CSSProperties {
   return {
     padding: compact ? "8px 12px" : "10px 12px",
     borderRadius: 12,
-    border: primary ? "1px solid rgba(82, 183, 136, 0.75)" : "1px solid rgba(255,255,255,0.2)",
-    background: primary
-      ? "linear-gradient(180deg, #40916C 0%, #2D6A4F 100%)"
-      : "rgba(13, 30, 20, 0.86)",
-    color: "#F0FFF4",
+    border: primary ? "none" : "1px solid #E8EAED",
+    background: primary ? "#2D6A4F" : "#FFFFFF",
+    color: primary ? "#FFFFFF" : "#1A1A2E",
     cursor:"pointer",
     flex: 1,
     textAlign:"center",
-    boxShadow: primary ? "0 10px 24px rgba(45, 106, 79, 0.42)" : undefined,
+    fontWeight: 600,
+    boxShadow: primary ? "0 4px 12px rgba(45, 106, 79, 0.3)" : undefined,
   };
 }
 
+// ─── Room Editor Component ──────────────────────────────────────────────────
+
+type Room = {
+  id: string;
+  label?: string;
+  area_px: number;
+  polygon_px: number[][];
+  polygon_world: number[][];
+};
+
+type NBCEquipmentItem = {
+  key: string;
+  label: string;
+  required: boolean;
+  supported: boolean;
+  notes: string[];
+};
+
+/* ── Wrapper: loads floor-plan mapping then renders RoomEditor ── */
+function FloorPlanRoomEditor({
+  renderUrl, mappingUrl, projectId, floorPlanId, nbcEquipment, onSave, onContinue, canEdit = true,
+}: {
+  renderUrl: string;
+  mappingUrl: string;
+  projectId: string;
+  floorPlanId: string;
+  nbcEquipment: NBCEquipmentItem[];
+  onSave: (rooms: Room[]) => Promise<void>;
+  onContinue: (rooms: Room[]) => Promise<void>;
+  canEdit?: boolean;
+}) {
+  const [fpMapping, setFpMapping] = useState<Mapping | null>(null);
+  useEffect(() => {
+    (async () => {
+      try {
+        const m: Mapping = await (await trackedFetch(mappingUrl, { cache: "no-store" })).json();
+        setFpMapping(m);
+      } catch { setFpMapping(null); }
+    })();
+  }, [mappingUrl]);
+  if (!fpMapping) return <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%" }}>Loading mapping...</div>;
+  return (
+    <RoomEditor
+      renderUrl={renderUrl}
+      mapping={fpMapping}
+      projectId={projectId}
+      floorPlanId={floorPlanId}
+      nbcEquipment={nbcEquipment}
+      onSave={onSave}
+      onContinue={onContinue}
+      canEdit={canEdit}
+    />
+  );
+}
+
+/* ── Wrapper: loads floor-plan mapping + detectors then renders Editor ── */
+function FloorPlanEditor({
+  renderUrl, mappingUrl, projectId, floorPlanId, floorPlan, isReady, exportDxfUrl, exportPngUrl, onSave, onChanged, canEdit = true,
+}: {
+  renderUrl: string;
+  mappingUrl: string;
+  projectId: string;
+  floorPlanId: string;
+  floorPlan: FloorPlan;
+  isReady: boolean;
+  exportDxfUrl: string | null;
+  exportPngUrl: string | null;
+  onSave: () => void;
+  onChanged: () => void;
+  canEdit?: boolean;
+}) {
+  const [fpMapping, setFpMapping] = useState<Mapping | null>(null);
+  const [fpDetectors, setFpDetectors] = useState<Detector[]>([]);
+  const [fpPipesData, setFpPipesData] = useState<PipesData | null>(null);
+
+  async function loadData() {
+    try {
+      const m: Mapping = await (await trackedFetch(mappingUrl, { cache: "no-store" })).json();
+      setFpMapping(m);
+    } catch { setFpMapping(null); }
+    try {
+      const dets: Detector[] = await (await authFetch(`/api/projects/${projectId}/detectors?floor_plan_id=${floorPlanId}`)).json();
+      setFpDetectors(dets);
+    } catch { setFpDetectors([]); }
+    // Load per-floor-plan sprinkler pipes
+    if (floorPlan.files?.sprinkler_pipes) {
+      try {
+        const pd: PipesData = await (await trackedFetch(apiUrl(floorPlan.files.sprinkler_pipes), { cache: "no-store" })).json();
+        setFpPipesData(pd);
+      } catch { setFpPipesData(null); }
+    } else {
+      setFpPipesData(null);
+    }
+  }
+
+  useEffect(() => { loadData(); }, [mappingUrl, floorPlanId]);
+
+  if (!fpMapping) return <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%" }}>Loading mapping...</div>;
+  return (
+    <Editor
+      renderUrl={renderUrl}
+      mapping={fpMapping}
+      detectors={fpDetectors}
+      projectId={projectId}
+      isReady={isReady}
+      pipesData={fpPipesData}
+      floorPlanId={floorPlanId}
+      exportDxfUrl={exportDxfUrl}
+      exportPngUrl={exportPngUrl}
+      onSave={onSave}
+      onChanged={() => { loadData(); onChanged(); }}
+      canEdit={canEdit}
+    />
+  );
+}
+
+function RoomEditor({
+  renderUrl,
+  mapping,
+  projectId,
+  nbcEquipment,
+  floorPlanId,
+  onSave,
+  onContinue,
+  canEdit = true,
+}: {
+  renderUrl: string;
+  mapping: Mapping;
+  projectId: string;
+  nbcEquipment: NBCEquipmentItem[];
+  floorPlanId?: string | null;
+  onSave: (rooms: Room[]) => Promise<void>;
+  onContinue: (rooms: Room[]) => Promise<void>;
+  canEdit?: boolean;
+}) {
+  // ── Room state ──
+  const [rooms, setRooms] = useState<Room[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [editingLabelId, setEditingLabelId] = useState<string | null>(null);
+  const [labelDraft, setLabelDraft] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [isSavingRooms, setIsSavingRooms] = useState(false);
+  const [isContinuing, setIsContinuing] = useState(false);
+  const [splitMode, setSplitMode] = useState(false);
+  const [splitStart, setSplitStart] = useState<{px:number; py:number} | null>(null);
+  const [splitEnd, setSplitEnd] = useState<{px:number; py:number} | null>(null);
+  const [splitHover, setSplitHover] = useState<{px:number; py:number} | null>(null);
+
+  // ── Detector state ──
+  const [detectors, setDetectors] = useState<Detector[]>([]);
+  const [editorMode, setEditorMode] = useState<"rooms" | "select" | "add" | "erase" | "pan" | "pipe_draw" | "pipe_select">("rooms");
+  const [addType, setAddType] = useState<ObjectType>("smoke");
+  const [selectedDetectorIds, setSelectedDetectorIds] = useState<string[]>([]);
+  const [imgDims, setImgDims] = useState<{w:number; h:number} | null>(null);
+  const [transformState, setTransformState] = useState({ scale: 0.18, positionX: 0, positionY: 0 });
+  const [hoverPoint, setHoverPoint] = useState<{px:number; py:number} | null>(null);
+  const [marquee, setMarquee] = useState<{sx:number; sy:number; ex:number; ey:number} | null>(null);
+  // ── Pipe editing state ──
+  const [selectedPipeIdx, setSelectedPipeIdx] = useState<number | null>(null);
+  const [pipeDrawStart, setPipeDrawStart] = useState<{px:number; py:number} | null>(null);
+  const [pipeDrawEnd, setPipeDrawEnd] = useState<{px:number; py:number} | null>(null);
+  const [groupDrag, setGroupDrag] = useState<{
+    ids: string[];
+    start: { px: number; py: number };
+    origins: Record<string, { px: number; py: number }>;
+  } | null>(null);
+  const [groupPreview, setGroupPreview] = useState<Record<string, { px: number; py: number }> | null>(null);
+  const [isAutoPlacing, setIsAutoPlacing] = useState<string | null>(null);
+  const [sidebarTab, setSidebarTab] = useState<"rooms" | "equipment">("rooms");
+  const [pipesData, setPipesData] = useState<PipesData | null>(null);
+  const [isSavingChanges, setIsSavingChanges] = useState(false);
+
+  // ── Helpers ──
+  function samePoint(a: {px:number; py:number}, b: {px:number; py:number}, tolerance = 0.5) {
+    return Math.hypot(a.px - b.px, a.py - b.py) <= tolerance;
+  }
+
+  function resetSplitState() {
+    setSplitStart(null);
+    setSplitEnd(null);
+    setSplitHover(null);
+  }
+
+  function onImageLoad(e: any) {
+    const img = e.target as HTMLImageElement;
+    setImgDims({ w: img.naturalWidth, h: img.naturalHeight });
+  }
+
+  function toImagePoint(e: any): { px: number; py: number } | null {
+    if (!imgDims) return null;
+    const rect = (e.currentTarget as any).getBoundingClientRect();
+    const px = ((e.clientX - rect.left) / rect.width) * imgDims.w;
+    const py = ((e.clientY - rect.top) / rect.height) * imgDims.h;
+    return { px, py };
+  }
+
+  function closestPointOnSegment(point: {px:number; py:number}, a: number[], b: number[]) {
+    const abx = b[0] - a[0]; const aby = b[1] - a[1];
+    const apx = point.px - a[0]; const apy = point.py - a[1];
+    const abLen2 = abx * abx + aby * aby;
+    if (abLen2 <= 1e-9) return { px: a[0], py: a[1] };
+    const t = Math.max(0, Math.min(1, (apx * abx + apy * aby) / abLen2));
+    return { px: a[0] + t * abx, py: a[1] + t * aby };
+  }
+
+  function snapPointToRoomBoundary(room: Room, point: {px:number; py:number}, maxDistPx = 14): {px:number; py:number} | null {
+    const pts = room.polygon_px;
+    const n = pts.length;
+    if (n < 2) return null;
+    let best: {px:number; py:number} | null = null;
+    let bestD2 = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < n; i++) {
+      const a = pts[i]; const b = pts[(i + 1) % n];
+      const hit = closestPointOnSegment(point, a, b);
+      const dx = hit.px - point.px; const dy = hit.py - point.py;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestD2) { bestD2 = d2; best = hit; }
+    }
+    if (!best || bestD2 > maxDistPx * maxDistPx) return null;
+    return best;
+  }
+
+  // ── Load rooms ──
+  useEffect(() => {
+    (async () => {
+      try {
+        const url = floorPlanId
+          ? `/api/projects/${projectId}/floor_plans/${floorPlanId}/rooms`
+          : `/api/projects/${projectId}/rooms`;
+        const res = await authFetch(url);
+        const data = await res.json();
+        const raw: Room[] = data.rooms || data;
+        setRooms(raw.map((r, i) => ({ ...r, label: r.label || `Room ${i + 1}` })));
+      } catch (e) { console.error("Failed to load rooms", e); }
+      finally { setLoading(false); }
+    })();
+  }, [projectId, floorPlanId]);
+
+  // ── Load detectors ──
+  async function loadDetectors() {
+    try {
+      const qs = floorPlanId ? `?floor_plan_id=${floorPlanId}` : "";
+      const res = await authFetch(`/api/projects/${projectId}/detectors${qs}`);
+      const data: Detector[] = await res.json();
+      setDetectors(data);
+    } catch (e) { console.error("Failed to load detectors", e); }
+  }
+
+  useEffect(() => { loadDetectors(); }, [projectId, floorPlanId]);
+  useEffect(() => { loadPipesData(); }, [projectId, floorPlanId]);
+
+  // ── Keyboard shortcuts for pipe editing & bulk delete ──
+  useEffect(() => {
+    function handleKey(e: KeyboardEvent) {
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if ((editorMode === "pipe_select" || editorMode === "pipe_draw") && selectedPipeIdx !== null) {
+          deletePipe(selectedPipeIdx);
+        } else if (selectedDetectorIds.length > 0 && canEdit) {
+          deleteDetectorsMany(selectedDetectorIds);
+        }
+      }
+      if (e.key === "Escape") {
+        if (pipeDrawStart) { setPipeDrawStart(null); setPipeDrawEnd(null); }
+        if (selectedPipeIdx !== null) setSelectedPipeIdx(null);
+        if (selectedDetectorIds.length > 0) setSelectedDetectorIds([]);
+      }
+    }
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  });
+
+  // ── Room functions ──
+  function roomCentroidPx(room: Room): { cx: number; cy: number } {
+    const pts = room.polygon_px;
+    const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+    const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+    return { cx, cy };
+  }
+
+  function handleRenameStart(room: Room) {
+    setEditingLabelId(room.id);
+    setLabelDraft(room.label || "");
+  }
+
+  function handleRenameCommit(roomId: string) {
+    setRooms(prev => prev.map(r => r.id === roomId ? { ...r, label: labelDraft.trim() || r.label } : r));
+    setEditingLabelId(null);
+  }
+
+  function handleDeleteRoom(roomId: string) {
+    setRooms(prev => prev.filter(r => r.id !== roomId));
+    if (selectedId === roomId) setSelectedId(null);
+  }
+
+  function handleSplitDotClick(point: {px:number; py:number}) {
+    if (!splitMode || !selectedId) return;
+    if (!splitStart) { setSplitStart(point); setSplitEnd(null); return; }
+    if (samePoint(splitStart, point)) return;
+    setSplitEnd(point);
+    const target = rooms.find(r => r.id === selectedId);
+    if (!target) return;
+    const splitRooms = splitPolygon(target, splitStart, point);
+    if (!splitRooms) { setSplitStart(point); setSplitEnd(null); return; }
+    setRooms(prev => { const others = prev.filter(r => r.id !== target.id); return [...others, ...splitRooms]; });
+    setSelectedId(null); resetSplitState(); setSplitMode(false);
+  }
+
+  function splitPolygon(room: Room, p1: {px:number;py:number}, p2: {px:number;py:number}): Room[] | null {
+    const pts = room.polygon_px; const n = pts.length;
+    const intersections: { idx: number; pt: number[]; ptW: number[] }[] = [];
+    for (let i = 0; i < n; i++) {
+      const a = pts[i]; const b = pts[(i + 1) % n];
+      const inter = lineSegIntersect(p1.px, p1.py, p2.px, p2.py, a[0], a[1], b[0], b[1]);
+      if (inter) {
+        const w = pixelToWorld(mapping, inter[0], inter[1]);
+        intersections.push({ idx: i, pt: inter, ptW: [w.x, w.y] });
+      }
+    }
+    const uniqueIntersections: { idx: number; pt: number[]; ptW: number[] }[] = [];
+    for (const inter of intersections) {
+      const exists = uniqueIntersections.some(hit => {
+        const dx = hit.pt[0] - inter.pt[0]; const dy = hit.pt[1] - inter.pt[1];
+        return dx * dx + dy * dy <= 0.25;
+      });
+      if (!exists) uniqueIntersections.push(inter);
+    }
+    if (uniqueIntersections.length < 2) return null;
+    let ia: typeof uniqueIntersections[0] | null = null;
+    let ib: typeof uniqueIntersections[0] | null = null;
+    let bestA = Number.POSITIVE_INFINITY, bestB = Number.POSITIVE_INFINITY;
+    for (const inter of uniqueIntersections) {
+      const da = (inter.pt[0] - p1.px) ** 2 + (inter.pt[1] - p1.py) ** 2;
+      if (da < bestA) { bestA = da; ia = inter; }
+    }
+    for (const inter of uniqueIntersections) {
+      if (ia && inter === ia) continue;
+      const db = (inter.pt[0] - p2.px) ** 2 + (inter.pt[1] - p2.py) ** 2;
+      if (db < bestB) { bestB = db; ib = inter; }
+    }
+    if (!ia || !ib) return null;
+    const poly1Px: number[][] = []; const poly1W: number[][] = [];
+    const poly2Px: number[][] = []; const poly2W: number[][] = [];
+    const wPts = room.polygon_world;
+    poly1Px.push(ia.pt); poly1W.push(ia.ptW);
+    for (let i = (ia.idx + 1) % n; i !== (ib.idx + 1) % n; i = (i + 1) % n) { poly1Px.push(pts[i]); poly1W.push(wPts[i]); }
+    poly1Px.push(ib.pt); poly1W.push(ib.ptW);
+    poly2Px.push(ib.pt); poly2W.push(ib.ptW);
+    for (let i = (ib.idx + 1) % n; i !== (ia.idx + 1) % n; i = (i + 1) % n) { poly2Px.push(pts[i]); poly2W.push(wPts[i]); }
+    poly2Px.push(ia.pt); poly2W.push(ia.ptW);
+    if (poly1Px.length < 3 || poly2Px.length < 3) return null;
+    const area1 = Math.abs(polyArea(poly1Px));
+    const area2 = Math.abs(polyArea(poly2Px));
+    return [
+      { id: room.id + "_a", label: (room.label || "Room") + " A", area_px: area1, polygon_px: poly1Px, polygon_world: poly1W },
+      { id: room.id + "_b", label: (room.label || "Room") + " B", area_px: area2, polygon_px: poly2Px, polygon_world: poly2W },
+    ];
+  }
+
+  function polyArea(pts: number[][]): number {
+    let a = 0;
+    for (let i = 0; i < pts.length; i++) { const j = (i + 1) % pts.length; a += pts[i][0] * pts[j][1] - pts[j][0] * pts[i][1]; }
+    return a / 2;
+  }
+
+  function lineSegIntersect(x1: number, y1: number, x2: number, y2: number, x3: number, y3: number, x4: number, y4: number): number[] | null {
+    const d = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+    if (Math.abs(d) < 1e-10) return null;
+    const u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / d;
+    if (u >= 0 && u <= 1) return [x3 + u * (x4 - x3), y3 + u * (y4 - y3)];
+    return null;
+  }
+
+  // ── Detector functions (client-side only, persisted on Save) ──
+  function addDetectorAt(px: number, py: number) {
+    const w = pixelToWorld(mapping, px, py);
+    const newDet: Detector = {
+      id: crypto.randomUUID(),
+      project_id: projectId,
+      x: w.x, y: w.y, z: 0,
+      dtype: addType,
+      locked: false,
+      floor_plan_id: floorPlanId || null,
+    };
+    setDetectors(prev => [...prev, newDet]);
+  }
+
+  function deleteDetector(detId: string) {
+    setDetectors(prev => prev.filter(d => d.id !== detId));
+  }
+
+  function deleteDetectorsMany(ids: string[]) {
+    if (!ids.length) return;
+    const idSet = new Set(ids);
+    setDetectors(prev => prev.filter(d => !idSet.has(d.id)));
+    setSelectedDetectorIds(prev => prev.filter(id => !idSet.has(id)));
+  }
+
+  function moveDetectorsToMany(nextPxById: Record<string, {px:number; py:number}>) {
+    const entries = Object.entries(nextPxById);
+    if (!entries.length) return;
+    setDetectors(prev => prev.map(d => {
+      const pt = nextPxById[d.id];
+      if (!pt) return d;
+      const w = pixelToWorld(mapping, pt.px, pt.py);
+      return { ...d, x: w.x, y: w.y };
+    }));
+  }
+
+  function hitTestDetector(px: number, py: number): string | null {
+    const R2 = 12 * 12;
+    for (const d of detectors) {
+      const p = worldToPixel(mapping, d.x, d.y);
+      const dx = p.px - px; const dy = p.py - py;
+      if (dx * dx + dy * dy <= R2) return d.id;
+    }
+    return null;
+  }
+
+  function rectFromPoints(a: {px:number; py:number}, b: {px:number; py:number}) {
+    return { left: Math.min(a.px, b.px), right: Math.max(a.px, b.px), top: Math.min(a.py, b.py), bottom: Math.max(a.py, b.py) };
+  }
+
+  function idsInRect(rect: {left:number; right:number; top:number; bottom:number}) {
+    const ids: string[] = [];
+    for (const d of detectors) {
+      const p = worldToPixel(mapping, d.x, d.y);
+      if (p.px >= rect.left && p.px <= rect.right && p.py >= rect.top && p.py <= rect.bottom) ids.push(d.id);
+    }
+    return ids;
+  }
+
+  function beginGroupDrag(ids: string[], at: {px:number; py:number}) {
+    if (!ids.length) return;
+    const origins: Record<string, { px: number; py: number }> = {};
+    for (const d of detectors) { if (ids.includes(d.id)) origins[d.id] = worldToPixel(mapping, d.x, d.y); }
+    setGroupDrag({ ids, start: at, origins });
+    setGroupPreview(origins);
+  }
+
+  // ── Load sprinkler pipes ──
+  async function loadPipesData() {
+    try {
+      const pipesUrl = floorPlanId
+        ? `/api/projects/${projectId}/floor_plans/${floorPlanId}/sprinkler_pipes`
+        : `/api/projects/${projectId}/sprinkler_pipes`;
+      const res = await authFetch(pipesUrl);
+      if (res.ok) {
+        const pd: PipesData = await res.json();
+        setPipesData(pd);
+      } else {
+        setPipesData(null);
+      }
+    } catch { setPipesData(null); }
+  }
+
+  // ── NBC Auto-place ──
+  async function autoPlaceEquipment(equipmentType: string) {
+    setIsAutoPlacing(equipmentType);
+    try {
+      // Save rooms to backend first so auto-place can use them
+      await onSave(rooms);
+      const url = floorPlanId
+        ? `/api/projects/${projectId}/floor_plans/${floorPlanId}/auto_place`
+        : `/api/projects/${projectId}/auto_place`;
+      const res = await authFetch(url, {
+        method: "POST",
+        body: JSON.stringify({ equipment_type: equipmentType }),
+      });
+      const placed: Detector[] = await res.json();
+      // Merge: keep detectors of other types, replace this type with placed result
+      setDetectors(prev => [
+        ...prev.filter(d => d.dtype !== equipmentType),
+        ...placed.filter(d => d.dtype === equipmentType),
+      ]);
+    } catch (e) { console.error("Auto-place failed", e); }
+    finally { setIsAutoPlacing(null); }
+  }
+
+  const [isConnectingPipes, setIsConnectingPipes] = useState(false);
+  const [detectedSources, setDetectedSources] = useState<{x:number; y:number}[]>([]);
+  const [sourceSelectMode, setSourceSelectMode] = useState(false);
+  const [chosenSource, setChosenSource] = useState<{x:number; y:number} | null>(null);
+  const [isDetectingSources, setIsDetectingSources] = useState(false);
+
+  /** Step 1: detect sources, show them, and enter source-selection mode. */
+  async function startConnectPipes() {
+    setIsDetectingSources(true);
+    try {
+      const res = await authFetch(`/api/projects/${projectId}/detect_sources`);
+      const srcs: {x:number; y:number}[] = res.ok ? await res.json() : [];
+      setDetectedSources(srcs);
+      setChosenSource(null);
+      setSourceSelectMode(true);
+      // If exactly one source detected, pre-select it
+      if (srcs.length === 1) setChosenSource(srcs[0]);
+    } catch (e) { console.error("Detect sources failed", e); }
+    finally { setIsDetectingSources(false); }
+  }
+
+  /** Step 2: route pipes with the chosen source (or auto if none). */
+  async function connectPipes(source?: {x:number; y:number} | null) {
+    setIsConnectingPipes(true);
+    setSourceSelectMode(false);
+    try {
+      const url = floorPlanId
+        ? `/api/projects/${projectId}/floor_plans/${floorPlanId}/route_pipes`
+        : `/api/projects/${projectId}/route_pipes`;
+      const body = source ? { source: { x: source.x, y: source.y } } : undefined;
+      const res = await authFetch(url, {
+        method: "POST",
+        headers: body ? { "Content-Type": "application/json" } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (res.ok) {
+        const pd: PipesData = await res.json();
+        setPipesData(pd);
+      }
+    } catch (e) { console.error("Connect pipes failed", e); }
+    finally {
+      setIsConnectingPipes(false);
+      setDetectedSources([]);
+      setChosenSource(null);
+    }
+  }
+
+  // ── Pipe editing helpers ──
+  function hitTestPipe(px: number, py: number): number | null {
+    if (!pipesData?.pipes) return null;
+    const threshold = 8;
+    for (let i = 0; i < pipesData.pipes.length; i++) {
+      const pipe = pipesData.pipes[i];
+      const p1 = worldToPixel(mapping, pipe.from[0], pipe.from[1]);
+      const p2 = worldToPixel(mapping, pipe.to[0], pipe.to[1]);
+      const dx = p2.px - p1.px, dy = p2.py - p1.py;
+      const len2 = dx * dx + dy * dy;
+      if (len2 < 1) continue;
+      const t = Math.max(0, Math.min(1, ((px - p1.px) * dx + (py - p1.py) * dy) / len2));
+      const cx = p1.px + t * dx, cy = p1.py + t * dy;
+      if (Math.hypot(px - cx, py - cy) <= threshold) return i;
+    }
+    return null;
+  }
+
+  function deletePipe(idx: number) {
+    if (!pipesData) return;
+    const newPipes = pipesData.pipes.filter((_, i) => i !== idx);
+    setPipesData({ ...pipesData, pipes: newPipes });
+    setSelectedPipeIdx(null);
+  }
+
+  function addPipe(fromPx: {px:number; py:number}, toPx: {px:number; py:number}) {
+    const wFrom = pixelToWorld(mapping, fromPx.px, fromPx.py);
+    const wTo = pixelToWorld(mapping, toPx.px, toPx.py);
+    const newSeg: PipeSegment = {
+      from: [wFrom.x, wFrom.y],
+      to: [wTo.x, wTo.y],
+      diameter: "25mm",
+    };
+    const prev = pipesData || { pipes: [], sources: [] };
+    setPipesData({ ...prev, pipes: [...prev.pipes, newSeg] });
+  }
+
+  async function savePipesData() {
+    if (!pipesData) return;
+    try {
+      const url = floorPlanId
+        ? `/api/projects/${projectId}/floor_plans/${floorPlanId}/sprinkler_pipes`
+        : `/api/projects/${projectId}/sprinkler_pipes`;
+      await authFetch(url, { method: "PUT", body: JSON.stringify(pipesData) });
+    } catch (e) { console.error("Save pipes failed", e); }
+  }
+
+  function clearEquipmentType(equipmentType: string) {
+    setDetectors(prev => prev.filter(d => d.dtype !== equipmentType));
+    if (equipmentType === "sprinkler") {
+      setPipesData(null);
+    }
+  }
+
+  async function handleSaveChanges() {
+    setIsSavingChanges(true);
+    try {
+      const payload: any = {
+        rooms,
+        detectors: detectors.map(d => ({
+          id: d.id, x: d.x, y: d.y, z: d.z,
+          dtype: d.dtype, locked: d.locked,
+          floor_plan_id: d.floor_plan_id,
+        })),
+        pipes: pipesData || undefined,
+        floor_plan_id: floorPlanId || undefined,
+      };
+      const res = await authFetch(`/api/projects/${projectId}/bulk_save`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.detectors) setDetectors(data.detectors);
+      }
+    } catch (e) { console.error("Save changes failed", e); }
+    finally { setIsSavingChanges(false); }
+  }
+
+  // ── Save & Continue ──
+  async function handleContinue() {
+    setIsContinuing(true);
+    try {
+      // Save all user state (rooms + detectors + pipes) before finalizing
+      const payload: any = {
+        rooms,
+        detectors: detectors.map(d => ({
+          id: d.id, x: d.x, y: d.y, z: d.z,
+          dtype: d.dtype, locked: d.locked,
+          floor_plan_id: d.floor_plan_id,
+        })),
+        pipes: pipesData || undefined,
+        floor_plan_id: floorPlanId || undefined,
+      };
+      await authFetch(`/api/projects/${projectId}/bulk_save`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+      await onContinue(rooms);
+    } finally { setIsContinuing(false); }
+  }
+
+  async function handleSaveRooms() {
+    setIsSavingRooms(true);
+    try { await onSave(rooms); } finally { setIsSavingRooms(false); }
+  }
+
+  // ── SVG event handlers for room split in "rooms" mode ──
+  function handleSvgSplitClick(e: React.MouseEvent<SVGSVGElement>) {
+    if (editorMode !== "rooms" || !splitMode || !selectedRoom) return;
+    const point = toImagePoint(e);
+    if (!point) return;
+    const snapped = snapPointToRoomBoundary(selectedRoom, point);
+    if (!snapped) return;
+    handleSplitDotClick(snapped);
+  }
+
+  function handleSvgSplitMouseMove(e: React.MouseEvent<SVGSVGElement>) {
+    if (editorMode !== "rooms" || !splitMode || !selectedRoom) { if (splitHover) setSplitHover(null); return; }
+    const point = toImagePoint(e);
+    if (!point) { if (splitHover) setSplitHover(null); return; }
+    const snapped = snapPointToRoomBoundary(selectedRoom, point);
+    setSplitHover(snapped);
+  }
+
+  // ── Loading state ──
+  if (loading) {
+    return (
+      <div style={{ height: "100%", display: "grid", placeItems: "center", color: "#6B7280" }}>
+        <p>Loading rooms...</p>
+      </div>
+    );
+  }
+
+  const selectedRoom = rooms.find(r => r.id === selectedId);
+  const splitPreviewEnd = splitEnd || splitHover;
+  const isPanning = editorMode === "pan";
+
+  function canvasCursor() {
+    if (editorMode === "pan") return "grab";
+    if (editorMode === "add") return "crosshair";
+    if (editorMode === "erase") return "not-allowed";
+    if (editorMode === "rooms" && splitMode) return "crosshair";
+    if (editorMode === "pipe_draw") return "crosshair";
+    if (editorMode === "pipe_select") return "pointer";
+    if (groupDrag) return "grabbing";
+    return "default";
+  }
+
+  return (
+    <div style={{ display: "flex", height: "100%", overflow: "hidden" }}>
+      {/* ── Canvas area ── */}
+      <div style={{ flex: 1, position: "relative", overflow: "hidden", background: "#F7F8FA" }}>
+        <TransformWrapper
+          minScale={0.02}
+          maxScale={24}
+          initialScale={0.18}
+          centerOnInit
+          limitToBounds={false}
+          panning={{ disabled: !isPanning }}
+          wheel={{ step: 0.08 }}
+          doubleClick={{ disabled: true }}
+          onTransformed={(_ref: unknown, state: any) => {
+            setTransformState({
+              scale: typeof state?.scale === "number" ? state.scale : 0.18,
+              positionX: typeof state?.positionX === "number" ? state.positionX : 0,
+              positionY: typeof state?.positionY === "number" ? state.positionY : 0,
+            });
+          }}
+        >
+          {({ zoomIn, zoomOut, resetTransform, setTransform }) => (
+            <>
+              {/* ── Toolbar ── */}
+              <div style={{
+                position: "absolute", top: 14, left: 14, zIndex: 3,
+                display: "flex", flexDirection: "column", gap: 6,
+              }}>
+                <div style={{
+                  display: "flex", alignItems: "center", gap: 6,
+                  padding: "6px 10px", borderRadius: 12,
+                  background: "#FFFFFF", border: "1px solid #E8EAED",
+                  boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+                }}>
+                  <button onClick={() => { setEditorMode("rooms"); setSelectedDetectorIds([]); }} style={ceToolBtn(editorMode === "rooms")}>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="12" y1="3" x2="12" y2="21"/></svg>
+                    Rooms
+                  </button>
+                  <div style={{ width: 1, height: 20, background: "#E8EAED" }} />
+                  <button onClick={() => { setEditorMode("select"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "select")}>Select</button>
+                  {canEdit && <button onClick={() => { setEditorMode("add"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "add")}>Add</button>}
+                  {canEdit && <button onClick={() => { setEditorMode("erase"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "erase")}>Erase</button>}
+                  <button onClick={() => { setEditorMode("pan"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "pan")}>Pan</button>
+                  {canEdit && (
+                  <>
+                  <div style={{ width: 1, height: 20, background: "#E8EAED" }} />
+                  <button onClick={() => { setEditorMode("pipe_draw"); setSplitMode(false); resetSplitState(); setSelectedPipeIdx(null); setPipeDrawStart(null); setPipeDrawEnd(null); }} style={ceToolBtn(editorMode === "pipe_draw" || editorMode === "pipe_select")}>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+                    Pipes
+                  </button>
+                  </>
+                  )}
+                  {selectedDetectorIds.length > 0 ? (
+                    <>
+                      <span style={{ fontSize: 12, color: "#6B7280", marginLeft: 4 }}>Selected: {selectedDetectorIds.length}</span>
+                      {canEdit && <button onClick={() => deleteDetectorsMany(selectedDetectorIds)} style={{ ...ceToolBtn(false), color: "#DC2626", borderColor: "#FECACA" }}>Delete Selected</button>}
+                      <button onClick={() => setSelectedDetectorIds([])} style={ceToolBtn(false)}>Clear</button>
+                    </>
+                  ) : null}
+                </div>
+                {editorMode === "add" ? (
+                  <div style={{
+                    display: "flex", alignItems: "center", gap: 6,
+                    padding: "6px 10px", borderRadius: 12,
+                    background: "#FFFFFF", border: "1px solid #E8EAED",
+                    boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+                  }}>
+                    {OBJECT_TYPES.map((otype) => (
+                      <button
+                        key={otype}
+                        onClick={() => { setAddType(otype); setEditorMode("add"); }}
+                        style={ceObjectBtn(addType === otype)}
+                        title={`Place ${objectLabel(otype)}`}
+                      >
+                        {renderObjectIcon(otype)}
+                        <span style={{ fontSize: 11 }}>{objectLabel(otype)}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                {(editorMode === "pipe_draw" || editorMode === "pipe_select") ? (
+                  <div style={{
+                    display: "flex", alignItems: "center", gap: 6,
+                    padding: "6px 10px", borderRadius: 12,
+                    background: "#FFFFFF", border: "1px solid #E8EAED",
+                    boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+                  }}>
+                    <button onClick={() => { setEditorMode("pipe_draw"); setSelectedPipeIdx(null); }} style={ceToolBtn(editorMode === "pipe_draw")}>
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                      Draw
+                    </button>
+                    <button onClick={() => { setEditorMode("pipe_select"); setPipeDrawStart(null); setPipeDrawEnd(null); }} style={ceToolBtn(editorMode === "pipe_select")}>
+                      Select
+                    </button>
+                    {selectedPipeIdx !== null ? (
+                      <button onClick={() => deletePipe(selectedPipeIdx)} style={{ ...ceToolBtn(false), borderColor: "rgba(220,38,38,0.3)", color: "#DC2626" }}>
+                        Delete
+                      </button>
+                    ) : null}
+                    <span style={{ fontSize: 11, color: "#6B7280" }}>
+                      {pipesData?.pipes?.length || 0} pipes
+                    </span>
+                  </div>
+                ) : null}
+              </div>
+
+              {/* ── Zoom controls ── */}
+              <div style={{
+                position: "absolute", bottom: 14, left: 14, zIndex: 3,
+                display: "flex", alignItems: "center", gap: 6,
+                padding: "6px 10px", borderRadius: 12,
+                background: "#FFFFFF", border: "1px solid #E8EAED",
+                boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+              }}>
+                <button onClick={() => zoomOut()} style={ceZoomBtn}>&#8722;</button>
+                <input type="range" min={2} max={2400}
+                  value={Math.max(2, Math.min(2400, Math.round(transformState.scale * 100)))}
+                  onChange={(e) => setTransform(transformState.positionX, transformState.positionY, Number(e.target.value) / 100, 100)}
+                  style={{ width: 100 }}
+                />
+                <button onClick={() => zoomIn()} style={ceZoomBtn}>+</button>
+                <button onClick={() => resetTransform()} style={ceZoomBtn}>Fit</button>
+                <span style={{ fontSize: 12, color: "#6B7280", minWidth: 40, textAlign: "right" }}>
+                  {Math.round(transformState.scale * 100)}%
+                </span>
+              </div>
+
+              <TransformComponent
+                wrapperStyle={{
+                  width: "100%", height: "100%", borderRadius: "14px",
+                  border: "1px solid #E8EAED",
+                  background: "#FAFBFC",
+                }}
+              >
+                <div style={{ position: "relative", display: "inline-block" }}>
+                  <img
+                    src={renderUrl}
+                    alt="Floor plan"
+                    style={{ display: "block", userSelect: "none", pointerEvents: "none", borderRadius: 8 }}
+                    draggable={false}
+                    onLoad={onImageLoad}
+                  />
+                  {imgDims ? (
+                    <svg
+                      width={imgDims.w}
+                      height={imgDims.h}
+                      viewBox={`0 0 ${imgDims.w} ${imgDims.h}`}
+                      style={{ position: "absolute", left: 0, top: 0, cursor: canvasCursor() }}
+                      onClick={(e) => {
+                        // Source selection mode: click to place custom source
+                        if (sourceSelectMode) {
+                          const pt = toImagePoint(e);
+                          if (!pt) return;
+                          const w = pixelToWorld(mapping, pt.px, pt.py);
+                          setChosenSource({ x: w.x, y: w.y });
+                          return;
+                        }
+                        if (editorMode === "rooms" && splitMode && selectedRoom) {
+                          const pt = toImagePoint(e);
+                          if (!pt) return;
+                          const snapped = snapPointToRoomBoundary(selectedRoom, pt);
+                          if (snapped) handleSplitDotClick(snapped);
+                        }
+                      }}
+                      onMouseDown={(e) => {
+                        const point = toImagePoint(e);
+                        if (!point) return;
+                        const { px, py } = point;
+                        if (editorMode === "rooms") return;
+                        // Pipe draw mode
+                        if (editorMode === "pipe_draw") {
+                          if (!pipeDrawStart) {
+                            setPipeDrawStart({ px, py });
+                            setPipeDrawEnd({ px, py });
+                          }
+                          return;
+                        }
+                        // Pipe select mode
+                        if (editorMode === "pipe_select") {
+                          const pIdx = hitTestPipe(px, py);
+                          setSelectedPipeIdx(pIdx);
+                          return;
+                        }
+                        const detId = hitTestDetector(px, py);
+                        if (editorMode === "select") {
+                          if (detId) {
+                            if (selectedDetectorIds.includes(detId)) beginGroupDrag(selectedDetectorIds, point);
+                            else { setSelectedDetectorIds([detId]); beginGroupDrag([detId], point); }
+                          } else { setMarquee({ sx: px, sy: py, ex: px, ey: py }); }
+                          return;
+                        }
+                        if (editorMode === "add") { if (canEdit) addDetectorAt(px, py); return; }
+                        if (editorMode === "erase") {
+                          if (detId) { if (canEdit) deleteDetector(detId); }
+                          else { setMarquee({ sx: px, sy: py, ex: px, ey: py }); }
+                          return;
+                        }
+                      }}
+                      onMouseMove={(e) => {
+                        const point = toImagePoint(e);
+                        if (!point) return;
+                        if (editorMode === "rooms" && splitMode && selectedRoom) {
+                          const snapped = snapPointToRoomBoundary(selectedRoom, point);
+                          setSplitHover(snapped);
+                          return;
+                        }
+                        setHoverPoint(point);
+                        // Pipe draw preview
+                        if (editorMode === "pipe_draw" && pipeDrawStart) {
+                          setPipeDrawEnd(point);
+                          return;
+                        }
+                        if (editorMode !== "select" && editorMode !== "erase") return;
+                        if (marquee) { setMarquee({ ...marquee, ex: point.px, ey: point.py }); return; }
+                        if (!groupDrag) return;
+                        const dx = point.px - groupDrag.start.px;
+                        const dy = point.py - groupDrag.start.py;
+                        const next: Record<string, { px: number; py: number }> = {};
+                        for (const detId of groupDrag.ids) {
+                          const base = groupDrag.origins[detId];
+                          if (base) next[detId] = { px: base.px + dx, py: base.py + dy };
+                        }
+                        setGroupPreview(next);
+                      }}
+                      onMouseUp={() => {
+                        // Finalize pipe draw
+                        if (editorMode === "pipe_draw" && pipeDrawStart && pipeDrawEnd) {
+                          const dist = Math.hypot(pipeDrawEnd.px - pipeDrawStart.px, pipeDrawEnd.py - pipeDrawStart.py);
+                          if (dist > 5) {
+                            // Snap to orthogonal (horizontal or vertical)
+                            const dx = Math.abs(pipeDrawEnd.px - pipeDrawStart.px);
+                            const dy = Math.abs(pipeDrawEnd.py - pipeDrawStart.py);
+                            const snappedEnd = dx > dy
+                              ? { px: pipeDrawEnd.px, py: pipeDrawStart.py }
+                              : { px: pipeDrawStart.px, py: pipeDrawEnd.py };
+                            addPipe(pipeDrawStart, snappedEnd);
+                          }
+                          setPipeDrawStart(null);
+                          setPipeDrawEnd(null);
+                          return;
+                        }
+                        if (editorMode !== "select" && editorMode !== "erase") return;
+                        if (marquee) {
+                          const rect = rectFromPoints({ px: marquee.sx, py: marquee.sy }, { px: marquee.ex, py: marquee.ey });
+                          if (editorMode === "erase" && canEdit) {
+                            const ids = idsInRect(rect);
+                            deleteDetectorsMany(ids);
+                          } else {
+                            setSelectedDetectorIds(idsInRect(rect));
+                          }
+                          setMarquee(null);
+                          return;
+                        }
+                        if (groupDrag && groupPreview) {
+                          moveDetectorsToMany(groupPreview);
+                          setGroupDrag(null);
+                          setGroupPreview(null);
+                        }
+                      }}
+                      onMouseLeave={() => {
+                        setHoverPoint(null);
+                        if (editorMode === "rooms") setSplitHover(null);
+                        if (marquee) setMarquee(null);
+                        if (groupDrag) setGroupDrag(null);
+                        if (groupPreview) setGroupPreview(null);
+                        if (pipeDrawStart) { setPipeDrawStart(null); setPipeDrawEnd(null); }
+                      }}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        if (!canEdit) return;
+                        if (editorMode === "rooms") return;
+                        const point = toImagePoint(e);
+                        if (!point) return;
+                        const detId = hitTestDetector(point.px, point.py);
+                        if (detId) deleteDetector(detId);
+                      }}
+                    >
+                      {/* Room polygons */}
+                      {rooms.map(room => {
+                        const pts = room.polygon_px.map(p => `${p[0]},${p[1]}`).join(" ");
+                        const { cx, cy } = roomCentroidPx(room);
+                        const isSelected = room.id === selectedId;
+                        return (
+                          <g key={room.id} onClick={() => { if (editorMode === "rooms" && !splitMode) setSelectedId(isSelected ? null : room.id); }}>
+                            <polygon
+                              points={pts}
+                              fill={isSelected ? "rgba(45,106,79,0.25)" : "rgba(45,106,79,0.10)"}
+                              stroke={isSelected ? "#2D6A4F" : "rgba(45,106,79,0.4)"}
+                              strokeWidth={isSelected ? 2.5 : 1.5}
+                              style={{ cursor: editorMode === "rooms" ? "pointer" : "inherit", transition: "fill 0.15s" }}
+                            />
+                            <text
+                              x={cx} y={cy}
+                              textAnchor="middle" dominantBaseline="central"
+                              fill="#1A1A2E"
+                              fontSize={Math.max(12, (imgDims?.w || mapping.width_px) / 80)}
+                              fontWeight={600}
+                              style={{ pointerEvents: "none", textShadow: "0 1px 3px rgba(255,255,255,0.8)" }}
+                            >
+                              {room.label || room.id}
+                            </text>
+                          </g>
+                        );
+                      })}
+
+                      {/* Sprinkler pipes */}
+                      {pipesData?.pipes?.map((pipe, i) => {
+                        const p1 = worldToPixel(mapping, pipe.from[0], pipe.from[1]);
+                        const p2 = worldToPixel(mapping, pipe.to[0], pipe.to[1]);
+                        const isSel = selectedPipeIdx === i;
+                        return (
+                          <g key={`pipe-${i}`}
+                            onClick={(e) => {
+                              if (editorMode === "pipe_select") { e.stopPropagation(); setSelectedPipeIdx(isSel ? null : i); }
+                            }}
+                            style={{ cursor: editorMode === "pipe_select" ? "pointer" : "inherit" }}
+                          >
+                            {isSel ? (
+                              <line x1={p1.px} y1={p1.py} x2={p2.px} y2={p2.py}
+                                stroke="#ffe58f" strokeWidth={6} opacity={0.5} />
+                            ) : null}
+                            <line x1={p1.px} y1={p1.py} x2={p2.px} y2={p2.py}
+                              stroke={isSel ? "#f59e0b" : "#DC2626"} strokeWidth={isSel ? 3 : 2} opacity={isSel ? 1 : 0.7} />
+                            {(editorMode === "pipe_select" || editorMode === "pipe_draw") ? (
+                              <line x1={p1.px} y1={p1.py} x2={p2.px} y2={p2.py}
+                                stroke="transparent" strokeWidth={12} />
+                            ) : null}
+                          </g>
+                        );
+                      })}
+                      {/* Pipe draw preview */}
+                      {editorMode === "pipe_draw" && pipeDrawStart && pipeDrawEnd ? (() => {
+                        const dx = Math.abs(pipeDrawEnd.px - pipeDrawStart.px);
+                        const dy = Math.abs(pipeDrawEnd.py - pipeDrawStart.py);
+                        const snappedEnd = dx > dy
+                          ? { px: pipeDrawEnd.px, py: pipeDrawStart.py }
+                          : { px: pipeDrawStart.px, py: pipeDrawEnd.py };
+                        return (
+                          <line x1={pipeDrawStart.px} y1={pipeDrawStart.py} x2={snappedEnd.px} y2={snappedEnd.py}
+                            stroke="#DC2626" strokeWidth={2} strokeDasharray="8 4" opacity={0.8} />
+                        );
+                      })() : null}
+                      {pipesData?.sources?.map((src, i) => {
+                        const p = worldToPixel(mapping, src.x, src.y);
+                        return (
+                          <g key={`src-${i}`}>
+                            <rect x={p.px - 7} y={p.py - 7} width={14} height={14} rx={2} fill="#B91C1C" opacity={0.85} />
+                            <line x1={p.px - 4} y1={p.py} x2={p.px + 4} y2={p.py} stroke="#fff" strokeWidth={1.8} />
+                            <line x1={p.px} y1={p.py - 4} x2={p.px} y2={p.py + 4} stroke="#fff" strokeWidth={1.8} />
+                          </g>
+                        );
+                      })}
+
+                      {/* Detected source markers (during source selection) */}
+                      {sourceSelectMode && detectedSources.map((src, i) => {
+                        const p = worldToPixel(mapping, src.x, src.y);
+                        const isChosen = chosenSource && Math.abs(chosenSource.x - src.x) < 1 && Math.abs(chosenSource.y - src.y) < 1;
+                        return (
+                          <g key={`dsrc-${i}`} style={{ cursor: "pointer" }}
+                            onClick={(e) => { e.stopPropagation(); setChosenSource(src); }}
+                          >
+                            <circle cx={p.px} cy={p.py} r={18} fill="none" stroke={isChosen ? "#16A34A" : "#F59E0B"} strokeWidth={3} strokeDasharray={isChosen ? "none" : "6 3"} />
+                            <circle cx={p.px} cy={p.py} r={6} fill={isChosen ? "#16A34A" : "#F59E0B"} />
+                            <text x={p.px} y={p.py - 24} textAnchor="middle" fill={isChosen ? "#16A34A" : "#F59E0B"} fontSize={12} fontWeight={700}>
+                              {isChosen ? "✓ Selected" : `Source ${i + 1}`}
+                            </text>
+                          </g>
+                        );
+                      })}
+
+                      {/* User-placed custom source marker */}
+                      {sourceSelectMode && chosenSource && !detectedSources.some(s => Math.abs(s.x - chosenSource.x) < 1 && Math.abs(s.y - chosenSource.y) < 1) && (() => {
+                        const p = worldToPixel(mapping, chosenSource.x, chosenSource.y);
+                        return (
+                          <g>
+                            <circle cx={p.px} cy={p.py} r={18} fill="none" stroke="#16A34A" strokeWidth={3} />
+                            <circle cx={p.px} cy={p.py} r={6} fill="#16A34A" />
+                            <text x={p.px} y={p.py - 24} textAnchor="middle" fill="#16A34A" fontSize={12} fontWeight={700}>
+                              ✓ Custom Source
+                            </text>
+                          </g>
+                        );
+                      })()}
+
+                      {/* Detectors */}
+                      {detectors.map(d => {
+                        const p = groupPreview?.[d.id] || worldToPixel(mapping, d.x, d.y);
+                        const isSel = selectedDetectorIds.includes(d.id);
+                        return (
+                          <g key={d.id}>
+                            {isSel ? (
+                              <>
+                                <circle cx={p.px} cy={p.py} r={16} fill="rgba(255,229,143,0.20)" />
+                                <circle cx={p.px} cy={p.py} r={15} fill="none" stroke="#ffe58f" strokeWidth={3} strokeDasharray="6 4" />
+                              </>
+                            ) : null}
+                            {renderPlacedObject(d.dtype, p.px, p.py)}
+                            <circle cx={p.px} cy={p.py} r={11} fill="none" stroke={isSel ? "#ffe58f" : "#ffffff"} strokeWidth={isSel ? 3 : 2} />
+                            {isSel ? <circle cx={p.px} cy={p.py} r={3} fill="#fff7d1" /> : null}
+                          </g>
+                        );
+                      })}
+
+                      {/* Split line preview */}
+                      {editorMode === "rooms" && splitMode && splitStart && splitPreviewEnd ? (
+                        <line x1={splitStart.px} y1={splitStart.py} x2={splitPreviewEnd.px} y2={splitPreviewEnd.py}
+                          stroke="#DC2626" strokeWidth={3} strokeDasharray="8 4" />
+                      ) : null}
+                      {editorMode === "rooms" && splitMode && splitHover ? (
+                        <circle cx={splitHover.px} cy={splitHover.py} r={5} fill="#FEE2E2" stroke="#DC2626" strokeWidth={2} style={{ pointerEvents: "none" }} />
+                      ) : null}
+                      {editorMode === "rooms" && splitMode && selectedRoom ? selectedRoom.polygon_px.map((p, idx) => {
+                        const dot = { px: p[0], py: p[1] };
+                        const isStart = !!splitStart && samePoint(splitStart, dot);
+                        return (
+                          <circle key={`split-dot-${idx}`} cx={dot.px} cy={dot.py} r={isStart ? 8 : 6}
+                            fill={isStart ? "#DC2626" : "#FFFFFF"} stroke={isStart ? "#FCA5A5" : "#2D6A4F"} strokeWidth={2}
+                            style={{ cursor: "pointer" }}
+                            onClick={(e) => { e.stopPropagation(); handleSplitDotClick(dot); }}
+                          />
+                        );
+                      }) : null}
+
+                      {/* Marquee selection */}
+                      {marquee ? (() => {
+                        const rect = rectFromPoints({ px: marquee.sx, py: marquee.sy }, { px: marquee.ex, py: marquee.ey });
+                        const isEraseMarquee = editorMode === "erase";
+                        return (
+                          <rect x={rect.left} y={rect.top}
+                            width={Math.max(1, rect.right - rect.left)} height={Math.max(1, rect.bottom - rect.top)}
+                            fill={isEraseMarquee ? "rgba(220,38,38,0.15)" : "rgba(45,106,79,0.12)"}
+                            stroke={isEraseMarquee ? "#DC2626" : "#2D6A4F"}
+                            strokeWidth={2} strokeDasharray="6 4" />
+                        );
+                      })() : null}
+
+                      {/* Add detector preview */}
+                      {editorMode === "add" && hoverPoint ? (
+                        <g>
+                          <circle cx={hoverPoint.px} cy={hoverPoint.py} r={13} fill="none" stroke="#2D6A4F" strokeWidth={2} strokeDasharray="5 4" />
+                          <line x1={hoverPoint.px - 9} y1={hoverPoint.py} x2={hoverPoint.px + 9} y2={hoverPoint.py} stroke="#2D6A4F" strokeWidth={2} />
+                          <line x1={hoverPoint.px} y1={hoverPoint.py - 9} x2={hoverPoint.px} y2={hoverPoint.py + 9} stroke="#2D6A4F" strokeWidth={2} />
+                        </g>
+                      ) : null}
+                    </svg>
+                  ) : null}
+                </div>
+              </TransformComponent>
+            </>
+          )}
+        </TransformWrapper>
+      </div>
+
+      {/* ── Sidebar ── */}
+      <div style={{
+        width: 320, flexShrink: 0, borderLeft: "1px solid #E8EAED",
+        background: "#FFFFFF",
+        display: "flex", flexDirection: "column", overflow: "hidden",
+      }}>
+        {/* Tab bar */}
+        <div style={{ display: "flex", borderBottom: "1px solid #E8EAED", flexShrink: 0 }}>
+          <button
+            onClick={() => setSidebarTab("rooms")}
+            style={{
+              flex: 1, padding: "12px 0", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600,
+              background: sidebarTab === "rooms" ? "#FFFFFF" : "#FAFBFC",
+              color: sidebarTab === "rooms" ? "#2D6A4F" : "#6B7280",
+              borderBottom: sidebarTab === "rooms" ? "2px solid #2D6A4F" : "2px solid transparent",
+            }}
+          >
+            Rooms ({rooms.length})
+          </button>
+          <button
+            onClick={() => setSidebarTab("equipment")}
+            style={{
+              flex: 1, padding: "12px 0", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600,
+              background: sidebarTab === "equipment" ? "#FFFFFF" : "#FAFBFC",
+              color: sidebarTab === "equipment" ? "#2D6A4F" : "#6B7280",
+              borderBottom: sidebarTab === "equipment" ? "2px solid #2D6A4F" : "2px solid transparent",
+            }}
+          >
+            Equipment ({detectors.length})
+          </button>
+        </div>
+
+        {sidebarTab === "rooms" ? (
+          <>
+            <div style={{ padding: "10px 14px 6px" }}>
+              <p style={{ margin: 0, fontSize: 12, color: "#6B7280", lineHeight: 1.4 }}>
+                Click a room to select, then rename, delete, or split. Switch to Add/Select mode to place equipment.
+              </p>
+            </div>
+            <div style={{ flex: 1, overflow: "auto", padding: "6px 14px" }}>
+              {rooms.map((room) => {
+                const isSelected = room.id === selectedId;
+                return (
+                  <div
+                    key={room.id}
+                    onClick={() => { setSelectedId(isSelected ? null : room.id); setEditorMode("rooms"); }}
+                    style={{
+                      padding: "10px 12px", marginBottom: 6, borderRadius: 10,
+                      border: isSelected ? "1px solid #2D6A4F" : "1px solid #E8EAED",
+                      background: isSelected ? "rgba(45,106,79,0.06)" : "#FAFBFC",
+                      cursor: "pointer", transition: "all 0.15s",
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      {editingLabelId === room.id ? (
+                        <input
+                          autoFocus
+                          value={labelDraft}
+                          onChange={e => setLabelDraft(e.target.value)}
+                          onBlur={() => handleRenameCommit(room.id)}
+                          onKeyDown={e => { if (e.key === "Enter") handleRenameCommit(room.id); if (e.key === "Escape") setEditingLabelId(null); }}
+                          onClick={e => e.stopPropagation()}
+                          style={{
+                            background: "#FFFFFF", border: "1px solid #2D6A4F", borderRadius: 6,
+                            color: "#1A1A2E", padding: "4px 8px", fontSize: 13, width: "60%", outline: "none",
+                          }}
+                        />
+                      ) : (
+                        <span style={{ fontSize: 13, fontWeight: 600, color: "#1A1A2E" }}>{room.label || room.id}</span>
+                      )}
+                      <span style={{ fontSize: 11, color: "#9CA3AF" }}>{room.polygon_px.length} pts</span>
+                    </div>
+                    {isSelected && canEdit ? (
+                      <div style={{ marginTop: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                        <button onClick={(e) => { e.stopPropagation(); handleRenameStart(room); }} style={ceRoomBtn}>Rename</button>
+                        <button onClick={(e) => { e.stopPropagation(); resetSplitState(); setSplitMode(true); setEditorMode("rooms"); }} style={ceRoomBtn}>Split</button>
+                        <button onClick={(e) => { e.stopPropagation(); handleDeleteRoom(room.id); }} style={{ ...ceRoomBtn, borderColor: "rgba(220,38,38,0.3)", color: "#DC2626" }}>Delete</button>
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        ) : (
+          <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
+            <div style={{ padding: "10px 14px 6px" }}>
+              <p style={{ margin: 0, fontSize: 12, color: "#6B7280", lineHeight: 1.4 }}>
+                {canEdit
+                  ? "Auto-place equipment based on NBC rules, or manually place using the toolbar."
+                  : "Equipment placement (view only). You need editor or admin role to modify."}
+              </p>
+            </div>
+
+            {/* Per-equipment auto-place buttons */}
+            {canEdit && (
+            <div style={{ padding: "6px 14px", display: "flex", flexDirection: "column", gap: 6 }}>
+              {(() => {
+                const EQUIPMENT_BUTTONS: { key: string; dtype: string; label: string; icon: React.ReactNode }[] = [
+                  {
+                    key: "auto_detection_alarm", dtype: "smoke",
+                    label: "Detectors & Alarms",
+                    icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><text x="12" y="16" textAnchor="middle" fontSize="12" fontWeight="700" fill="currentColor" stroke="none">S</text></svg>,
+                  },
+                  {
+                    key: "auto_sprinkler", dtype: "sprinkler",
+                    label: "Sprinklers",
+                    icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2v6"/><path d="M5 10l7 4 7-4"/><path d="M5 14l2 6"/><path d="M19 14l-2 6"/><path d="M12 14v8"/></svg>,
+                  },
+                  {
+                    key: "hose_reel", dtype: "fire_hose",
+                    label: "Fire Hose Reels",
+                    icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/></svg>,
+                  },
+                  {
+                    key: "fire_extinguisher", dtype: "panel",
+                    label: "Fire Extinguishers",
+                    icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="6" y="4" width="12" height="16" rx="2"/><line x1="10" y1="2" x2="14" y2="2"/><line x1="12" y1="8" x2="12" y2="14"/></svg>,
+                  },
+                  {
+                    key: "manual_fire_alarm", dtype: "hooter",
+                    label: "Manual Fire Alarms",
+                    icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>,
+                  },
+                ];
+
+                const nbcMap: Record<string, NBCEquipmentItem> = {};
+                for (const eq of nbcEquipment) { nbcMap[eq.key] = eq; }
+
+                const detCounts: Record<string, number> = {};
+                for (const d of detectors) { detCounts[d.dtype] = (detCounts[d.dtype] || 0) + 1; }
+
+                return EQUIPMENT_BUTTONS.map(btn => {
+                  const nbcInfo = nbcMap[btn.key];
+                  const isRequired = nbcInfo?.required ?? false;
+                  const isPlacing = isAutoPlacing === btn.dtype;
+                  const placedCount = detCounts[btn.dtype] || 0;
+
+                  return (
+                    <div key={btn.key} style={{
+                      padding: "10px 12px", borderRadius: 10,
+                      background: "#FAFBFC", border: "1px solid #E8EAED",
+                    }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                        <div style={{ color: isRequired ? "#2D6A4F" : "#9CA3AF", flexShrink: 0 }}>{btn.icon}</div>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: "#1A1A2E" }}>{btn.label}</div>
+                          <div style={{ fontSize: 11, color: "#6B7280", marginTop: 1 }}>
+                            {nbcInfo ? (isRequired ? "Required by NBC" : "Not required") : "NBC status unknown"}
+                            {placedCount > 0 ? ` \u00B7 ${placedCount} placed` : ""}
+                          </div>
+                        </div>
+                        {isRequired ? (
+                          <span style={{
+                            fontSize: 9, fontWeight: 700, padding: "2px 6px", borderRadius: 4,
+                            background: "#ECFDF5", color: "#059669", border: "1px solid rgba(5,150,105,0.2)",
+                            textTransform: "uppercase", letterSpacing: "0.05em", flexShrink: 0,
+                          }}>Required</span>
+                        ) : null}
+                      </div>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button
+                          onClick={() => autoPlaceEquipment(btn.dtype)}
+                          disabled={!!isAutoPlacing || rooms.length === 0}
+                          style={{
+                            flex: 1, padding: "6px 10px", borderRadius: 8,
+                            border: "none",
+                            background: isPlacing ? "#9CA3AF" : isRequired ? "#2D6A4F" : "#6B7280",
+                            color: "#fff", fontWeight: 600, fontSize: 11,
+                            cursor: (!!isAutoPlacing || rooms.length === 0) ? "wait" : "pointer",
+                            display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                            opacity: (!!isAutoPlacing && !isPlacing) ? 0.5 : 1,
+                          }}
+                        >
+                          {isPlacing ? (
+                            <>
+                              <div style={{ width: 12, height: 12, border: "2px solid rgba(255,255,255,0.3)", borderTopColor: "#fff", borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+                              Placing...
+                            </>
+                          ) : (
+                            <>{placedCount > 0 ? "Re-place" : "Auto-place"}</>
+                          )}
+                        </button>
+                        {placedCount > 0 ? (
+                          <button
+                            onClick={() => clearEquipmentType(btn.dtype)}
+                            disabled={!!isAutoPlacing}
+                            style={{
+                              padding: "6px 10px", borderRadius: 8,
+                              border: "1px solid rgba(220,38,38,0.2)",
+                              background: "#FEF2F2", color: "#DC2626",
+                              fontWeight: 600, fontSize: 11, cursor: "pointer",
+                            }}
+                          >
+                            Clear
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+            )}
+
+            {/* Connect Pipes button */}
+            {canEdit && (() => {
+              const sprinklerCount = detectors.filter(d => d.dtype === "sprinkler").length;
+              if (sprinklerCount === 0) return null;
+              return (
+                <div style={{ padding: "6px 14px" }}>
+                  <div style={{
+                    padding: "10px 12px", borderRadius: 10,
+                    background: "#FEF2F2", border: "1px solid rgba(220,38,38,0.2)",
+                  }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                      <div style={{ color: "#DC2626", flexShrink: 0 }}>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <line x1="2" y1="12" x2="22" y2="12" />
+                          <polyline points="15 5 22 12 15 19" />
+                        </svg>
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: "#1A1A2E" }}>Sprinkler Pipelines</div>
+                        <div style={{ fontSize: 11, color: "#6B7280", marginTop: 1 }}>
+                          {pipesData?.pipes?.length ? `${pipesData.pipes.length} pipe segments connected` : `${sprinklerCount} sprinklers ready to connect`}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Source selection panel (shown after detect) */}
+                    {sourceSelectMode ? (
+                      <div style={{ marginBottom: 8 }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: "#1A1A2E", marginBottom: 4 }}>
+                          Select Pipeline Source
+                        </div>
+                        <div style={{ fontSize: 11, color: "#6B7280", marginBottom: 6 }}>
+                          {detectedSources.length > 0
+                            ? `${detectedSources.length} source(s) detected (highlighted on drawing). Click one to select, or click anywhere on the drawing to place a custom source.`
+                            : "No sources detected in DXF. Click on the drawing to place a source manually."}
+                        </div>
+                        {detectedSources.map((src, i) => {
+                          const isChosen = chosenSource && Math.abs(chosenSource.x - src.x) < 1 && Math.abs(chosenSource.y - src.y) < 1;
+                          return (
+                            <button
+                              key={i}
+                              onClick={() => setChosenSource(src)}
+                              style={{
+                                width: "100%", padding: "5px 8px", borderRadius: 6, marginBottom: 3,
+                                border: isChosen ? "2px solid #16A34A" : "1px solid rgba(220,38,38,0.2)",
+                                background: isChosen ? "rgba(22,163,74,0.08)" : "#fff",
+                                color: isChosen ? "#16A34A" : "#374151",
+                                fontWeight: isChosen ? 700 : 500, fontSize: 11, cursor: "pointer",
+                                textAlign: "left",
+                              }}
+                            >
+                              {isChosen ? "✓ " : ""}Source {i + 1} ({src.x.toFixed(0)}, {src.y.toFixed(0)})
+                            </button>
+                          );
+                        })}
+                        {chosenSource && !detectedSources.some(s => Math.abs(s.x - chosenSource.x) < 1 && Math.abs(s.y - chosenSource.y) < 1) && (
+                          <div style={{ fontSize: 11, color: "#16A34A", fontWeight: 600, marginTop: 4 }}>
+                            ✓ Custom source placed at ({chosenSource.x.toFixed(0)}, {chosenSource.y.toFixed(0)})
+                          </div>
+                        )}
+                        <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                          <button
+                            onClick={() => connectPipes(chosenSource)}
+                            disabled={isConnectingPipes}
+                            style={{
+                              flex: 1, padding: "7px 10px", borderRadius: 8,
+                              border: "none",
+                              background: isConnectingPipes ? "#9CA3AF" : "#16A34A",
+                              color: "#fff", fontWeight: 600, fontSize: 11,
+                              cursor: isConnectingPipes ? "wait" : "pointer",
+                              display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                            }}
+                          >
+                            {isConnectingPipes ? (
+                              <>
+                                <div style={{ width: 12, height: 12, border: "2px solid rgba(255,255,255,0.3)", borderTopColor: "#fff", borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+                                Routing...
+                              </>
+                            ) : (
+                              <>{chosenSource ? "Route with Source" : "Route (auto)"}</>
+                            )}
+                          </button>
+                          <button
+                            onClick={() => { setSourceSelectMode(false); setDetectedSources([]); setChosenSource(null); }}
+                            style={{
+                              padding: "7px 10px", borderRadius: 8,
+                              border: "1px solid rgba(220,38,38,0.2)",
+                              background: "#fff", color: "#6B7280",
+                              fontWeight: 600, fontSize: 11, cursor: "pointer",
+                            }}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={startConnectPipes}
+                        disabled={isConnectingPipes || isDetectingSources || !!isAutoPlacing}
+                        style={{
+                          width: "100%", padding: "7px 10px", borderRadius: 8,
+                          border: "none",
+                          background: (isConnectingPipes || isDetectingSources) ? "#9CA3AF" : "#DC2626",
+                          color: "#fff", fontWeight: 600, fontSize: 11,
+                          cursor: (isConnectingPipes || isDetectingSources || !!isAutoPlacing) ? "wait" : "pointer",
+                          display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                        }}
+                      >
+                        {isDetectingSources ? (
+                          <>
+                            <div style={{ width: 12, height: 12, border: "2px solid rgba(255,255,255,0.3)", borderTopColor: "#fff", borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+                            Detecting Sources...
+                          </>
+                        ) : isConnectingPipes ? (
+                          <>
+                            <div style={{ width: 12, height: 12, border: "2px solid rgba(255,255,255,0.3)", borderTopColor: "#fff", borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+                            Connecting...
+                          </>
+                        ) : (
+                          <>{pipesData?.pipes?.length ? "Re-connect Pipes" : "Connect Pipes"}</>
+                        )}
+                      </button>
+                    )}
+
+                    {pipesData?.pipes?.length && !sourceSelectMode ? (
+                      <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                        <button
+                          onClick={() => { setEditorMode("pipe_draw"); setSidebarTab("equipment"); }}
+                          style={{
+                            flex: 1, padding: "6px 10px", borderRadius: 8,
+                            border: "1px solid rgba(220,38,38,0.2)",
+                            background: editorMode === "pipe_draw" ? "rgba(220,38,38,0.12)" : "#FEF2F2",
+                            color: "#DC2626", fontWeight: 600, fontSize: 11, cursor: "pointer",
+                          }}
+                        >
+                          + Draw Pipe
+                        </button>
+                        <button
+                          onClick={() => { setEditorMode("pipe_select"); setSidebarTab("equipment"); }}
+                          style={{
+                            flex: 1, padding: "6px 10px", borderRadius: 8,
+                            border: "1px solid rgba(220,38,38,0.2)",
+                            background: editorMode === "pipe_select" ? "rgba(220,38,38,0.12)" : "#FEF2F2",
+                            color: "#DC2626", fontWeight: 600, fontSize: 11, cursor: "pointer",
+                          }}
+                        >
+                          Select / Delete
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Equipment summary */}
+            <div style={{ padding: "6px 14px" }}>
+              {detectors.length === 0 ? (
+                <div style={{ textAlign: "center", padding: "16px 0", color: "#9CA3AF", fontSize: 12 }}>
+                  No equipment placed yet.
+                </div>
+              ) : (
+                <div style={{ fontSize: 12, color: "#6B7280", padding: "4px 0" }}>
+                  {detectors.length} total items placed
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Split mode hint */}
+        {editorMode === "rooms" && splitMode && selectedRoom ? (
+          <div style={{ padding: "0 14px 8px", fontSize: 12, color: "#6B7280" }}>
+            Click two points on the selected room boundary to split.
+          </div>
+        ) : null}
+
+        {/* Bottom action bar */}
+        {canEdit && (
+        <div style={{ padding: "12px 14px", borderTop: "1px solid #E8EAED", display: "flex", gap: 8, flexShrink: 0 }}>
+          {splitMode ? (
+            <button onClick={() => { setSplitMode(false); resetSplitState(); }} style={{ ...ceRoomBtn, flex: 1, background: "rgba(220,38,38,0.06)" }}>
+              Cancel Split
+            </button>
+          ) : null}
+          <button
+            onClick={handleSaveChanges}
+            disabled={isSavingChanges || isContinuing}
+            style={{
+              flex: 1, padding: "10px 16px", borderRadius: 10,
+              border: "1px solid #2D6A4F",
+              background: isSavingChanges ? "rgba(45,106,79,0.08)" : "#FFFFFF",
+              color: "#2D6A4F",
+              fontWeight: 600, fontSize: 13,
+              cursor: (isSavingChanges || isContinuing) ? "wait" : "pointer",
+              opacity: (isSavingChanges || isContinuing) ? 0.5 : 1,
+              display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+            }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+              <polyline points="17 21 17 13 7 13 7 21"/>
+              <polyline points="7 3 7 8 15 8"/>
+            </svg>
+            {isSavingChanges ? "Saving..." : "Save Changes"}
+          </button>
+          <button
+            onClick={handleContinue}
+            disabled={isSavingRooms || isContinuing || rooms.length === 0}
+            style={{
+              flex: 1, padding: "10px 16px", borderRadius: 10, border: "none",
+              background: "linear-gradient(135deg, #2D6A4F, #40916C)", color: "#fff",
+              fontWeight: 600, fontSize: 13, cursor: (isSavingRooms || isContinuing) ? "wait" : "pointer",
+              opacity: (isSavingRooms || isContinuing) ? 0.5 : 1,
+            }}
+          >
+            {isContinuing ? "Finalizing..." : "Finalize & Export"}
+          </button>
+        </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const ceToolBtn = (active: boolean): CSSProperties => ({
+  borderRadius: 8, border: active ? "1px solid #2D6A4F" : "1px solid #E8EAED",
+  background: active ? "rgba(45,106,79,0.10)" : "#FFFFFF",
+  color: active ? "#2D6A4F" : "#1A1A2E",
+  height: 30, minWidth: 50, padding: "0 10px",
+  cursor: "pointer", fontSize: 12, fontWeight: 600,
+  display: "inline-flex", alignItems: "center", gap: 5,
+});
+
+const ceObjectBtn = (active: boolean): CSSProperties => ({
+  borderRadius: 8, border: active ? "1px solid #2D6A4F" : "1px solid #E8EAED",
+  background: active ? "rgba(45,106,79,0.10)" : "#FFFFFF",
+  color: active ? "#2D6A4F" : "#1A1A2E",
+  height: 30, minWidth: 70, padding: "0 8px",
+  cursor: "pointer", fontWeight: 600,
+  display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5,
+});
+
+const ceZoomBtn: CSSProperties = {
+  borderRadius: 8, border: "1px solid #E8EAED",
+  background: "#FFFFFF", color: "#1A1A2E",
+  height: 30, minWidth: 34, padding: "0 10px",
+  cursor: "pointer", fontSize: 13, fontWeight: 600,
+};
+
+const ceRoomBtn: CSSProperties = {
+  padding: "6px 12px", borderRadius: 8, fontSize: 12, fontWeight: 600,
+  background: "#FAFBFC", border: "1px solid #E8EAED",
+  color: "#1A1A2E", cursor: "pointer",
+};
+
+const roomBtnStyle: CSSProperties = {
+  padding: "4px 10px", borderRadius: 8, fontSize: 11, fontWeight: 600,
+  background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.2)",
+  color: "#D8F3DC", cursor: "pointer",
+};
+
+
+
 const styles: Record<string, CSSProperties> = {
   workspace: {
-    minHeight: "100vh",
+    height: "95vh",
     display: "grid",
     gridTemplateColumns: "380px 1fr",
+    gridTemplateRows: "1fr",
     gap: "14px",
     padding: "14px",
-    background:
-      "radial-gradient(circle at 8% 18%, rgba(45, 106, 79, 0.25) 0%, transparent 35%), radial-gradient(circle at 82% 86%, rgba(82, 183, 136, 0.18) 0%, transparent 34%), linear-gradient(130deg, #0A1F13 0%, #0D2818 45%, #132B1E 100%)",
+    background: "#F0F2F5",
     position: "relative",
     overflow: "hidden"
   },
@@ -975,7 +3671,7 @@ const styles: Record<string, CSSProperties> = {
     width: "420px",
     height: "420px",
     borderRadius: "999px",
-    background: "rgba(45, 106, 79, 0.24)",
+    background: "rgba(45, 106, 79, 0.04)",
     filter: "blur(90px)",
     pointerEvents: "none"
   },
@@ -986,17 +3682,16 @@ const styles: Record<string, CSSProperties> = {
     width: "460px",
     height: "460px",
     borderRadius: "999px",
-    background: "rgba(82, 183, 136, 0.18)",
+    background: "rgba(82, 183, 136, 0.04)",
     filter: "blur(96px)",
     pointerEvents: "none"
   },
   sidebar: {
     zIndex: 1,
     borderRadius: "20px",
-    border: "1px solid rgba(255,255,255,0.18)",
-    background: "linear-gradient(160deg, rgba(255,255,255,0.13), rgba(255,255,255,0.05))",
-    backdropFilter: "blur(10px)",
-    boxShadow: "0 20px 56px rgba(0,0,0,0.34)",
+    border: "1px solid #E8EAED",
+    background: "#FFFFFF",
+    boxShadow: "0 2px 8px rgba(0,0,0,0.06)",
     padding: "14px",
     overflow: "auto"
   },
@@ -1010,36 +3705,37 @@ const styles: Record<string, CSSProperties> = {
     fontSize: "11px",
     textTransform: "uppercase",
     letterSpacing: "0.08em",
-    color: "rgba(244, 247, 255, 0.66)",
+    color: "#9CA3AF",
     marginBottom: "4px"
   },
   projectTitle: {
     display: "block",
     fontSize: "18px",
-    lineHeight: 1.25
+    lineHeight: 1.25,
+    color: "#1A1A2E"
   },
   statusRow: {
     marginTop: "10px",
     fontSize: "12px",
-    color: "rgba(244, 247, 255, 0.78)",
+    color: "#6B7280",
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
     padding: "8px 10px",
     borderRadius: "10px",
-    background: "rgba(255,255,255,0.08)",
-    border: "1px solid rgba(255,255,255,0.12)"
+    background: "#FAFBFC",
+    border: "1px solid #E8EAED"
   },
   statusValue: {
     fontWeight: 600,
-    color: "#D8F3DC"
+    color: "#059669"
   },
   errorBox: {
     marginTop: "10px",
     whiteSpace: "pre-wrap",
-    background: "rgba(255, 102, 102, 0.12)",
-    border: "1px solid rgba(255, 136, 136, 0.35)",
-    color: "#ffd7d7",
+    background: "#FEF2F2",
+    border: "1px solid rgba(220,38,38,0.2)",
+    color: "#DC2626",
     padding: "10px",
     borderRadius: "12px",
     fontSize: "12px"
@@ -1051,32 +3747,31 @@ const styles: Record<string, CSSProperties> = {
     margin: "8px 0",
     fontSize: "14px",
     fontWeight: 600,
-    color: "#F0FFF4"
+    color: "#1A1A2E"
   },
   divider: {
     margin: "16px 0",
     border: 0,
-    borderTop: "1px solid rgba(255,255,255,0.16)"
+    borderTop: "1px solid #E8EAED"
   },
   fieldLabel: {
     display: "block",
     fontSize: "12px",
-    color: "rgba(244, 247, 255, 0.76)",
+    color: "#6B7280",
     marginBottom: "6px"
   },
   helpText: {
     fontSize: "12px",
-    color: "rgba(244, 247, 255, 0.76)",
+    color: "#6B7280",
     lineHeight: 1.45
   },
   canvasPanel: {
     position: "relative",
     zIndex: 1,
     borderRadius: "20px",
-    border: "1px solid rgba(255,255,255,0.16)",
-    background: "rgba(10, 26, 16, 0.7)",
-    backdropFilter: "blur(8px)",
-    boxShadow: "0 20px 56px rgba(0,0,0,0.34)",
+    border: "1px solid #E8EAED",
+    background: "#FFFFFF",
+    boxShadow: "0 2px 8px rgba(0,0,0,0.06)",
     overflow: "hidden",
     minHeight: 0
   },
@@ -1085,37 +3780,36 @@ const styles: Record<string, CSSProperties> = {
     minHeight: "calc(100vh - 28px)",
     display: "grid",
     placeItems: "center",
-    padding: "14px"
+    padding: "24px"
   },
   questionnaireCard: {
     width: "min(680px, 100%)",
     borderRadius: "20px",
-    border: "1px solid rgba(255,255,255,0.18)",
-    background: "linear-gradient(160deg, rgba(255,255,255,0.13), rgba(255,255,255,0.05))",
-    backdropFilter: "blur(10px)",
-    boxShadow: "0 20px 56px rgba(0,0,0,0.34)",
+    border: "1px solid #E8EAED",
+    background: "#FFFFFF",
+    boxShadow: "0 2px 8px rgba(0,0,0,0.06)",
     padding: "18px"
   },
   runningCard: {
     width: "min(620px, 100%)",
     borderRadius: "22px",
-    border: "1px solid rgba(255,255,255,0.2)",
-    background: "linear-gradient(160deg, rgba(255,255,255,0.14), rgba(255,255,255,0.06))",
-    backdropFilter: "blur(12px)",
-    boxShadow: "0 26px 64px rgba(0,0,0,0.36)",
+    border: "1px solid #E8EAED",
+    background: "#FFFFFF",
+    boxShadow: "0 4px 16px rgba(0,0,0,0.08)",
     padding: "30px 22px",
     display: "flex",
     flexDirection: "column",
     alignItems: "center",
     position: "relative",
-    overflow: "hidden"
+    overflow: "hidden",
+    color: "#1A1A2E"
   },
   globalLoaderOverlay: {
     position: "fixed",
     inset: 0,
     zIndex: 30,
-    background: "rgba(6, 10, 20, 0.45)",
-    backdropFilter: "blur(6px)",
+    background: "rgba(0, 0, 0, 0.3)",
+    backdropFilter: "blur(4px)",
     display: "grid",
     placeItems: "center",
     pointerEvents: "all"
@@ -1123,33 +3817,35 @@ const styles: Record<string, CSSProperties> = {
   globalLoaderCard: {
     width: "min(320px, calc(100% - 32px))",
     borderRadius: "16px",
-    border: "1px solid rgba(255,255,255,0.2)",
-    background: "linear-gradient(160deg, rgba(255,255,255,0.13), rgba(255,255,255,0.06))",
-    boxShadow: "0 20px 50px rgba(0,0,0,0.32)",
+    border: "1px solid #E8EAED",
+    background: "#FFFFFF",
+    boxShadow: "0 8px 24px rgba(0,0,0,0.12)",
     padding: "16px 18px",
     display: "flex",
     flexDirection: "column",
     alignItems: "center",
-    gap: 4
+    gap: 4,
+    color: "#1A1A2E"
   },
   emptyState: {
     height: "100%",
     display: "grid",
     placeItems: "center",
     textAlign: "center",
-    color: "rgba(244, 247, 255, 0.8)",
+    color: "#6B7280",
     padding: "24px"
   },
   emptyTitle: {
     margin: 0,
     marginBottom: "6px",
-    fontSize: "24px"
+    fontSize: "24px",
+    color: "#1A1A2E"
   },
   emptySubtitle: {
     margin: 0,
     maxWidth: "520px",
     lineHeight: 1.5,
-    color: "rgba(244, 247, 255, 0.72)"
+    color: "#9CA3AF"
   }
 };
 
@@ -1172,20 +3868,24 @@ async function uploadFile(projectId: string, e: any, refresh: ()=>void) {
 }
 
 function Editor({
-  renderUrl, mapping, detectors, projectId, isReady, exportDxfUrl, exportPngUrl, onSave, onChanged
+  renderUrl, mapping, detectors: detectorsProp, projectId, isReady, pipesData: pipesProp, floorPlanId, exportDxfUrl, exportPngUrl, onSave, onChanged, canEdit = true,
 }: {
   renderUrl: string;
   mapping: Mapping;
   detectors: Detector[];
   projectId: string;
   isReady: boolean;
+  pipesData: PipesData | null;
+  floorPlanId?: string | null;
   exportDxfUrl: string | null;
   exportPngUrl: string | null;
   onSave: ()=>void;
   onChanged: ()=>void;
+  canEdit?: boolean;
 }) {
   const [imgDims, setImgDims] = useState<{w:number;h:number}|null>(null);
-  const [tool, setTool] = useState<"select"|"add"|"erase"|"pan">("select");
+  const readOnly = isReady;
+  const [tool, setTool] = useState<"select"|"add"|"erase"|"pan">(isReady ? "pan" : "select");
   const [addType, setAddType] = useState<ObjectType>("smoke");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [marquee, setMarquee] = useState<{sx:number; sy:number; ex:number; ey:number} | null>(null);
@@ -1200,26 +3900,50 @@ function Editor({
   const [isSaving, setIsSaving] = useState(false);
   const [isExporting, setIsExporting] = useState<null | "dxf" | "png">(null);
 
+  // Local mutable copies of detectors and pipes (client-side editing)
+  const [detectors, setDetectors] = useState<Detector[]>(detectorsProp);
+  const [pipesData, setPipesData] = useState<PipesData | null>(pipesProp);
+  useEffect(() => { setDetectors(detectorsProp); }, [detectorsProp]);
+  useEffect(() => { setPipesData(pipesProp); }, [pipesProp]);
+
   function onImageLoad(e: any) {
     const img = e.target as HTMLImageElement;
     setImgDims({ w: img.naturalWidth, h: img.naturalHeight });
   }
 
-  async function addDetectorAt(px: number, py: number) {
+  function addDetectorAt(px: number, py: number) {
     const w = pixelToWorld(mapping, px, py);
-    await authFetch(`/api/projects/${projectId}/detectors`, {
-      method:"POST",
-      body: JSON.stringify({ x: w.x, y: w.y, z: 0, dtype:addType })
-    });
-    onChanged();
+    setDetectors(prev => [...prev, {
+      id: crypto.randomUUID(),
+      project_id: projectId,
+      x: w.x, y: w.y, z: 0,
+      dtype: addType,
+      locked: false,
+      floor_plan_id: floorPlanId || null,
+    }]);
   }
   async function saveEdits() {
     setIsSaving(true);
     try {
-      await onSave();
-    } finally {
-      setIsSaving(false);
-    }
+      const payload: any = {
+        detectors: detectors.map(d => ({
+          id: d.id, x: d.x, y: d.y, z: d.z,
+          dtype: d.dtype, locked: d.locked,
+          floor_plan_id: d.floor_plan_id,
+        })),
+        pipes: pipesData || undefined,
+        floor_plan_id: floorPlanId || undefined,
+      };
+      const res = await authFetch(`/api/projects/${projectId}/bulk_save`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.detectors) setDetectors(data.detectors);
+      }
+    } catch (e) { console.error("Save failed", e); }
+    finally { setIsSaving(false); }
   }
 
   async function downloadFresh(url: string, filename: string) {
@@ -1246,9 +3970,11 @@ function Editor({
         return;
       }
 
+      // Save data first, then generate DXF via /save, then download
+      await saveEdits();
+      await authFetch(`/api/projects/${projectId}/save`, { method: "POST" });
       const url = exportDxfUrl;
       if (!url) return;
-      await saveEdits();
       await downloadFresh(url, `project_${projectId}_${Date.now()}.dxf`);
     } finally {
       setIsExporting(null);
@@ -1272,6 +3998,39 @@ function Editor({
 
     ctx.drawImage(baseBitmap, 0, 0, imgDims.w, imgDims.h);
     baseBitmap.close();
+
+    // Draw sprinkler pipes
+    if (pipesData?.pipes) {
+      ctx.strokeStyle = "#DC2626";
+      ctx.lineWidth = 2;
+      ctx.globalAlpha = 0.7;
+      for (const pipe of pipesData.pipes) {
+        const p1 = worldToPixel(mapping, pipe.from[0], pipe.from[1]);
+        const p2 = worldToPixel(mapping, pipe.to[0], pipe.to[1]);
+        ctx.beginPath();
+        ctx.moveTo(p1.px, p1.py);
+        ctx.lineTo(p2.px, p2.py);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1.0;
+    }
+    if (pipesData?.sources) {
+      for (const src of pipesData.sources) {
+        const p = worldToPixel(mapping, src.x, src.y);
+        ctx.fillStyle = "#B91C1C";
+        ctx.globalAlpha = 0.85;
+        ctx.fillRect(p.px - 7, p.py - 7, 14, 14);
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 1.8;
+        ctx.beginPath();
+        ctx.moveTo(p.px - 4, p.py);
+        ctx.lineTo(p.px + 4, p.py);
+        ctx.moveTo(p.px, p.py - 4);
+        ctx.lineTo(p.px, p.py + 4);
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+      }
+    }
 
     for (const d of detectors) {
       const p = worldToPixel(mapping, d.x, d.y);
@@ -1297,29 +4056,31 @@ function Editor({
   }
 
 
-  async function patchDetectorTo(detId: string, px: number, py: number) {
+  function moveDetectorTo(detId: string, px: number, py: number) {
     const w = pixelToWorld(mapping, px, py);
-    await authFetch(`/api/detectors/${detId}`, {
-      method:"PATCH",
-      body: JSON.stringify({ x: w.x, y: w.y, z: 0 })
-    });
+    setDetectors(prev => prev.map(d => d.id === detId ? { ...d, x: w.x, y: w.y } : d));
   }
 
-  async function moveDetectorTo(detId: string, px: number, py: number) {
-    await patchDetectorTo(detId, px, py);
-    onChanged();
-  }
-
-  async function moveDetectorsToMany(nextPxById: Record<string, {px:number; py:number}>) {
+  function moveDetectorsToMany(nextPxById: Record<string, {px:number; py:number}>) {
     const entries = Object.entries(nextPxById);
     if (!entries.length) return;
-    await Promise.all(entries.map(([detId, pt]) => patchDetectorTo(detId, pt.px, pt.py)));
-    onChanged();
+    setDetectors(prev => prev.map(d => {
+      const pt = nextPxById[d.id];
+      if (!pt) return d;
+      const w = pixelToWorld(mapping, pt.px, pt.py);
+      return { ...d, x: w.x, y: w.y };
+    }));
   }
 
-  async function deleteDetector(detId: string) {
-    await authFetch(`/api/detectors/${detId}`, { method:"DELETE" });
-    onChanged();
+  function deleteDetector(detId: string) {
+    setDetectors(prev => prev.filter(d => d.id !== detId));
+  }
+
+  function deleteDetectorsMany(ids: string[]) {
+    if (!ids.length) return;
+    const idSet = new Set(ids);
+    setDetectors(prev => prev.filter(d => !idSet.has(d.id)));
+    setSelectedIds(prev => prev.filter(id => !idSet.has(id)));
   }
 
   function toImagePoint(e: any): { px: number; py: number } | null {
@@ -1417,10 +4178,11 @@ function Editor({
                 backdropFilter: "blur(8px)"
               }}
             >
-              <button onClick={() => setTool("select")} style={toolBtn(tool === "select")}>Select</button>
-              <button onClick={() => setTool("add")} style={toolBtn(tool === "add")}>Add</button>
-              <button onClick={() => setTool("erase")} style={toolBtn(tool === "erase")}>Erase</button>
+              {!readOnly && <button onClick={() => setTool("select")} style={toolBtn(tool === "select")}>Select</button>}
+              {!readOnly && canEdit && <button onClick={() => setTool("add")} style={toolBtn(tool === "add")}>Add</button>}
+              {!readOnly && canEdit && <button onClick={() => setTool("erase")} style={toolBtn(tool === "erase")}>Erase</button>}
               <button onClick={() => setTool("pan")} style={toolBtn(tool === "pan")}>Pan</button>
+              {!readOnly && canEdit && (
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 2 }}>
                 {OBJECT_TYPES.map((otype) => {
                   const active = addType === otype;
@@ -1440,21 +4202,26 @@ function Editor({
                   );
                 })}
               </div>
-              <span style={{ fontSize: 12, color: "#D8F3DC", marginLeft: 2 }}>
-                Selected: {selectedIds.length}
-              </span>
-              {selectedIds.length > 0 ? (
-                <button onClick={() => setSelectedIds([])} style={toolBtn(false)}>Clear</button>
-              ) : null}
-              {isReady ? (
+              )}
+              {!readOnly && (
+              <>
+                <span style={{ fontSize: 12, color: "#D8F3DC", marginLeft: 2 }}>
+                  Selected: {selectedIds.length}
+                </span>
+                {selectedIds.length > 0 ? (
+                  <>
+                    {canEdit && <button onClick={() => deleteDetectorsMany(selectedIds)} style={{ ...toolBtn(false), color: "#FF6B6B" }}>Delete Selected</button>}
+                    <button onClick={() => setSelectedIds([])} style={toolBtn(false)}>Clear</button>
+                  </>
+                ) : null}
+              </>
+              )}
+              {isReady && canEdit ? (
                 <>
-                  <button onClick={saveEdits} style={toolBtn(true)} disabled={isSaving}>
-                    {isSaving ? "Saving..." : "Save"}
-                  </button>
                   {exportDxfUrl ? (
                     <button
                       onClick={() => exportLatest("dxf")}
-                      disabled={isSaving || isExporting !== null}
+                      disabled={isExporting !== null}
                       style={{ ...toolBtn(false), textDecoration: "none", display: "inline-flex", alignItems: "center", justifyContent: "center" }}
                     >
                       {isExporting === "dxf" ? "Exporting DXF..." : "Export DXF"}
@@ -1463,7 +4230,7 @@ function Editor({
                   {exportPngUrl ? (
                     <button
                       onClick={() => exportLatest("png")}
-                      disabled={isSaving || isExporting !== null}
+                      disabled={isExporting !== null}
                       style={{ ...toolBtn(false), textDecoration: "none", display: "inline-flex", alignItems: "center", justifyContent: "center" }}
                     >
                       {isExporting === "png" ? "Exporting PNG..." : "Export PNG"}
@@ -1525,8 +4292,8 @@ function Editor({
                     width={imgDims.w}
                     height={imgDims.h}
                     viewBox={`0 0 ${imgDims.w} ${imgDims.h}`}
-                    style={{ position:"absolute", left:0, top:0, cursor: canvasCursor() }}
-                    onMouseDown={(e)=> {
+                    style={{ position:"absolute", left:0, top:0, cursor: readOnly ? "default" : canvasCursor() }}
+                    onMouseDown={readOnly ? undefined : (e)=> {
                       const point = toImagePoint(e);
                       if (!point) return;
                       const { px, py } = point;
@@ -1545,18 +4312,20 @@ function Editor({
                         return;
                       }
                       if (tool === "add") {
-                        addDetectorAt(px, py);
+                        if (canEdit) addDetectorAt(px, py);
                         return;
                       }
-                      if (tool === "erase" && id) {
-                        deleteDetector(id);
+                      if (tool === "erase") {
+                        if (id) { if (canEdit) deleteDetector(id); }
+                        else { setMarquee({ sx: px, sy: py, ex: px, ey: py }); }
+                        return;
                       }
                     }}
-                    onMouseMove={(e)=> {
+                    onMouseMove={readOnly ? undefined : (e)=> {
                       const point = toImagePoint(e);
                       if (!point) return;
                       setHoverPoint(point);
-                      if (tool !== "select") return;
+                      if (tool !== "select" && tool !== "erase") return;
                       if (marquee) {
                         setMarquee({ ...marquee, ex: point.px, ey: point.py });
                         return;
@@ -1572,23 +4341,26 @@ function Editor({
                       }
                       setGroupPreview(next);
                     }}
-                    onMouseUp={(e)=> {
-                      if (tool !== "select") return;
+                    onMouseUp={readOnly ? undefined : (e)=> {
+                      if (tool !== "select" && tool !== "erase") return;
                       if (marquee) {
                         const p1 = { px: marquee.sx, py: marquee.sy };
                         const p2 = { px: marquee.ex, py: marquee.ey };
                         const rect = rectFromPoints(p1, p2);
-                        setSelectedIds(idsInRect(rect));
+                        if (tool === "erase" && canEdit) {
+                          deleteDetectorsMany(idsInRect(rect));
+                        } else {
+                          setSelectedIds(idsInRect(rect));
+                        }
                         setMarquee(null);
                         return;
                       }
                       if (!groupDrag || !groupPreview) return;
-                      moveDetectorsToMany(groupPreview).finally(() => {
-                        setGroupDrag(null);
-                        setGroupPreview(null);
-                      });
+                      moveDetectorsToMany(groupPreview);
+                      setGroupDrag(null);
+                      setGroupPreview(null);
                     }}
-                    onMouseLeave={()=> {
+                    onMouseLeave={readOnly ? undefined : ()=> {
                       setHoverPoint(null);
                       if (marquee) setMarquee(null);
                       if (groupDrag) setGroupDrag(null);
@@ -1596,13 +4368,28 @@ function Editor({
                     }}
                     onContextMenu={(e)=> {
                       e.preventDefault();
-                      const point = toImagePoint(e);
-                      if (!point) return;
-                      const { px, py } = point;
-                      const id = hitTest(px, py);
-                      if (id) deleteDetector(id);
+                      if (readOnly || !canEdit) return;
                     }}
                   >
+                    {/* Sprinkler pipes */}
+                    {pipesData?.pipes?.map((pipe, i) => {
+                      const p1 = worldToPixel(mapping, pipe.from[0], pipe.from[1]);
+                      const p2 = worldToPixel(mapping, pipe.to[0], pipe.to[1]);
+                      return (
+                        <line key={`pipe-${i}`} x1={p1.px} y1={p1.py} x2={p2.px} y2={p2.py}
+                          stroke="#DC2626" strokeWidth={2} opacity={0.7} />
+                      );
+                    })}
+                    {pipesData?.sources?.map((src, i) => {
+                      const p = worldToPixel(mapping, src.x, src.y);
+                      return (
+                        <g key={`src-${i}`}>
+                          <rect x={p.px - 7} y={p.py - 7} width={14} height={14} rx={2} fill="#B91C1C" opacity={0.85} />
+                          <line x1={p.px - 4} y1={p.py} x2={p.px + 4} y2={p.py} stroke="#fff" strokeWidth={1.8} />
+                          <line x1={p.px} y1={p.py - 4} x2={p.px} y2={p.py + 4} stroke="#fff" strokeWidth={1.8} />
+                        </g>
+                      );
+                    })}
                     {detectors.map((d)=> {
                       const p = groupPreview?.[d.id] || worldToPixel(mapping, d.x, d.y);
                       const isSelected = selectedIds.includes(d.id);
@@ -1624,14 +4411,15 @@ function Editor({
                     })}
                     {marquee ? (() => {
                       const rect = rectFromPoints({ px: marquee.sx, py: marquee.sy }, { px: marquee.ex, py: marquee.ey });
+                      const isEraseMarquee = tool === "erase";
                       return (
                         <rect
                           x={rect.left}
                           y={rect.top}
                           width={Math.max(1, rect.right - rect.left)}
                           height={Math.max(1, rect.bottom - rect.top)}
-                          fill="rgba(82, 183, 136, 0.15)"
-                          stroke="#52B788"
+                          fill={isEraseMarquee ? "rgba(220,38,38,0.15)" : "rgba(82, 183, 136, 0.15)"}
+                          stroke={isEraseMarquee ? "#DC2626" : "#52B788"}
                           strokeWidth={2}
                           strokeDasharray="6 4"
                         />
@@ -1688,6 +4476,7 @@ function objectFill(dtype: string): string {
   if (key === "panel") return "#ffd166";
   if (key === "hooter") return "#c77dff";
   if (key === "mcb") return "#4ecdc4";
+  if (key === "sprinkler") return "#DC2626";
   return "#ff5a7e";
 }
 
@@ -1697,9 +4486,8 @@ function renderPlacedObject(dtype: string, cx: number, cy: number) {
   if (key === "panel") {
     return (
       <>
-        <rect x={cx - 9} y={cy - 9} width={18} height={18} rx={3} fill="#ffd166" opacity={0.96} />
-        <rect x={cx - 5.5} y={cy - 5.5} width={11} height={11} rx={2} fill="#e8b347" />
-        <circle cx={cx} cy={cy} r={2} fill="#7a5300" />
+        <rect x={cx - 14} y={cy - 8} width={28} height={16} rx={1.5} fill="none" stroke="#1A7A3A" strokeWidth={1.8} />
+        <text x={cx} y={cy + 4} textAnchor="middle" fontSize={9} fontWeight={700} fill="#1A7A3A" style={{ pointerEvents: "none" }}>FACP</text>
       </>
     );
   }
@@ -1707,9 +4495,17 @@ function renderPlacedObject(dtype: string, cx: number, cy: number) {
   if (key === "hooter") {
     return (
       <>
-        <polygon points={`${cx - 7},${cy + 1} ${cx - 1},${cy - 3} ${cx - 1},${cy + 5}`} fill="#c77dff" opacity={0.96} />
-        <path d={`M ${cx + 1} ${cy - 2} Q ${cx + 6} ${cy} ${cx + 1} ${cy + 2}`} stroke="#f3e7ff" strokeWidth={1.6} fill="none" />
-        <path d={`M ${cx + 3} ${cy - 4} Q ${cx + 10} ${cy} ${cx + 3} ${cy + 4}`} stroke="#f3e7ff" strokeWidth={1.6} fill="none" />
+        {/* base */}
+        <rect x={cx - 10} y={cy + 4} width={20} height={4} rx={1.5} fill="#F9A8A8" />
+        <rect x={cx - 8} y={cy + 1} width={16} height={4} rx={1} fill="#F9A8A8" />
+        {/* dome */}
+        <path d={`M ${cx - 6} ${cy + 1} Q ${cx - 6} ${cy - 7} ${cx} ${cy - 8} Q ${cx + 6} ${cy - 7} ${cx + 6} ${cy + 1} Z`} fill="#EF5350" />
+        {/* rays */}
+        <line x1={cx} y1={cy - 10} x2={cx} y2={cy - 14} stroke="#F9A8A8" strokeWidth={2} strokeLinecap="round" />
+        <line x1={cx - 5} y1={cy - 9} x2={cx - 7} y2={cy - 12} stroke="#F9A8A8" strokeWidth={1.6} strokeLinecap="round" />
+        <line x1={cx + 5} y1={cy - 9} x2={cx + 7} y2={cy - 12} stroke="#F9A8A8" strokeWidth={1.6} strokeLinecap="round" />
+        <line x1={cx - 8} y1={cy - 5} x2={cx - 11} y2={cy - 7} stroke="#F9A8A8" strokeWidth={1.4} strokeLinecap="round" />
+        <line x1={cx + 8} y1={cy - 5} x2={cx + 11} y2={cy - 7} stroke="#F9A8A8" strokeWidth={1.4} strokeLinecap="round" />
       </>
     );
   }
@@ -1717,72 +4513,126 @@ function renderPlacedObject(dtype: string, cx: number, cy: number) {
   if (key === "mcb") {
     return (
       <>
-        <rect x={cx - 8} y={cy - 9} width={16} height={18} rx={2.5} fill="#4ecdc4" opacity={0.96} />
-        <rect x={cx - 3.5} y={cy - 5.5} width={7} height={11} rx={1.4} fill="#0f4f4a" />
-        <circle cx={cx} cy={cy + 3.5} r={1.2} fill="#9ff3eb" />
+        <rect x={cx - 9} y={cy - 9} width={18} height={18} rx={1.5} fill="none" stroke="#1A7A3A" strokeWidth={1.8} />
+        <circle cx={cx} cy={cy} r={3.5} fill="#2563EB" />
       </>
     );
   }
 
-  return <circle cx={cx} cy={cy} r={9} fill="#ff5a7e" opacity={0.96} />;
+  if (key === "sprinkler") {
+    return (
+      <>
+        <circle cx={cx} cy={cy} r={9} fill="none" stroke="#DC2626" strokeWidth={2.2} />
+        <line x1={cx - 6} y1={cy} x2={cx + 6} y2={cy} stroke="#DC2626" strokeWidth={2.2} />
+        <line x1={cx} y1={cy - 6} x2={cx} y2={cy + 6} stroke="#DC2626" strokeWidth={2.2} />
+      </>
+    );
+  }
+
+  return (
+    <>
+      <circle cx={cx} cy={cy} r={9} fill="none" stroke="#ff5a7e" strokeWidth={2.2} />
+      <text x={cx} y={cy + 3} textAnchor="middle" fontSize={10} fontWeight={700} fill="#ff5a7e">S</text>
+    </>
+  );
 }
 
 function drawPlacedObjectOnCanvas(ctx: CanvasRenderingContext2D, dtype: string, cx: number, cy: number) {
   const key = (dtype || "").toLowerCase();
 
   if (key === "panel") {
-    ctx.fillStyle = "#ffd166";
-    ctx.fillRect(cx - 9, cy - 9, 18, 18);
-    ctx.fillStyle = "#e8b347";
-    ctx.fillRect(cx - 5.5, cy - 5.5, 11, 11);
-    ctx.beginPath();
-    ctx.arc(cx, cy, 2, 0, Math.PI * 2);
-    ctx.fillStyle = "#7a5300";
-    ctx.fill();
+    ctx.strokeStyle = "#1A7A3A";
+    ctx.lineWidth = 1.8;
+    ctx.strokeRect(cx - 14, cy - 8, 28, 16);
+    ctx.fillStyle = "#1A7A3A";
+    ctx.font = "700 9px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("FACP", cx, cy);
     return;
   }
 
   if (key === "hooter") {
+    // base
+    ctx.fillStyle = "#F9A8A8";
     ctx.beginPath();
-    ctx.moveTo(cx - 7, cy + 1);
-    ctx.lineTo(cx - 1, cy - 3);
-    ctx.lineTo(cx - 1, cy + 5);
-    ctx.closePath();
-    ctx.fillStyle = "#c77dff";
+    ctx.roundRect(cx - 10, cy + 4, 20, 4, 1.5);
     ctx.fill();
-
-    ctx.strokeStyle = "#f3e7ff";
-    ctx.lineWidth = 1.6;
     ctx.beginPath();
-    ctx.quadraticCurveTo(cx + 6, cy, cx + 1, cy + 2);
-    ctx.stroke();
+    ctx.roundRect(cx - 8, cy + 1, 16, 4, 1);
+    ctx.fill();
+    // dome
+    ctx.fillStyle = "#EF5350";
     ctx.beginPath();
-    ctx.moveTo(cx + 3, cy - 4);
-    ctx.quadraticCurveTo(cx + 10, cy, cx + 3, cy + 4);
-    ctx.stroke();
+    ctx.moveTo(cx - 6, cy + 1);
+    ctx.quadraticCurveTo(cx - 6, cy - 7, cx, cy - 8);
+    ctx.quadraticCurveTo(cx + 6, cy - 7, cx + 6, cy + 1);
+    ctx.closePath();
+    ctx.fill();
+    // rays
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "#F9A8A8";
+    const rays: [number,number,number,number,number][] = [
+      [cx, cy-10, cx, cy-14, 2],
+      [cx-5, cy-9, cx-7, cy-12, 1.6],
+      [cx+5, cy-9, cx+7, cy-12, 1.6],
+      [cx-8, cy-5, cx-11, cy-7, 1.4],
+      [cx+8, cy-5, cx+11, cy-7, 1.4],
+    ];
+    for (const [x1,y1,x2,y2,w] of rays) {
+      ctx.lineWidth = w;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
     return;
   }
 
   if (key === "mcb") {
-    ctx.fillStyle = "#4ecdc4";
-    ctx.fillRect(cx - 8, cy - 9, 16, 18);
-    ctx.fillStyle = "#0f4f4a";
-    ctx.fillRect(cx - 3.5, cy - 5.5, 7, 11);
+    ctx.strokeStyle = "#1A7A3A";
+    ctx.lineWidth = 1.8;
+    ctx.strokeRect(cx - 9, cy - 9, 18, 18);
     ctx.beginPath();
-    ctx.arc(cx, cy + 3.5, 1.2, 0, Math.PI * 2);
-    ctx.fillStyle = "#9ff3eb";
+    ctx.arc(cx, cy, 3.5, 0, Math.PI * 2);
+    ctx.fillStyle = "#2563EB";
     ctx.fill();
+    return;
+  }
+
+  if (key === "sprinkler") {
+    ctx.beginPath();
+    ctx.arc(cx, cy, 9, 0, Math.PI * 2);
+    ctx.strokeStyle = "#DC2626";
+    ctx.lineWidth = 2.2;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx - 6, cy);
+    ctx.lineTo(cx + 6, cy);
+    ctx.moveTo(cx, cy - 6);
+    ctx.lineTo(cx, cy + 6);
+    ctx.strokeStyle = "#DC2626";
+    ctx.lineWidth = 2.2;
+    ctx.stroke();
     return;
   }
 
   ctx.beginPath();
   ctx.arc(cx, cy, 9, 0, Math.PI * 2);
+  ctx.strokeStyle = "#ff5a7e";
+  ctx.lineWidth = 2.2;
+  ctx.stroke();
   ctx.fillStyle = "#ff5a7e";
-  ctx.fill();
+  ctx.font = "700 11px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("S", cx, cy + 0.5);
 }
 
 function objectLabel(dtype: ObjectType): string {
-  if (dtype === "mcb") return "MCB";
+  if (dtype === "mcb") return "MCP";
+  if (dtype === "panel") return "FACP";
+  if (dtype === "sprinkler") return "Sprinkler";
   return dtype.charAt(0).toUpperCase() + dtype.slice(1);
 }
 
@@ -1807,33 +4657,46 @@ function objectToolBtn(active: boolean): CSSProperties {
 function renderObjectIcon(dtype: ObjectType) {
   if (dtype === "panel") {
     return (
-      <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden>
-        <rect x="2" y="2" width="10" height="10" rx="2" fill="#ffd166" stroke="#fff" strokeWidth="1" />
-        <circle cx="7" cy="7" r="1.3" fill="#7a5300" />
+      <svg width="18" height="14" viewBox="0 0 18 14" aria-hidden>
+        <rect x="1" y="2" width="16" height="10" rx="1" fill="none" stroke="#fff" strokeWidth="1.2" />
+        <text x="9" y="9" textAnchor="middle" fontSize="5" fontWeight="700" fill="#fff">FACP</text>
       </svg>
     );
   }
   if (dtype === "hooter") {
     return (
-      <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden>
-        <polygon points="3,8 6,6 6,10" fill="#c77dff" stroke="#fff" strokeWidth="0.8" />
-        <path d="M8 6.2 Q10 7 8 7.8" stroke="#fff" strokeWidth="1" fill="none" />
-        <path d="M9.2 5.4 Q12 7 9.2 8.6" stroke="#fff" strokeWidth="1" fill="none" />
+      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
+        <rect x="3" y="11" width="10" height="2.2" rx="1" fill="#F9A8A8" />
+        <rect x="4" y="9" width="8" height="2.5" rx="0.8" fill="#F9A8A8" />
+        <path d="M5 9 Q5 4 8 3.5 Q11 4 11 9 Z" fill="#EF5350" />
+        <line x1="8" y1="2" x2="8" y2="0.5" stroke="#F9A8A8" strokeWidth="1.2" strokeLinecap="round" />
+        <line x1="5.5" y1="2.8" x2="4.5" y2="1.4" stroke="#F9A8A8" strokeWidth="1" strokeLinecap="round" />
+        <line x1="10.5" y1="2.8" x2="11.5" y2="1.4" stroke="#F9A8A8" strokeWidth="1" strokeLinecap="round" />
       </svg>
     );
   }
   if (dtype === "mcb") {
     return (
       <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden>
-        <rect x="2" y="2" width="10" height="10" rx="1.8" fill="#4ecdc4" stroke="#fff" strokeWidth="1" />
-        <rect x="5.4" y="4" width="3.2" height="6" rx="0.8" fill="#0f4f4a" />
+        <rect x="2" y="2" width="10" height="10" rx="1" fill="none" stroke="#fff" strokeWidth="1.2" />
+        <circle cx="7" cy="7" r="2.2" fill="#60A5FA" />
+      </svg>
+    );
+  }
+  if (dtype === "sprinkler") {
+    return (
+      <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden>
+        <circle cx="7" cy="7" r="4.2" fill="none" stroke="#DC2626" strokeWidth="1.2" />
+        <line x1="4.2" y1="7" x2="9.8" y2="7" stroke="#DC2626" strokeWidth="1.2" />
+        <line x1="7" y1="4.2" x2="7" y2="9.8" stroke="#DC2626" strokeWidth="1.2" />
       </svg>
     );
   }
 
   return (
     <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden>
-      <circle cx="7" cy="7" r="4.2" fill="#ff5a7e" stroke="#fff" strokeWidth="1" />
+      <circle cx="7" cy="7" r="4.2" fill="none" stroke="#ff5a7e" strokeWidth="1.2" />
+      <text x="7" y="9" textAnchor="middle" fontSize="5" fontWeight="700" fill="#ff5a7e">S</text>
     </svg>
   );
 }
