@@ -131,7 +131,13 @@ def _run_post_alignment_steps(
     stage_start("extract_rooms")
     rooms_json = os.path.join(pdir, "rooms_from_image.json")
     debug_rooms = os.path.join(pdir, "rooms_debug.png")
-    rooms = extract_rooms(fixed, mapping_json, rooms_json, debug_png_path=debug_rooms)
+    rooms = extract_rooms(
+        fixed,
+        mapping_json,
+        rooms_json,
+        debug_png_path=debug_rooms,
+        dxf_path=dxf_path,
+    )
     stage_done("extract_rooms", stage_ts, rooms=len(rooms), rooms_json=rooms_json)
     with db() as con:
         _set_project(con, project_id, rooms_json_path=rooms_json, status="rooms_extracted")
@@ -160,6 +166,8 @@ def _run_multi_block_post_alignment(
         fps = _get_floor_plans(con, project_id)
 
     all_rooms: list = []
+    all_doors: list = []
+    all_staircases: list = []
 
     for fp in fps:
         fp_id = fp["id"]
@@ -186,20 +194,49 @@ def _run_multi_block_post_alignment(
         stage_start(f"extract_rooms_block_{idx}")
         rooms_json = os.path.join(fp_dir, f"block_{idx}_rooms.json")
         debug_rooms = os.path.join(fp_dir, f"block_{idx}_rooms_debug.png")
-        rooms = extract_rooms(fixed, mapping_json, rooms_json, debug_png_path=debug_rooms)
+        rooms = extract_rooms(
+            fixed,
+            mapping_json,
+            rooms_json,
+            debug_png_path=debug_rooms,
+            dxf_path=dxf_path,
+        )
         stage_done(f"extract_rooms_block_{idx}", stage_ts, rooms=len(rooms))
         with db() as con:
             _set_floor_plan(con, fp_id, rooms_json_path=rooms_json, status="rooms_extracted")
 
-        # Tag each room with its block index for traceability
+        # Read block JSON to aggregate extracted entities.
+        block_rooms: list = []
+        block_doors: list = []
+        block_staircases: list = []
+        try:
+            with open(rooms_json, "r", encoding="utf-8") as bf:
+                block_data = _json.load(bf)
+            if isinstance(block_data, dict):
+                block_rooms = block_data.get("rooms", []) or []
+                block_doors = block_data.get("doors", []) or []
+                block_staircases = block_data.get("staircases", []) or []
+        except Exception:
+            block_rooms = rooms
+
+        # Tag each extracted entity with its block index for traceability.
+        for d in block_doors:
+            d["block_index"] = idx
+        for s in block_staircases:
+            s["block_index"] = idx
+
         for r in rooms:
             r["block_index"] = idx
-        all_rooms.extend(rooms)
+        for r in block_rooms:
+            r["block_index"] = idx
+        all_rooms.extend(block_rooms if block_rooms else rooms)
+        all_doors.extend(block_doors)
+        all_staircases.extend(block_staircases)
 
     # Aggregate all rooms into the project-level rooms JSON
     agg_rooms_json = os.path.join(pdir, "rooms_from_image.json")
     with open(agg_rooms_json, "w", encoding="utf-8") as f:
-        _json.dump({"rooms": all_rooms}, f, indent=2)
+        _json.dump({"rooms": all_rooms, "doors": all_doors, "staircases": all_staircases}, f, indent=2)
     with db() as con:
         _set_project(con, project_id, rooms_json_path=agg_rooms_json, status="rooms_extracted")
 

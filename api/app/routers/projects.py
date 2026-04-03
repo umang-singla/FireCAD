@@ -26,6 +26,36 @@ from app.routers.auth import get_current_user
 router = APIRouter(tags=["projects"])
 
 
+def _normalize_data_path(p: str | None) -> str | None:
+    """Normalize persisted file paths to be rooted under DATA_DIR.
+
+    Handles legacy relative values like "data/projects/..." or Windows-style
+    separators so API serialization never crashes on relpath conversion.
+    """
+    if not p:
+        return None
+
+    s = str(p).strip()
+    if not s:
+        return None
+
+    # If already absolute and valid, keep as-is.
+    if os.path.isabs(s):
+        return s
+
+    norm = s.replace("\\", "/")
+    base = os.getenv("DATA_DIR", "/data").replace("\\", "/").rstrip("/")
+
+    if norm.startswith("data/"):
+        rest = norm[len("data/"):]
+        return os.path.join(base, *rest.split("/"))
+
+    if norm.startswith("projects/"):
+        return os.path.join(base, *norm.split("/"))
+
+    return s
+
+
 def _authorize_project(con, project_id: str, user: dict):
     """Fetch a project row and verify the caller has access (owner or tenant member).
     Raises 404 if not found / not authorized.
@@ -72,7 +102,15 @@ def list_projects(user=Depends(get_current_user)):
 def _project_row_to_out(r) -> ProjectOut:
     files = {}
     def add(k, p):
-        files[k] = f"/files/{relpath(p)}" if p else None
+        if not p:
+            files[k] = None
+            return
+        p_norm = _normalize_data_path(p)
+        try:
+            files[k] = f"/files/{relpath(p_norm)}" if p_norm else None
+        except Exception:
+            # Never fail project fetch due to malformed persisted file path.
+            files[k] = None
 
     preview_mapping_path = os.path.join(project_dir(r["id"]), "detectors_preview_mapping.json")
     detectors_debug_path = os.path.join(project_dir(r["id"]), "detectors_global_snapping_debug.png")
@@ -417,6 +455,17 @@ def update_rooms(project_id: str, payload: dict, user=Depends(get_current_user))
     rooms_path = r["rooms_json_path"]
     if not rooms_path:
         rooms_path = os.path.join(project_dir(project_id), "rooms_from_image.json")
+    if os.path.exists(rooms_path):
+        try:
+            with open(rooms_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if isinstance(existing, dict) and isinstance(payload, dict):
+                if "doors" in existing and "doors" not in payload:
+                    payload["doors"] = existing["doors"]
+                if "staircases" in existing and "staircases" not in payload:
+                    payload["staircases"] = existing["staircases"]
+        except Exception:
+            pass
     with open(rooms_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     return payload
@@ -691,15 +740,39 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
         all_pipe_segments = []
         all_pipe_sources = []
 
+        # Deduplicate by normalized coordinates + diameter to avoid
+        # overlapping duplicate labels when both aggregate and per-block files exist.
+        seg_seen = set()
+        src_seen = set()
+
+        def _norm_pt(pt):
+            return (round(float(pt[0]), 4), round(float(pt[1]), 4))
+
+        def _add_segment(p_from, p_to, diameter):
+            a = _norm_pt(p_from)
+            b = _norm_pt(p_to)
+            key_endpoints = tuple(sorted([a, b]))
+            key = (key_endpoints[0], key_endpoints[1], str(diameter))
+            if key in seg_seen:
+                return
+            seg_seen.add(key)
+            all_pipe_segments.append(((a, b), str(diameter)))
+
+        def _add_source(src):
+            s = _norm_pt(src)
+            if s in src_seen:
+                return
+            src_seen.add(s)
+            all_pipe_sources.append(s)
+
         pipes_json_path = os.path.join(project_dir(project_id), "sprinkler_pipes.json")
         if os.path.exists(pipes_json_path):
             with open(pipes_json_path, "r", encoding="utf-8") as pf:
                 pipes_data = json.load(pf)
-            all_pipe_segments.extend([
-                (((p["from"][0], p["from"][1]), (p["to"][0], p["to"][1])), p["diameter"])
-                for p in pipes_data.get("pipes", [])
-            ])
-            all_pipe_sources.extend([(s["x"], s["y"]) for s in pipes_data.get("sources", [])])
+            for p in pipes_data.get("pipes", []):
+                _add_segment(p["from"], p["to"], p.get("diameter", "32mm"))
+            for s in pipes_data.get("sources", []):
+                _add_source((s["x"], s["y"]))
 
         # Per-floor-plan pipes
         fp_rows = con.execute(
@@ -711,11 +784,10 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
             if os.path.exists(fp_pipes_path):
                 with open(fp_pipes_path, "r", encoding="utf-8") as pf:
                     fp_pipes = json.load(pf)
-                all_pipe_segments.extend([
-                    (((p["from"][0], p["from"][1]), (p["to"][0], p["to"][1])), p["diameter"])
-                    for p in fp_pipes.get("pipes", [])
-                ])
-                all_pipe_sources.extend([(s["x"], s["y"]) for s in fp_pipes.get("sources", [])])
+                for p in fp_pipes.get("pipes", []):
+                    _add_segment(p["from"], p["to"], p.get("diameter", "32mm"))
+                for s in fp_pipes.get("sources", []):
+                    _add_source((s["x"], s["y"]))
 
         sprinkler_dets = [(float(d["x"]), float(d["y"])) for d in dets if d["dtype"] == "sprinkler"]
         if sprinkler_dets or all_pipe_segments:
@@ -874,6 +946,17 @@ def update_floor_plan_rooms(project_id: str, fp_id: str, payload: dict, user=Dep
         with db() as con:
             con.execute("UPDATE floor_plans SET rooms_json_path=?, updated_at=? WHERE id=?",
                         (rooms_path, now(), fp_id))
+    if os.path.exists(rooms_path):
+        try:
+            with open(rooms_path, "r", encoding="utf-8") as rf:
+                existing = json.load(rf)
+            if isinstance(existing, dict) and isinstance(payload, dict):
+                if "doors" in existing and "doors" not in payload:
+                    payload["doors"] = existing["doors"]
+                if "staircases" in existing and "staircases" not in payload:
+                    payload["staircases"] = existing["staircases"]
+        except Exception:
+            pass
     with open(rooms_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     return payload

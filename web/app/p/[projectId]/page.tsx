@@ -2061,6 +2061,8 @@ function btn(primary=false, compact=false): CSSProperties {
 type Room = {
   id: string;
   label?: string;
+  label_text?: string;
+  label_texts?: string[];
   area_px: number;
   polygon_px: number[][];
   polygon_world: number[][];
@@ -2288,7 +2290,12 @@ function RoomEditor({
         const res = await authFetch(url);
         const data = await res.json();
         const raw: Room[] = data.rooms || data;
-        setRooms(raw.map((r, i) => ({ ...r, label: r.label || `Room ${i + 1}` })));
+        setRooms(
+          raw.map((r, i) => ({
+            ...r,
+            label: (r.label && r.label.trim()) || (r.label_text && r.label_text.trim()) || `Room ${i + 1}`,
+          }))
+        );
       } catch (e) { console.error("Failed to load rooms", e); }
       finally { setLoading(false); }
     })();

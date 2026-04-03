@@ -1,4 +1,6 @@
 import os
+import cv2
+import numpy as np
 import json
 import math
 import logging
@@ -39,6 +41,57 @@ def _build_mapping(width_px: int, height_px: int, xmin_p: float, ymin_p: float, 
         "conversion": "px=offset_x+(x-xmin)*scale; py=offset_y+(ymax-y)*scale; inverse with same scale/offset",
     }
 
+def process_and_bolden_floor_plan(input_path, output_path, thickness=2, kernel_size=3):
+    """
+    Reads a faint line drawing image, makes all lines dark and bold,
+    and saves the result.
+
+    Args:
+        input_path (str): The path to the original faint line drawing image.
+        output_path (str): The path where the processed bold image will be saved.
+        thickness (int): The number of dilation iterations. More iterations
+                         result in thicker lines. A value of 2-3 is usually good.
+        kernel_size (int): The size of the dilation kernel. (Must be an odd number).
+    """
+    # 1. Load the image as a single-channel grayscale image.
+    img_gray = cv2.imread(input_path, cv2.IMREAD_GRAYSCALE)
+
+    # 2. Check if the image loaded correctly.
+    if img_gray is None:
+        print(f"Error: Could not load image at {input_path}")
+        return
+
+    # 3. The lines are very faint and light on a dark background.
+    #    For the morphological operation (dilation), we need the
+    #    lines to be light on a *dark* background.
+    #    So, we invert the image. The faint lines become light, and
+    #    the white background becomes black.
+    img_inverted = cv2.bitwise_not(img_gray)
+
+    # 4. Define a simple rectangular kernel for the dilation.
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+
+    # 5. Apply the dilation operation to make the lines bolder.
+    #    Dilation makes light (foreground) areas thicker.
+    img_dilated = cv2.dilate(img_inverted, kernel, iterations=thickness)
+
+    # 6. Invert the image back so that we have dark lines on a
+    #    clean white background.
+    img_final = cv2.bitwise_not(img_dilated)
+
+    # 7. (Optional) Enhance final contrast.
+    #    We can use a simple threshold to make sure the background
+    #    is perfectly white and lines are perfectly black.
+    _, img_final_thresholded = cv2.threshold(img_final, 220, 255, cv2.THRESH_BINARY)
+
+    # 8. Save the final image.
+    #    If the directory doesn't exist, create it.
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    cv2.imwrite(output_path, img_final_thresholded)
+    print(f"Processed image successfully saved to: {output_path}")
 
 def _padded_bbox_from_msp(msp, pad_frac: float):
     cache = bbox.Cache()
@@ -374,6 +427,8 @@ def render_dwg_to_png_with_qcad(
             f"qcad_lib_selected={qcad_lib}\n"
             f"stdout={proc.stdout}\nstderr={proc.stderr}"
         )
+    
+    process_and_bolden_floor_plan(out_png, out_png, thickness=2, kernel_size=3)
 
     Image.MAX_IMAGE_PIXELS = None
     with Image.open(out_png) as im:
