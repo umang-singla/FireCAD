@@ -13,6 +13,8 @@ from app.pipeline.run_pipeline import (
     continue_pipeline_after_rooms,
     PipelineOptions,
 )
+from app.pipeline.gemini_mask import generate_mask_image, DEFAULT_PROMPT
+from app.pipeline.mask_align import align_perfect_tight_box
 from app.pipeline.dxf_export import write_detectors_to_dxf
 from app.pipeline.render import render_dwg_to_png_with_qcad, write_mapping_from_dxf_and_png
 from app.pipeline.nbc_rules import (
@@ -309,6 +311,56 @@ async def upload_aligned_mask(project_id: str, file: UploadFile = File(...), use
         )
         r2 = _authorize_project(con, project_id, user)
 
+    return _project_row_to_out(r2)
+
+
+@router.post("/projects/{project_id}/regenerate_mask", response_model=ProjectOut)
+def regenerate_project_mask(project_id: str, payload: dict | None = None, user=Depends(get_current_user)):
+    """Regenerate project mask via Gemini using optional instruction, then re-align it."""
+    with db() as con:
+        r = _authorize_project_write(con, project_id, user)
+
+    render_path = r["render_png_path"]
+    if not render_path or not os.path.exists(render_path):
+        raise HTTPException(404, "project render image not available")
+
+    settings = json.loads(r["settings_json"] or "{}")
+    opts = PipelineOptions.from_env().merge_settings(settings)
+
+    instruction = ((payload or {}).get("instruction") or "").strip()
+    out_mask = r["mask_png_path"] or os.path.join(project_dir(project_id), "mask.png")
+    out_aligned = r["aligned_mask_path"] or os.path.join(project_dir(project_id), "mask_aligned.png")
+    retry_prompt = (
+        f"{DEFAULT_PROMPT}\n\n"
+        "You are given two images in this request: "
+        "(1) the original floor plan image and "
+        "(2) the current generated mask image. "
+        "Improve the current mask using the original image as source of truth. "
+        "Preserve geometry/relative positions and fix missed walls, doors, beams, and partitions."
+    )
+    if instruction:
+        retry_prompt = f"{retry_prompt}\n\nAdditional user instruction:\n{instruction}"
+
+    try:
+        generate_mask_image(
+            input_png=render_path,
+            out_mask_png=out_mask,
+            prompt=retry_prompt,
+            model=opts.gemini_model,
+            context_mask_png=out_mask if os.path.exists(out_mask) else None,
+        )
+        align_perfect_tight_box(render_path, out_mask, out_aligned)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(500, f"mask regeneration failed: {exc}") from exc
+
+    with db() as con:
+        con.execute(
+            "UPDATE projects SET mask_png_path=?, aligned_mask_path=?, status=?, error=NULL, updated_at=? WHERE id=?",
+            (out_mask, out_aligned, "awaiting_alignment_review", now(), project_id),
+        )
+        r2 = _authorize_project(con, project_id, user)
     return _project_row_to_out(r2)
 
 @router.post("/projects/{project_id}/continue_floor_review", response_model=ProjectOut)
@@ -918,6 +970,67 @@ async def upload_floor_plan_aligned_mask(
         con.execute(
             "UPDATE floor_plans SET aligned_mask_path=?, status=?, updated_at=? WHERE id=?",
             (aligned_path, "aligned", now(), fp_id),
+        )
+        fp2 = con.execute("SELECT * FROM floor_plans WHERE id=?", (fp_id,)).fetchone()
+    return _floor_plan_row_to_dict(fp2)
+
+
+@router.post("/projects/{project_id}/floor_plans/{fp_id}/regenerate_mask")
+def regenerate_floor_plan_mask(project_id: str, fp_id: str, payload: dict | None = None, user=Depends(get_current_user)):
+    """Regenerate a floor-plan block mask via Gemini using optional instruction, then re-align it."""
+    with db() as con:
+        r = _authorize_project_write(con, project_id, user)
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
+        if not fp:
+            raise HTTPException(404, "floor plan block not found")
+
+    render_path = fp["render_png_path"]
+    if not render_path or not os.path.exists(render_path):
+        raise HTTPException(404, "floor plan render image not available")
+
+    settings = json.loads(r["settings_json"] or "{}")
+    opts = PipelineOptions.from_env().merge_settings(settings)
+
+    instruction = ((payload or {}).get("instruction") or "").strip()
+
+    idx = fp["block_index"]
+    blocks_dir = os.path.join(project_dir(project_id), "blocks")
+    os.makedirs(blocks_dir, exist_ok=True)
+    out_mask = fp["mask_png_path"] or os.path.join(blocks_dir, f"block_{idx}_mask.png")
+    out_aligned = fp["aligned_mask_path"] or os.path.join(blocks_dir, f"block_{idx}_aligned.png")
+    retry_prompt = (
+        f"{DEFAULT_PROMPT}\n\n"
+        "You are given two images in this request: "
+        "(1) the original floor plan image and "
+        "(2) the current generated mask image. "
+        "Improve the current mask using the original image as source of truth. "
+        "Preserve geometry/relative positions and fix missed walls, doors, beams, and partitions."
+    )
+    if instruction:
+        retry_prompt = f"{retry_prompt}\n\nAdditional user instruction:\n{instruction}"
+
+    try:
+        generate_mask_image(
+            input_png=render_path,
+            out_mask_png=out_mask,
+            prompt=retry_prompt,
+            model=opts.gemini_model,
+            context_mask_png=out_mask if os.path.exists(out_mask) else None,
+        )
+        align_perfect_tight_box(render_path, out_mask, out_aligned)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(500, f"mask regeneration failed: {exc}") from exc
+
+    with db() as con:
+        con.execute(
+            "UPDATE floor_plans SET mask_png_path=?, aligned_mask_path=?, status=?, updated_at=? WHERE id=?",
+            (out_mask, out_aligned, "aligned", now(), fp_id),
+        )
+        con.execute(
+            "UPDATE projects SET status=?, error=NULL, updated_at=? WHERE id=?",
+            ("awaiting_alignment_review", now(), project_id),
         )
         fp2 = con.execute("SELECT * FROM floor_plans WHERE id=?", (fp_id,)).fetchone()
     return _floor_plan_row_to_dict(fp2)

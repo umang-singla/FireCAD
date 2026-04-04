@@ -49,6 +49,7 @@ def generate_mask_image(
     prompt: str = DEFAULT_PROMPT,
     model: str = "gemini-3.1-flash-image-preview",
     max_side: int = 2048,
+    context_mask_png: str | None = None,
 ):
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -58,11 +59,17 @@ def generate_mask_image(
     img = Image.open(input_png)
     img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
 
+    contents = [prompt, img]
+    if context_mask_png and os.path.exists(context_mask_png):
+        ctx_img = Image.open(context_mask_png)
+        ctx_img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        contents.append(ctx_img)
+
     client = genai.Client(api_key=api_key)
 
     resp = client.models.generate_content(
         model=model,
-        contents=[prompt, img],
+        contents=contents,
         config={"response_modalities": ["IMAGE"]},
     )
 

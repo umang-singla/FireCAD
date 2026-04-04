@@ -20,6 +20,11 @@ function resolveApiBase() {
 
 const apiUrl = (path: string) => `${resolveApiBase()}${path}`;
 
+function apiMediaUrl(path: string, version: number) {
+  const base = apiUrl(path);
+  return `${base}${base.includes("?") ? "&" : "?"}v=${version}`;
+}
+
 const NETWORK_PENDING_EVENT = "firecad-network-pending";
 let networkPendingCount = 0;
 
@@ -219,6 +224,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   const [nbcSettingsLabels, setNbcSettingsLabels] = useState<Record<string, string>>({});
   const [nbcSettingsSaving, setNbcSettingsSaving] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
+  const [mediaVersion, setMediaVersion] = useState<number>(Date.now());
 
   const canEdit = (() => {
     const role = getTenantRole();
@@ -275,6 +281,9 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     } else {
       setFloorPlans([]);
     }
+
+    // Force image reload for updated PNG assets (mask/render) after refresh.
+    setMediaVersion(Date.now());
   }
 
   useEffect(() => { refresh(); }, []);
@@ -518,6 +527,22 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
       await authFetch(`/api/projects/${projectId}/floor_plans/${activeFp.id}/aligned_mask`, { method:"POST", body: fd });
     } else {
       await authFetch(`/api/projects/${projectId}/aligned_mask`, { method:"POST", body: fd });
+    }
+    await refresh();
+  }
+
+  async function retryMaskGeneration(instruction: string) {
+    const activeFp = floorPlans[activeBlockIndex];
+    if (activeFp) {
+      await authFetch(`/api/projects/${projectId}/floor_plans/${activeFp.id}/regenerate_mask`, {
+        method: "POST",
+        body: JSON.stringify({ instruction }),
+      });
+    } else {
+      await authFetch(`/api/projects/${projectId}/regenerate_mask`, {
+        method: "POST",
+        body: JSON.stringify({ instruction }),
+      });
     }
     await refresh();
   }
@@ -1002,10 +1027,11 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                     return (
                       <AlignmentReview
                         key={fp.id}
-                        originalUrl={apiUrl(blockRender)}
-                        alignedUrl={apiUrl(blockMask)}
+                        originalUrl={apiMediaUrl(blockRender, mediaVersion)}
+                        alignedUrl={apiMediaUrl(blockMask, mediaVersion)}
                         onContinue={continuePipelineAfterAlignment}
                         onUploadAlignedMask={uploadAlignedMaskFile}
+                        onRetryGeneration={retryMaskGeneration}
                         onRefresh={refresh}
                         blockLabel={floorPlans.length > 1 ? `Block ${fp.block_index + 1} of ${floorPlans.length}` : undefined}
                         canEdit={canEdit}
@@ -1023,10 +1049,11 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
             </div>
           ) : project?.files?.aligned_mask && project?.files?.render_png ? (
             <AlignmentReview
-              originalUrl={apiUrl(project.files.render_png)}
-              alignedUrl={apiUrl(project.files.aligned_mask)}
+              originalUrl={apiMediaUrl(project.files.render_png, mediaVersion)}
+              alignedUrl={apiMediaUrl(project.files.aligned_mask, mediaVersion)}
               onContinue={continuePipelineAfterAlignment}
               onUploadAlignedMask={uploadAlignedMaskFile}
+              onRetryGeneration={retryMaskGeneration}
               onRefresh={refresh}
               canEdit={canEdit}
             />
@@ -1772,6 +1799,7 @@ function AlignmentReview({
   alignedUrl,
   onContinue,
   onUploadAlignedMask,
+  onRetryGeneration,
   onRefresh,
   blockLabel,
   canEdit = true,
@@ -1780,6 +1808,7 @@ function AlignmentReview({
   alignedUrl: string;
   onContinue: (adjustedMaskBlob: Blob) => Promise<void>;
   onUploadAlignedMask: (e: any) => Promise<void>;
+  onRetryGeneration: (instruction: string) => Promise<void>;
   onRefresh: () => Promise<void>;
   blockLabel?: string;
   canEdit?: boolean;
@@ -1796,6 +1825,10 @@ function AlignmentReview({
   const [isDragging, setIsDragging] = useState(false);
   const [isResizing, setIsResizing] = useState(false);
   const [isContinuing, setIsContinuing] = useState(false);
+  const [isRetrying, setIsRetrying] = useState(false);
+  const [generationInstruction, setGenerationInstruction] = useState("");
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const hasAutoFitRef = useRef(false);
   const dragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null);
   const resizeRef = useRef<{
     sx: number;
@@ -1878,6 +1911,19 @@ function AlignmentReview({
     };
   }, [maskDims, scale, viewZoom]);
 
+  useEffect(() => {
+    if (!origDims || hasAutoFitRef.current) return;
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const availW = Math.max(120, vp.clientWidth - 20);
+    const availH = Math.max(120, vp.clientHeight - 20);
+    const fitZoom = Math.min(availW / origDims.w, availH / origDims.h);
+    if (Number.isFinite(fitZoom) && fitZoom > 0) {
+      setViewZoom(Math.max(0.25, Math.min(3, fitZoom)));
+      hasAutoFitRef.current = true;
+    }
+  }, [origDims]);
+
   function startResize(
     e: React.MouseEvent<HTMLDivElement>,
     dir: "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw"
@@ -1928,6 +1974,15 @@ function AlignmentReview({
       await onContinue(blob);
     } finally {
       setIsContinuing(false);
+    }
+  }
+
+  async function retryGeneration() {
+    setIsRetrying(true);
+    try {
+      await onRetryGeneration(generationInstruction.trim());
+    } finally {
+      setIsRetrying(false);
     }
   }
 
@@ -2003,7 +2058,50 @@ function AlignmentReview({
         )}
       </div>
 
+      {canEdit && (
+        <div
+          style={{
+            borderRadius: 10,
+            border: "1px solid rgba(255,255,255,0.14)",
+            background: "rgba(9, 24, 14, 0.68)",
+            padding: 10,
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+          }}
+        >
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#B7E4C7" }}>Mask Generation Instruction</div>
+          <textarea
+            value={generationInstruction}
+            onChange={(e) => setGenerationInstruction(e.target.value)}
+            placeholder="Optional: add instruction for retry generation (e.g. keep all internal walls and beams fully solid red)."
+            rows={2}
+            style={{
+              width: "100%",
+              resize: "vertical",
+              minHeight: 56,
+              borderRadius: 8,
+              border: "1px solid rgba(255,255,255,0.2)",
+              background: "rgba(2, 10, 5, 0.75)",
+              color: "#D8F3DC",
+              padding: "8px 10px",
+              fontSize: 12,
+              outline: "none",
+            }}
+          />
+          <div style={{ fontSize: 11, color: "#95D5B2" }}>
+            Use this when auto-generated mask misses walls/doors or wrongly fills spaces, then click Retry Generation.
+          </div>
+          <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            <button onClick={retryGeneration} style={{ ...toolBtn(false), flex: "0 0 auto", width: 170 }} disabled={isRetrying}>
+              {isRetrying ? "Retrying..." : "Retry Generation"}
+            </button>
+          </div>
+        </div>
+      )}
+
       <div
+        ref={viewportRef}
         style={{
           position:"relative",
           flex: 1,
