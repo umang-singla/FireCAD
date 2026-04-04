@@ -509,7 +509,8 @@ def _run_post_room_review_steps(
     if fps:
         all_xmin, all_ymin, all_xmax, all_ymax = [], [], [], []
         for fp in fps:
-            wb = _json.loads(fp["world_bbox_json"]) if fp.get("world_bbox_json") else None
+            wb_json = fp["world_bbox_json"]
+            wb = _json.loads(wb_json) if wb_json else None
             if wb:
                 all_xmin.append(float(wb["xmin"])); all_ymin.append(float(wb["ymin"]))
                 all_xmax.append(float(wb["xmax"])); all_ymax.append(float(wb["ymax"]))

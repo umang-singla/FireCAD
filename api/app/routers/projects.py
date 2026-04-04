@@ -864,6 +864,7 @@ def _floor_plan_row_to_dict(fp) -> dict:
         "project_id": fp["project_id"],
         "block_index": fp["block_index"],
         "status": fp["status"],
+        "height_m": float(fp["height_m"]) if fp["height_m"] is not None else None,
         "world_bbox": json.loads(fp["world_bbox_json"]) if fp["world_bbox_json"] else None,
         "pixel_bbox": json.loads(fp["pixel_bbox_json"]) if fp["pixel_bbox_json"] else None,
         "files": {},
@@ -931,6 +932,37 @@ def get_floor_plan(project_id: str, fp_id: str, user=Depends(get_current_user)):
         if not fp:
             raise HTTPException(404, "floor plan block not found")
     return _floor_plan_row_to_dict(fp)
+
+
+@router.put("/projects/{project_id}/floor_plans/{fp_id}")
+def update_floor_plan(project_id: str, fp_id: str, payload: dict, user=Depends(get_current_user)):
+    """Update editable floor-plan metadata (currently height in meters)."""
+    with db() as con:
+        _authorize_project_write(con, project_id, user)
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
+        if not fp:
+            raise HTTPException(404, "floor plan block not found")
+
+    height_m_raw = payload.get("height_m")
+    if height_m_raw is None:
+        raise HTTPException(400, "height_m is required")
+
+    try:
+        height_m = float(height_m_raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, "height_m must be a number") from exc
+
+    if height_m <= 0:
+        raise HTTPException(400, "height_m must be greater than 0")
+
+    with db() as con:
+        con.execute(
+            "UPDATE floor_plans SET height_m=?, updated_at=? WHERE id=?",
+            (height_m, now(), fp_id),
+        )
+        fp2 = con.execute("SELECT * FROM floor_plans WHERE id=?", (fp_id,)).fetchone()
+
+    return _floor_plan_row_to_dict(fp2)
 
 
 # ── Per-floor-plan rooms endpoints ──────────────────────────

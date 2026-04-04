@@ -120,6 +120,7 @@ type FloorPlan = {
   project_id: string;
   block_index: number;
   status: string;
+  height_m?: number | null;
   world_bbox: { xmin: number; ymin: number; xmax: number; ymax: number } | null;
   pixel_bbox: number[] | null;
   files: Record<string, string | null>;
@@ -454,7 +455,21 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     await refresh();
   }
 
-  async function continuePipelineAfterFloorReview() {
+  async function continuePipelineAfterFloorReview(floorPlanHeightsM?: Record<string, number>) {
+    if (floorPlanHeightsM && Object.keys(floorPlanHeightsM).length > 0 && floorPlans.length > 0) {
+      await Promise.all(
+        floorPlans.map(async (fp) => {
+          const h = floorPlanHeightsM[fp.id];
+          if (!Number.isFinite(h) || h <= 0) {
+            throw new Error(`Invalid floor height for block ${fp.block_index + 1}`);
+          }
+          await authFetch(`/api/projects/${projectId}/floor_plans/${fp.id}`, {
+            method: "PUT",
+            body: JSON.stringify({ height_m: h }),
+          });
+        }),
+      );
+    }
     setPipelineStage(null);
     await authFetch(`/api/projects/${projectId}/continue_floor_review`, { method:"POST" });
     await refresh();
@@ -938,6 +953,11 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
             renderUrl={apiUrl(project.files.render_png)}
             mapping={mapping}
             floorPlans={floorPlans}
+            initialHeightsByFloorPlanId={Object.fromEntries(
+              floorPlans
+                .filter((fp) => Number.isFinite(fp.height_m as number))
+                .map((fp) => [fp.id, Number(fp.height_m)]),
+            )}
             onConfirm={continuePipelineAfterFloorReview}
             onAddFloorPlan={addFloorPlan}
             onDeleteFloorPlan={deleteFloorPlan}
@@ -1310,6 +1330,7 @@ function FloorPlanReview({
   renderUrl,
   mapping,
   floorPlans,
+  initialHeightsByFloorPlanId,
   onConfirm,
   onAddFloorPlan,
   onDeleteFloorPlan,
@@ -1319,7 +1340,8 @@ function FloorPlanReview({
   renderUrl: string;
   mapping: Mapping;
   floorPlans: FloorPlan[];
-  onConfirm: () => Promise<void>;
+  initialHeightsByFloorPlanId?: Record<string, number>;
+  onConfirm: (heightsByFloorPlanId: Record<string, number>) => Promise<void>;
   onAddFloorPlan: (pixelBbox: number[]) => Promise<void>;
   onDeleteFloorPlan: (fpId: string) => Promise<void>;
   onRefresh: () => Promise<void>;
@@ -1332,6 +1354,7 @@ function FloorPlanReview({
   const [drawEnd, setDrawEnd] = useState<{ px: number; py: number } | null>(null);
   const [hoveredFp, setHoveredFp] = useState<string | null>(null);
   const [isAdding, setIsAdding] = useState(false);
+  const [floorHeights, setFloorHeights] = useState<Record<string, string>>({});
   const svgRef = useRef<SVGSVGElement>(null);
 
   const COLORS = ["#2563EB", "#DC2626", "#059669", "#D97706", "#7C3AED", "#DB2777", "#0891B2", "#65A30D"];
@@ -1363,10 +1386,36 @@ function FloorPlanReview({
     };
   }
 
+  useEffect(() => {
+    setFloorHeights((prev) => {
+      const next: Record<string, string> = { ...prev };
+      for (const fp of floorPlans) {
+        if (next[fp.id] !== undefined) continue;
+        const initial = initialHeightsByFloorPlanId?.[fp.id];
+        next[fp.id] = Number.isFinite(initial as number) ? String(initial) : "";
+      }
+      for (const fpId of Object.keys(next)) {
+        if (!floorPlans.some((fp) => fp.id === fpId)) delete next[fpId];
+      }
+      return next;
+    });
+  }, [floorPlans, initialHeightsByFloorPlanId]);
+
+  const allHeightsEntered = floorPlans.length > 0 && floorPlans.every((fp) => {
+    const v = Number(floorHeights[fp.id]);
+    return Number.isFinite(v) && v > 0;
+  });
+
   async function handleConfirm() {
+    if (!allHeightsEntered) return;
     setIsConfirming(true);
     try {
-      await onConfirm();
+      const heightsByFloorPlanId: Record<string, number> = {};
+      for (const fp of floorPlans) {
+        const v = Number(floorHeights[fp.id]);
+        if (Number.isFinite(v) && v > 0) heightsByFloorPlanId[fp.id] = v;
+      }
+      await onConfirm(heightsByFloorPlanId);
     } finally {
       setIsConfirming(false);
     }
@@ -1444,13 +1493,13 @@ function FloorPlanReview({
         {canEdit && (
         <button
           onClick={handleConfirm}
-          disabled={isConfirming || floorPlans.length === 0}
+          disabled={isConfirming || !allHeightsEntered}
           style={{
             padding: "7px 18px", borderRadius: 10, border: "none",
             background: "#2D6A4F", color: "#fff", cursor: "pointer",
             fontSize: 12, fontWeight: 700,
             boxShadow: "0 4px 12px rgba(45,106,79,0.3)",
-            opacity: isConfirming || floorPlans.length === 0 ? 0.6 : 1,
+            opacity: isConfirming || !allHeightsEntered ? 0.6 : 1,
           }}
         >
           {isConfirming ? "Confirming..." : "Confirm & Continue"}
@@ -1538,6 +1587,32 @@ function FloorPlanReview({
                   );
                 })}
 
+                {/* Height inputs above each highlighted floor plan */}
+                {canEdit && floorPlans.map((fp, i) => {
+                  if (!fp.world_bbox) return null;
+                  const rect = worldBboxToPixelRect(fp.world_bbox);
+                  const val = floorHeights[fp.id] ?? "";
+                  const inputWidth = 132;
+                  const fx = Math.max(0, Math.min(rect.x + rect.width * 0.5 - inputWidth * 0.5, imgDims.w - inputWidth));
+                  const fy = Math.max(0, rect.y - 52);
+                  return (
+                    <foreignObject key={`fp-height-${fp.id}`} x={fx} y={fy} width={inputWidth} height={30}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 4, background: "rgba(255,255,255,0.95)", border: "1px solid #D1D5DB", borderRadius: 8, padding: "2px 6px" }}>
+                        <input
+                          type="number"
+                          min={0.1}
+                          step={0.1}
+                          value={val}
+                          onChange={(e) => setFloorHeights((prev) => ({ ...prev, [fp.id]: e.target.value }))}
+                          placeholder={`H${i + 1} (m)`}
+                          style={{ width: 86, border: "none", outline: "none", fontSize: 11, background: "transparent", color: "#111827" }}
+                        />
+                        <span style={{ fontSize: 11, color: "#374151", fontWeight: 600 }}>m</span>
+                      </div>
+                    </foreignObject>
+                  );
+                })}
+
                 {/* Drawing rectangle */}
                 {drawMode && drawRect && (
                   <rect
@@ -1582,6 +1657,7 @@ function FloorPlanReview({
           ) : null}
           {floorPlans.map((fp, i) => {
             const color = fpColor(i);
+            const heightVal = floorHeights[fp.id] ?? "";
             return (
               <div
                 key={fp.id}
@@ -1605,6 +1681,39 @@ function FloorPlanReview({
                   </div>
                   <div style={{ fontSize: 10, color: "#9CA3AF" }}>
                     Block {fp.block_index}
+                  </div>
+                  <div style={{ marginTop: 6 }}>
+                    {canEdit ? (
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <input
+                          type="number"
+                          min={0.1}
+                          step={0.1}
+                          value={heightVal}
+                          onClick={(e) => e.stopPropagation()}
+                          onChange={(e) => {
+                            e.stopPropagation();
+                            setFloorHeights((prev) => ({ ...prev, [fp.id]: e.target.value }));
+                          }}
+                          placeholder="Height"
+                          style={{
+                            width: 86,
+                            borderRadius: 6,
+                            border: "1px solid #D1D5DB",
+                            padding: "3px 6px",
+                            fontSize: 11,
+                            color: "#1A1A2E",
+                            background: "#FFFFFF",
+                            outline: "none",
+                          }}
+                        />
+                        <span style={{ fontSize: 11, color: "#6B7280", fontWeight: 600 }}>m</span>
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: 11, color: "#6B7280" }}>
+                        Height: {heightVal ? `${heightVal} m` : "Not set"}
+                      </div>
+                    )}
                   </div>
                 </div>
                 {fp.files?.render_png && (
@@ -1649,8 +1758,8 @@ function FloorPlanReview({
             background: "#FEFCE8", border: "1px solid rgba(217,119,6,0.2)",
             fontSize: 11, color: "#92400E", lineHeight: 1.5,
           }}>
-            Review the detected floor plans. You can add more by clicking "Add Floor Plan" and drawing a box, or remove incorrect ones by clicking &times;.
-            When satisfied, click "Confirm & Continue".
+            Review the detected floor plans and enter height (m) for each one.
+            Confirm & Continue is enabled only after all floor plan heights are filled.
           </div>
         </div>
       </div>
