@@ -2208,7 +2208,7 @@ function RoomEditor({
 
   // ── Detector state ──
   const [detectors, setDetectors] = useState<Detector[]>([]);
-  const [editorMode, setEditorMode] = useState<"rooms" | "select" | "add" | "erase" | "pan" | "pipe_draw" | "pipe_select">("rooms");
+  const [editorMode, setEditorMode] = useState<"rooms" | "select" | "add" | "erase" | "pan" | "pipe_draw" | "pipe_select" | "measure">("rooms");
   const [addType, setAddType] = useState<ObjectType>("smoke");
   const [selectedDetectorIds, setSelectedDetectorIds] = useState<string[]>([]);
   const [imgDims, setImgDims] = useState<{w:number; h:number} | null>(null);
@@ -2229,6 +2229,9 @@ function RoomEditor({
   const [sidebarTab, setSidebarTab] = useState<"rooms" | "equipment">("rooms");
   const [pipesData, setPipesData] = useState<PipesData | null>(null);
   const [isSavingChanges, setIsSavingChanges] = useState(false);
+  const [measureStart, setMeasureStart] = useState<{px:number; py:number} | null>(null);
+  const [measureEnd, setMeasureEnd] = useState<{px:number; py:number} | null>(null);
+  const [measureLocked, setMeasureLocked] = useState(false);
 
   // ── Helpers ──
   function samePoint(a: {px:number; py:number}, b: {px:number; py:number}, tolerance = 0.5) {
@@ -2328,6 +2331,11 @@ function RoomEditor({
         if (pipeDrawStart) { setPipeDrawStart(null); setPipeDrawEnd(null); }
         if (selectedPipeIdx !== null) setSelectedPipeIdx(null);
         if (selectedDetectorIds.length > 0) setSelectedDetectorIds([]);
+        if (measureStart || measureEnd) {
+          setMeasureStart(null);
+          setMeasureEnd(null);
+          setMeasureLocked(false);
+        }
       }
     }
     window.addEventListener("keydown", handleKey);
@@ -2742,6 +2750,7 @@ function RoomEditor({
     if (editorMode === "pan") return "grab";
     if (editorMode === "add") return "crosshair";
     if (editorMode === "erase") return "not-allowed";
+    if (editorMode === "measure") return "crosshair";
     if (editorMode === "rooms" && splitMode) return "crosshair";
     if (editorMode === "pipe_draw") return "crosshair";
     if (editorMode === "pipe_select") return "pointer";
@@ -2792,6 +2801,9 @@ function RoomEditor({
                   {canEdit && <button onClick={() => { setEditorMode("add"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "add")}>Add</button>}
                   {canEdit && <button onClick={() => { setEditorMode("erase"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "erase")}>Erase</button>}
                   <button onClick={() => { setEditorMode("pan"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "pan")}>Pan</button>
+                  <button onClick={() => { setEditorMode("measure"); setSplitMode(false); resetSplitState(); setSelectedDetectorIds([]); setMarquee(null); }} style={ceToolBtn(editorMode === "measure")}>
+                    Measure
+                  </button>
                   {canEdit && (
                   <>
                   <div style={{ width: 1, height: 20, background: "#E8EAED" }} />
@@ -2917,6 +2929,17 @@ function RoomEditor({
                         const point = toImagePoint(e);
                         if (!point) return;
                         const { px, py } = point;
+                        if (editorMode === "measure") {
+                          if (!measureStart || measureLocked) {
+                            setMeasureStart({ px, py });
+                            setMeasureEnd({ px, py });
+                            setMeasureLocked(false);
+                          } else {
+                            setMeasureEnd({ px, py });
+                            setMeasureLocked(true);
+                          }
+                          return;
+                        }
                         if (editorMode === "rooms") return;
                         // Pipe draw mode
                         if (editorMode === "pipe_draw") {
@@ -2955,6 +2978,10 @@ function RoomEditor({
                           setSplitHover(snapped);
                           return;
                         }
+                        if (editorMode === "measure") {
+                          if (measureStart && !measureLocked) setMeasureEnd(point);
+                          return;
+                        }
                         setHoverPoint(point);
                         // Pipe draw preview
                         if (editorMode === "pipe_draw" && pipeDrawStart) {
@@ -2974,6 +3001,7 @@ function RoomEditor({
                         setGroupPreview(next);
                       }}
                       onMouseUp={() => {
+                        if (editorMode === "measure") return;
                         // Finalize pipe draw
                         if (editorMode === "pipe_draw" && pipeDrawStart && pipeDrawEnd) {
                           const dist = Math.hypot(pipeDrawEnd.px - pipeDrawStart.px, pipeDrawEnd.py - pipeDrawStart.py);
@@ -3193,6 +3221,35 @@ function RoomEditor({
                           <line x1={hoverPoint.px} y1={hoverPoint.py - 9} x2={hoverPoint.px} y2={hoverPoint.py + 9} stroke="#2D6A4F" strokeWidth={2} />
                         </g>
                       ) : null}
+
+                      {/* Measure stencil */}
+                      {measureStart && measureEnd ? (() => {
+                        const worldA = pixelToWorld(mapping, measureStart.px, measureStart.py);
+                        const worldB = pixelToWorld(mapping, measureEnd.px, measureEnd.py);
+                        const dWorld = Math.hypot(worldB.x - worldA.x, worldB.y - worldA.y);
+                        const dMeters = dWorld * 0.001;
+                        const midX = (measureStart.px + measureEnd.px) * 0.5;
+                        const midY = (measureStart.py + measureEnd.py) * 0.5;
+                        return (
+                          <g style={{ pointerEvents: "none" }}>
+                            <line
+                              x1={measureStart.px}
+                              y1={measureStart.py}
+                              x2={measureEnd.px}
+                              y2={measureEnd.py}
+                              stroke="#2563EB"
+                              strokeWidth={2.5}
+                              strokeDasharray="8 4"
+                            />
+                            <circle cx={measureStart.px} cy={measureStart.py} r={5} fill="#DBEAFE" stroke="#2563EB" strokeWidth={2} />
+                            <circle cx={measureEnd.px} cy={measureEnd.py} r={5} fill="#DBEAFE" stroke="#2563EB" strokeWidth={2} />
+                            <rect x={midX - 60} y={midY - 24} width={120} height={22} rx={8} fill="rgba(37,99,235,0.92)" />
+                            <text x={midX} y={midY - 9} textAnchor="middle" fill="#ffffff" fontSize={12} fontWeight={700}>
+                              {`${dMeters.toFixed(2)} m`}
+                            </text>
+                          </g>
+                        );
+                      })() : null}
                     </svg>
                   ) : null}
                 </div>
@@ -3603,6 +3660,19 @@ function RoomEditor({
             Click two points on the selected room boundary to split.
           </div>
         ) : null}
+        {editorMode === "measure" ? (
+          <div style={{ padding: "0 14px 8px", fontSize: 12, color: "#6B7280", display: "flex", alignItems: "center", gap: 8 }}>
+            Click first point, click second to lock. Click again to start a new measurement.
+            {(measureStart || measureEnd) ? (
+              <button
+                onClick={() => { setMeasureStart(null); setMeasureEnd(null); setMeasureLocked(false); }}
+                style={{ ...ceRoomBtn, padding: "4px 8px", fontSize: 11 }}
+              >
+                Clear Measure
+              </button>
+            ) : null}
+          </div>
+        ) : null}
 
         {/* Bottom action bar */}
         {canEdit && (
@@ -3924,7 +3994,7 @@ function Editor({
 }) {
   const [imgDims, setImgDims] = useState<{w:number;h:number}|null>(null);
   const readOnly = isReady;
-  const [tool, setTool] = useState<"select"|"add"|"erase"|"pan">(isReady ? "pan" : "select");
+  const [tool, setTool] = useState<"select"|"add"|"erase"|"pan"|"measure">(isReady ? "pan" : "select");
   const [addType, setAddType] = useState<ObjectType>("smoke");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [marquee, setMarquee] = useState<{sx:number; sy:number; ex:number; ey:number} | null>(null);
@@ -3938,6 +4008,9 @@ function Editor({
   const [transformState, setTransformState] = useState({ scale: 0.18, positionX: 0, positionY: 0 });
   const [isSaving, setIsSaving] = useState(false);
   const [isExporting, setIsExporting] = useState<null | "dxf" | "png">(null);
+  const [measureStart, setMeasureStart] = useState<{px:number; py:number} | null>(null);
+  const [measureEnd, setMeasureEnd] = useState<{px:number; py:number} | null>(null);
+  const [measureLocked, setMeasureLocked] = useState(false);
 
   // Local mutable copies of detectors and pipes (client-side editing)
   const [detectors, setDetectors] = useState<Detector[]>(detectorsProp);
@@ -4134,6 +4207,7 @@ function Editor({
     if (tool === "pan") return "grab";
     if (tool === "add") return "crosshair";
     if (tool === "erase") return "not-allowed";
+    if (tool === "measure") return "crosshair";
     if (groupDrag) return "grabbing";
     return "default";
   }
@@ -4221,6 +4295,10 @@ function Editor({
               {!readOnly && canEdit && <button onClick={() => setTool("add")} style={toolBtn(tool === "add")}>Add</button>}
               {!readOnly && canEdit && <button onClick={() => setTool("erase")} style={toolBtn(tool === "erase")}>Erase</button>}
               <button onClick={() => setTool("pan")} style={toolBtn(tool === "pan")}>Pan</button>
+              <button onClick={() => setTool("measure")} style={toolBtn(tool === "measure")}>Measure</button>
+              {tool === "measure" && (measureStart || measureEnd) ? (
+                <button onClick={() => { setMeasureStart(null); setMeasureEnd(null); setMeasureLocked(false); }} style={toolBtn(false)}>Clear Measure</button>
+              ) : null}
               {!readOnly && canEdit && (
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 2 }}>
                 {OBJECT_TYPES.map((otype) => {
@@ -4332,10 +4410,22 @@ function Editor({
                     height={imgDims.h}
                     viewBox={`0 0 ${imgDims.w} ${imgDims.h}`}
                     style={{ position:"absolute", left:0, top:0, cursor: readOnly ? "default" : canvasCursor() }}
-                    onMouseDown={readOnly ? undefined : (e)=> {
+                    onMouseDown={(e)=> {
                       const point = toImagePoint(e);
                       if (!point) return;
                       const { px, py } = point;
+                      if (tool === "measure") {
+                        if (!measureStart || measureLocked) {
+                          setMeasureStart({ px, py });
+                          setMeasureEnd({ px, py });
+                          setMeasureLocked(false);
+                        } else {
+                          setMeasureEnd({ px, py });
+                          setMeasureLocked(true);
+                        }
+                        return;
+                      }
+                      if (readOnly) return;
                       const id = hitTest(px, py);
                       if (tool === "select") {
                         if (id) {
@@ -4360,9 +4450,14 @@ function Editor({
                         return;
                       }
                     }}
-                    onMouseMove={readOnly ? undefined : (e)=> {
+                    onMouseMove={(e)=> {
                       const point = toImagePoint(e);
                       if (!point) return;
+                      if (tool === "measure") {
+                        if (measureStart && !measureLocked) setMeasureEnd(point);
+                        return;
+                      }
+                      if (readOnly) return;
                       setHoverPoint(point);
                       if (tool !== "select" && tool !== "erase") return;
                       if (marquee) {
@@ -4380,7 +4475,9 @@ function Editor({
                       }
                       setGroupPreview(next);
                     }}
-                    onMouseUp={readOnly ? undefined : (e)=> {
+                    onMouseUp={(e)=> {
+                      if (tool === "measure") return;
+                      if (readOnly) return;
                       if (tool !== "select" && tool !== "erase") return;
                       if (marquee) {
                         const p1 = { px: marquee.sx, py: marquee.sy };
@@ -4399,7 +4496,7 @@ function Editor({
                       setGroupDrag(null);
                       setGroupPreview(null);
                     }}
-                    onMouseLeave={readOnly ? undefined : ()=> {
+                    onMouseLeave={()=> {
                       setHoverPoint(null);
                       if (marquee) setMarquee(null);
                       if (groupDrag) setGroupDrag(null);
@@ -4471,6 +4568,34 @@ function Editor({
                         <line x1={hoverPoint.px} y1={hoverPoint.py - 9} x2={hoverPoint.px} y2={hoverPoint.py + 9} stroke="#52B788" strokeWidth={2} />
                       </g>
                     ) : null}
+
+                    {measureStart && measureEnd ? (() => {
+                      const worldA = pixelToWorld(mapping, measureStart.px, measureStart.py);
+                      const worldB = pixelToWorld(mapping, measureEnd.px, measureEnd.py);
+                      const dWorld = Math.hypot(worldB.x - worldA.x, worldB.y - worldA.y);
+                      const dMeters = dWorld * 0.001;
+                      const midX = (measureStart.px + measureEnd.px) * 0.5;
+                      const midY = (measureStart.py + measureEnd.py) * 0.5;
+                      return (
+                        <g style={{ pointerEvents: "none" }}>
+                          <line
+                            x1={measureStart.px}
+                            y1={measureStart.py}
+                            x2={measureEnd.px}
+                            y2={measureEnd.py}
+                            stroke="#2563EB"
+                            strokeWidth={2.5}
+                            strokeDasharray="8 4"
+                          />
+                          <circle cx={measureStart.px} cy={measureStart.py} r={5} fill="#DBEAFE" stroke="#2563EB" strokeWidth={2} />
+                          <circle cx={measureEnd.px} cy={measureEnd.py} r={5} fill="#DBEAFE" stroke="#2563EB" strokeWidth={2} />
+                          <rect x={midX - 60} y={midY - 24} width={120} height={22} rx={8} fill="rgba(37,99,235,0.92)" />
+                          <text x={midX} y={midY - 9} textAnchor="middle" fill="#ffffff" fontSize={12} fontWeight={700}>
+                            {`${dMeters.toFixed(2)} m`}
+                          </text>
+                        </g>
+                      );
+                    })() : null}
                   </svg>
                 ) : null}
               </div>
