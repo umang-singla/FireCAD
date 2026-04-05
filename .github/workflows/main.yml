@@ -62,4 +62,24 @@ jobs:
             --ports 80 8000\
             --os-type Linux \
             --cpu 1 \
-            --memory 1.5
+            --memory 1.5 \
+            --environment-variables \
+              API_HOST=0.0.0.0 \
+              API_PORT=8000 \
+              DATA_DIR=/data \
+              ODA_PATH=/opt/oda/ODAFileConverter \
+              TARGET_LONG_SIDE_PX=6000 \
+              DPI=600 \
+              RENDER_MAX_MEGAPIXELS=25 \
+              USE_QCAD_DWG2BMP=1 \
+              QCAD_HIGH_QUALITY=1 \
+              QCAD_MARGIN_PX=4 \
+              QCAD_DEFAULT_WIDTH_PX=24000 \
+              QCAD_DEFAULT_HEIGHT_PX=16000 \
+              QCAD_JPEG_QUALITY=95 \
+              QCAD_FLATTEN_WHITE=1 \
+              PAD_FRAC=0.01 \
+              DETECTOR_SPACING_M=5.0 \
+              WALL_BUFFER_M=0.5 \
+            --secure-environment-variables \
+              GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
