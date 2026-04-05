@@ -6,6 +6,7 @@ import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
 import { getToken, getTenantRole } from "../../lib/auth";
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
+const WS_BASE = (process.env.NEXT_PUBLIC_WS_BASE || "").replace(/\/$/, "");
 
 function resolveApiBase() {
   if (API_BASE) return API_BASE;
@@ -16,6 +17,11 @@ function resolveApiBase() {
     }
   }
   return "";
+}
+
+function resolveWsBase() {
+  if (WS_BASE) return WS_BASE.replace(/^http/, "ws");
+  return resolveApiBase().replace(/^http/, "ws");
 }
 
 const apiUrl = (path: string) => `${resolveApiBase()}${path}`;
@@ -288,9 +294,9 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
 
   useEffect(() => { refresh(); }, []);
 
-  // Real-time pipeline status via WebSocket
+  // Real-time pipeline status via WebSocket (routed through proxy)
   useEffect(() => {
-    const base = resolveApiBase().replace(/^http/, "ws");
+    const base = resolveWsBase();
     const wsUrl = `${base}/api/projects/${projectId}/ws`;
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
