@@ -237,7 +237,7 @@ async def websocket_proxy(ws: WebSocket, path: str = ""):
 
         async with wsc.connect(
             ws_url,
-            additional_headers=extra_headers,
+            extra_headers=extra_headers,
             open_timeout=_TIMEOUT,
             close_timeout=10,
         ) as upstream:
