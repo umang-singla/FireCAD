@@ -7,6 +7,7 @@ coordinates, sized pipe segments, and optionally exports them into a DXF.
 import os
 import math
 import logging
+import re
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -28,6 +29,12 @@ try:
 except ImportError:
     _EZDXF_OK = False
 
+try:
+    from google import genai
+    _GENAI_OK = True
+except ImportError:
+    _GENAI_OK = False
+
 logger = logging.getLogger("firecad.pipeline.sprinkler_routing")
 
 # ── runtime defaults (overridden by callers) ──────────────────────
@@ -38,6 +45,35 @@ NOISE_TOLERANCE_M = 0.15
 MIN_WALL_LENGTH_M = 0.05
 WALL_BUFFER_M = 0.5
 ALIGNMENT_TOLERANCE_M = 2.0
+
+# Hazard categories used by sprinkler placement logic.
+HAZARD_LH = "LH"
+HAZARD_OH = "OH"
+HAZARD_HH = "HH"
+HAZARD_WASHROOM = "WASHROOM"
+
+# Deterministic room classification patterns (kept local/offline).
+_HH_KEYWORDS = {
+    "BOILER", "DG", "GENERATOR", "TURBINE", "FURNACE", "OVEN", "KILN",
+    "CHEMICAL", "PAINT", "FLAMMABLE", "BATTERY",
+}
+_OH_KEYWORDS = {
+    "KITCHEN", "PANTRY", "GARAGE", "WORKSHOP", "REPAIR", "PLANT", "MECHANICAL",
+    "MACHINE", "SERVICE",
+}
+_WASHROOM_KEYWORDS = {
+    "WASHROOM", "TOILET", "WC", "RESTROOM", "BATHROOM",
+}
+
+# Rule-based sprinkler geometry constraints by hazard type.
+_HAZARD_PARAMS = {
+    HAZARD_HH: {"max_area": 9.0, "max_spacing": 3.75, "max_wall": 1.875},
+    HAZARD_OH: {"max_area": 12.0, "max_spacing": 4.5, "max_wall": 2.25},
+    HAZARD_LH: {"max_area": 21.0, "max_spacing": 4.5, "max_wall": 2.25},
+}
+
+_VALID_GEMINI_HAZARDS = {HAZARD_LH, HAZARD_OH, HAZARD_HH, HAZARD_WASHROOM, "IGNORE", "MANUAL_REVIEW"}
+_GEMINI_LABEL_CACHE: Dict[str, str] = {}
 
 # DXF layers
 DXF_LAYER_SPRINKLER = "AI_FIRE_SPRINKLERS"
@@ -57,6 +93,153 @@ def _set_runtime_config(
     SPRINKLER_SPACING_M = float(spacing_m)
     WALL_BUFFER_M = float(wall_buffer_m)
     WORLD_TO_M = float(world_to_m)
+
+
+def _normalize_label_for_match(text: str) -> str:
+    s = str(text or "").upper()
+    s = s.replace("\\P", " ")
+    s = re.sub(r"[^A-Z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _merge_room_label_text(room: Dict) -> str:
+    candidates = [
+        room.get("label"),
+        room.get("label_text"),
+        room.get("name"),
+    ]
+    label_texts = room.get("label_texts")
+    if isinstance(label_texts, list):
+        candidates.extend(label_texts)
+
+    return " ".join(_normalize_label_for_match(c) for c in candidates if c).strip()
+
+
+def _deterministic_hazard_from_label(merged_label: str) -> str | None:
+    if not merged_label:
+        return None
+
+    words = set(merged_label.split())
+
+    if words & _WASHROOM_KEYWORDS:
+        return HAZARD_WASHROOM
+    if words & _HH_KEYWORDS:
+        return HAZARD_HH
+    if words & _OH_KEYWORDS:
+        return HAZARD_OH
+    # Ordinary office/meeting/etc. usually contains ROOM and should be LH.
+    if "ROOM" in words:
+        return HAZARD_LH
+    return None
+
+
+def _gemini_enabled_for_hazards() -> bool:
+    if not _GENAI_OK:
+        return False
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    return bool(api_key)
+
+
+def _classify_unknown_labels_with_gemini(labels: List[str]) -> Dict[str, str]:
+    """Classify unknown labels only; returns map normalized_label -> hazard."""
+    if not labels or not _gemini_enabled_for_hazards():
+        return {}
+
+    try:
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY", "").strip())
+        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip() or "gemini-2.5-flash-lite"
+
+        payload = {
+            "valid_hazards": ["LH", "OH", "HH", "WASHROOM", "IGNORE", "MANUAL_REVIEW"],
+            "labels": labels,
+            "notes": [
+                "Map each label to exactly one valid_hazard.",
+                "Use IGNORE for non-room text.",
+                "Use MANUAL_REVIEW only if truly ambiguous.",
+            ],
+        }
+
+        prompt = (
+            "You are a fire-safety room classifier. Return strict JSON as: "
+            '{"items":[{"label":"...","hazard":"LH|OH|HH|WASHROOM|IGNORE|MANUAL_REVIEW"}]} '
+            "for all labels in input order."
+        )
+
+        response = client.models.generate_content(
+            model=model,
+            contents=[prompt, str(payload)],
+        )
+        raw = (response.text or "").strip()
+        data = None
+        try:
+            data = __import__("json").loads(raw)
+        except Exception:
+            match = re.search(r"\{[\s\S]*\}", raw)
+            if match:
+                data = __import__("json").loads(match.group(0))
+
+        out: Dict[str, str] = {}
+        items = (data or {}).get("items", []) if isinstance(data, dict) else []
+        for item in items:
+            label = _normalize_label_for_match(item.get("label", ""))
+            hazard = str(item.get("hazard", "")).upper().strip()
+            if not label:
+                continue
+            if hazard not in _VALID_GEMINI_HAZARDS:
+                continue
+            if hazard in {"IGNORE", "MANUAL_REVIEW"}:
+                out[label] = HAZARD_LH
+            else:
+                out[label] = hazard
+        return out
+    except Exception as e:
+        logger.warning("Gemini hazard classification failed: %s", e)
+        return {}
+
+
+def _classify_room_hazards(rooms: List[Dict]) -> List[str]:
+    """Deterministic first, optional Gemini fallback for unknown labels only."""
+    hazards: List[str] = [HAZARD_LH] * len(rooms)
+    unknown_labels: List[str] = []
+    unknown_indices: List[int] = []
+
+    for i, room in enumerate(rooms):
+        merged = _merge_room_label_text(room)
+        if not merged:
+            hazards[i] = HAZARD_LH
+            continue
+
+        det = _deterministic_hazard_from_label(merged)
+        if det is not None:
+            hazards[i] = det
+            continue
+
+        cached = _GEMINI_LABEL_CACHE.get(merged)
+        if cached:
+            hazards[i] = cached
+            continue
+
+        unknown_labels.append(merged)
+        unknown_indices.append(i)
+
+    gemini_map = _classify_unknown_labels_with_gemini(sorted(set(unknown_labels))) if unknown_labels else {}
+
+    for idx in unknown_indices:
+        merged = _merge_room_label_text(rooms[idx])
+        gem = gemini_map.get(merged)
+        if gem:
+            hazards[idx] = gem
+            _GEMINI_LABEL_CACHE[merged] = gem
+        else:
+            hazards[idx] = HAZARD_LH
+            _GEMINI_LABEL_CACHE[merged] = HAZARD_LH
+
+    return hazards
+
+
+def _hazard_params(hazard_type: str) -> Dict[str, float]:
+    return _HAZARD_PARAMS.get(hazard_type, _HAZARD_PARAMS[HAZARD_LH])
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -233,17 +416,36 @@ def _decompose_recursive(poly):
 # ──────────────────────────────────────────────────────────────────
 # Sprinkler grid placement
 # ──────────────────────────────────────────────────────────────────
-def _get_grid_points(poly):
+def _get_grid_points(poly: Polygon, hazard_type: str = HAZARD_LH):
+    params = _hazard_params(hazard_type)
     angle_rad, (cx, cy) = _get_longest_wall_angle(poly)
     angle_deg = math.degrees(angle_rad)
     rot_poly = rotate(poly, -angle_deg, origin=(cx, cy))
     minx, miny, maxx, maxy = rot_poly.bounds
     width, height = maxx - minx, maxy - miny
-    spacing_world = SPRINKLER_SPACING_M / WORLD_TO_M
+    max_spacing_world = min(SPRINKLER_SPACING_M, params["max_spacing"]) / WORLD_TO_M
+    max_area_world = params["max_area"] / (WORLD_TO_M ** 2)
+    max_wall_world = params["max_wall"] / WORLD_TO_M
 
-    nx_pts = max(1, math.ceil(width / spacing_world))
-    ny_pts = max(1, math.ceil(height / spacing_world))
+    nx_pts = max(1, math.ceil(width / max_spacing_world))
+    ny_pts = max(1, math.ceil(height / max_spacing_world))
+
+    # Respect max coverage area per sprinkler.
+    while (width / nx_pts) * (height / ny_pts) > max_area_world:
+        if (width / nx_pts) > (height / ny_pts):
+            nx_pts += 1
+        else:
+            ny_pts += 1
+
     step_x, step_y = width / nx_pts, height / ny_pts
+
+    # Respect wall distance constraints.
+    while (step_x / 2.0) > max_wall_world:
+        nx_pts += 1
+        step_x = width / nx_pts
+    while (step_y / 2.0) > max_wall_world:
+        ny_pts += 1
+        step_y = height / ny_pts
 
     points = []
     for i in range(nx_pts):
@@ -257,7 +459,7 @@ def _get_grid_points(poly):
     return points
 
 
-def _process_room(room_poly):
+def _process_room(room_poly: Polygon, hazard_type: str = HAZARD_LH):
     points: List[Tuple[float, float]] = []
     regions: List[Polygon] = []
     tolerance_world = NOISE_TOLERANCE_M / WORLD_TO_M
@@ -277,7 +479,7 @@ def _process_room(room_poly):
         if poly.area < min_area_world:
             continue
         regions.append(poly)
-        grid = _get_grid_points(poly)
+        grid = _get_grid_points(poly, hazard_type=hazard_type)
         if not grid:
             rep = poly.representative_point()
             grid = [(rep.x, rep.y)]
@@ -302,6 +504,17 @@ def get_pipe_diameter_label(num_sprinklers: int) -> str:
     elif num_sprinklers <= 60:
         return "80mm"
     return "90mm"
+
+
+def _diameter_label_to_mm(label: str) -> int:
+    m = re.search(r"(\d+)", str(label))
+    return int(m.group(1)) if m else 25
+
+
+def _ensure_min_diameter(label: str, min_mm: int) -> str:
+    curr = _diameter_label_to_mm(label)
+    mm = max(curr, int(min_mm))
+    return f"{mm}mm"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -347,6 +560,39 @@ def route_pipes(
 
     source = (round(source[0], 4), round(source[1], 4))
     sprinklers = [(round(s[0], 4), round(s[1], 4)) for s in sprinklers]
+
+    def _is_room_crossing_segment(u_pt, v_pt) -> bool:
+        """True when a segment crosses through/into multiple room regions.
+
+        This is intentionally geometric (line vs polygons) and does not rely
+        only on endpoint region assignment, which can be brittle near borders.
+        """
+        if not valid_regions:
+            return False
+
+        seg = LineString([u_pt, v_pt])
+        if seg.length <= 1e-6:
+            return False
+
+        eps = 0.05 / WORLD_TO_M
+        touched_indices = []
+        for i, reg in enumerate(valid_regions):
+            if reg.buffer(eps).intersects(seg):
+                touched_indices.append(i)
+                if len(touched_indices) >= 2:
+                    return True
+
+        # If it traverses across a single room boundary with both endpoints
+        # outside that room, treat it as a crossing segment too.
+        if len(touched_indices) == 1:
+            reg = valid_regions[touched_indices[0]]
+            rp = reg.buffer(eps)
+            u_in = rp.contains(Point(u_pt[0], u_pt[1]))
+            v_in = rp.contains(Point(v_pt[0], v_pt[1]))
+            if (not u_in and not v_in) and seg.crosses(reg):
+                return True
+
+        return False
 
     xs = [s[0] for s in sprinklers]
     ys = [s[1] for s in sprinklers]
@@ -456,6 +702,7 @@ def route_pipes(
         return [], sprinklers
 
     node_cost = {node: (1 if node in sprinkler_set else 0) for node in directed_tree.nodes()}
+
     subtree_counts: Dict = {}
     for node in reversed(list(nx.topological_sort(directed_tree))):
         count = node_cost[node]
@@ -467,42 +714,21 @@ def route_pipes(
     for u, v in directed_tree.edges():
         fed = subtree_counts[v]
         if fed > 0:
-            raw_segments.append((u, v, get_pipe_diameter_label(fed)))
+            label = get_pipe_diameter_label(fed)
+            is_arm_segment = (u in sprinkler_set) or (v in sprinkler_set)
+            # Keep 25mm only for final arm segments connected directly to a sprinkler.
+            if not is_arm_segment:
+                label = _ensure_min_diameter(label, 32)
+            # Rule: if a segment crosses room regions, enforce minimum 32mm.
+            if _is_room_crossing_segment(u, v):
+                label = _ensure_min_diameter(label, 32)
+            raw_segments.append((u, v, label))
 
-    # Merge collinear segments
-    horiz_lines: Dict[float, list] = {}
-    vert_lines: Dict[float, list] = {}
-    for u, v, label in raw_segments:
-        pt1, pt2 = sorted([u, v])
-        if abs(pt1[1] - pt2[1]) < 1e-4:
-            y = round(pt1[1], 4)
-            horiz_lines.setdefault(y, []).append((round(pt1[0], 4), round(pt2[0], 4), label))
-        else:
-            x = round(pt1[0], 4)
-            vert_lines.setdefault(x, []).append((round(pt1[1], 4), round(pt2[1], 4), label))
-
+    # Keep each routed edge as its own segment so every joint-to-joint pipe
+    # can be labeled independently downstream.
     final_segments: List[Tuple[Tuple[Tuple[float, float], Tuple[float, float]], str]] = []
-    for y, segs in horiz_lines.items():
-        segs.sort()
-        merged = []
-        for s in segs:
-            if merged and abs(merged[-1][1] - s[0]) < 1e-4 and merged[-1][2] == s[2]:
-                merged[-1] = (merged[-1][0], s[1], merged[-1][2])
-            else:
-                merged.append(s)
-        for m in merged:
-            final_segments.append((((m[0], y), (m[1], y)), m[2]))
-
-    for x, segs in vert_lines.items():
-        segs.sort()
-        merged = []
-        for s in segs:
-            if merged and abs(merged[-1][1] - s[0]) < 1e-4 and merged[-1][2] == s[2]:
-                merged[-1] = (merged[-1][0], s[1], merged[-1][2])
-            else:
-                merged.append(s)
-        for m in merged:
-            final_segments.append((((x, m[0]), (x, m[1])), m[2]))
+    for u, v, label in raw_segments:
+        final_segments.append(((u, v), label))
 
     return final_segments, sprinklers
 
@@ -606,7 +832,8 @@ def write_sprinklers_to_dxf(
         if layer_name not in doc.layers:
             doc.layers.add(layer_name)
 
-    pipe_text_height = text_height_world * 0.40
+    # Increase readability for pipe size labels in output drawings.
+    pipe_text_height = text_height_world * 1.10
     # Keep pipe thickness proportional to symbol scale while enforcing a practical minimum.
     pipe_const_width = max(symbol_radius_world * 0.18, 0.03 / world_to_m)
 
@@ -619,8 +846,6 @@ def write_sprinklers_to_dxf(
         dx = pt2[0] - pt1[0]
         dy = pt2[1] - pt1[1]
         length = math.hypot(dx, dy)
-        if length < 0.6 / WORLD_TO_M:
-            continue
         mid_x = (pt1[0] + pt2[0]) / 2.0
         mid_y = (pt1[1] + pt2[1]) / 2.0
         is_horizontal = abs(dx) > abs(dy)
@@ -706,11 +931,27 @@ def place_sprinklers_from_rooms_json(
     all_points: List[Tuple[float, float]] = []
     all_regions: List[Polygon] = []
 
-    for room in rooms:
+    hazard_counts: Dict[str, int] = {HAZARD_LH: 0, HAZARD_OH: 0, HAZARD_HH: 0, HAZARD_WASHROOM: 0}
+    room_hazards = _classify_room_hazards(rooms)
+
+    for room, hazard in zip(rooms, room_hazards):
         poly = _parse_polygon(room.get("polygon_world"))
         if poly is None:
             continue
-        pts, regs = _process_room(poly)
+        area_m2 = float(poly.area) * (world_to_m ** 2)
+        # Optional washroom exception: skip tiny washrooms.
+        if hazard == HAZARD_WASHROOM and area_m2 < 5.0:
+            continue
+        if hazard == HAZARD_WASHROOM:
+            hazard = HAZARD_LH
+
+        # Large LH spaces are treated as OH to avoid under-protection.
+        if hazard == HAZARD_LH and area_m2 > 126.0:
+            hazard = HAZARD_OH
+
+        hazard_counts[hazard] = hazard_counts.get(hazard, 0) + 1
+
+        pts, regs = _process_room(poly, hazard_type=hazard)
         all_points.extend(pts)
         all_regions.extend(regs)
 
@@ -740,11 +981,12 @@ def place_sprinklers_from_rooms_json(
     pipe_segments, snapped_sprinklers = route_pipes(all_points, source, valid_regions=all_regions)
 
     logger.info(
-        "place_sprinklers_from_rooms_json sprinklers=%d pipes=%d source=(%.1f, %.1f)",
+        "place_sprinklers_from_rooms_json sprinklers=%d pipes=%d source=(%.1f, %.1f) hazards=%s",
         len(snapped_sprinklers),
         len(pipe_segments),
         source[0],
         source[1],
+        hazard_counts,
     )
 
     if debug_png_path:
@@ -770,11 +1012,20 @@ def place_sprinklers_only(
 
     all_points: List[Tuple[float, float]] = []
 
-    for room in rooms:
+    room_hazards = _classify_room_hazards(rooms)
+    for room, hazard in zip(rooms, room_hazards):
         poly = _parse_polygon(room.get("polygon_world"))
         if poly is None:
             continue
-        pts, _regs = _process_room(poly)
+        area_m2 = float(poly.area) * (world_to_m ** 2)
+        if hazard == HAZARD_WASHROOM and area_m2 < 5.0:
+            continue
+        if hazard == HAZARD_WASHROOM:
+            hazard = HAZARD_LH
+        if hazard == HAZARD_LH and area_m2 > 126.0:
+            hazard = HAZARD_OH
+
+        pts, _regs = _process_room(poly, hazard_type=hazard)
         all_points.extend(pts)
 
     logger.info("place_sprinklers_only sprinklers=%d", len(all_points))
@@ -810,11 +1061,20 @@ def route_pipes_for_sprinklers(
 
     # Build regions from rooms for safe-path checking
     all_regions: List[Polygon] = []
-    for room in rooms:
+    room_hazards = _classify_room_hazards(rooms)
+    for room, hazard in zip(rooms, room_hazards):
         poly = _parse_polygon(room.get("polygon_world"))
         if poly is None:
             continue
-        _pts, regs = _process_room(poly)
+        area_m2 = float(poly.area) * (world_to_m ** 2)
+        if hazard == HAZARD_WASHROOM and area_m2 < 5.0:
+            continue
+        if hazard == HAZARD_WASHROOM:
+            hazard = HAZARD_LH
+        if hazard == HAZARD_LH and area_m2 > 126.0:
+            hazard = HAZARD_OH
+
+        _pts, regs = _process_room(poly, hazard_type=hazard)
         all_regions.extend(regs)
 
     # Determine source

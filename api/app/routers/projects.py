@@ -13,6 +13,8 @@ from app.pipeline.run_pipeline import (
     continue_pipeline_after_rooms,
     PipelineOptions,
 )
+from app.pipeline.gemini_mask import generate_mask_image, DEFAULT_PROMPT
+from app.pipeline.mask_align import align_perfect_tight_box
 from app.pipeline.dxf_export import write_detectors_to_dxf
 from app.pipeline.render import render_dwg_to_png_with_qcad, write_mapping_from_dxf_and_png
 from app.pipeline.nbc_rules import (
@@ -24,6 +26,39 @@ from app.pipeline.nbc_rules import (
 from app.routers.auth import get_current_user
 
 router = APIRouter(tags=["projects"])
+
+# Keep MCP and Hooter as a tight side-by-side pair.
+MCP_HOOTER_PAIR_OFFSET_M = 0.45
+
+
+def _normalize_data_path(p: str | None) -> str | None:
+    """Normalize persisted file paths to be rooted under DATA_DIR.
+
+    Handles legacy relative values like "data/projects/..." or Windows-style
+    separators so API serialization never crashes on relpath conversion.
+    """
+    if not p:
+        return None
+
+    s = str(p).strip()
+    if not s:
+        return None
+
+    # If already absolute and valid, keep as-is.
+    if os.path.isabs(s):
+        return s
+
+    norm = s.replace("\\", "/")
+    base = os.getenv("DATA_DIR", "/data").replace("\\", "/").rstrip("/")
+
+    if norm.startswith("data/"):
+        rest = norm[len("data/"):]
+        return os.path.join(base, *rest.split("/"))
+
+    if norm.startswith("projects/"):
+        return os.path.join(base, *norm.split("/"))
+
+    return s
 
 
 def _authorize_project(con, project_id: str, user: dict):
@@ -72,7 +107,15 @@ def list_projects(user=Depends(get_current_user)):
 def _project_row_to_out(r) -> ProjectOut:
     files = {}
     def add(k, p):
-        files[k] = f"/files/{relpath(p)}" if p else None
+        if not p:
+            files[k] = None
+            return
+        p_norm = _normalize_data_path(p)
+        try:
+            files[k] = f"/files/{relpath(p_norm)}" if p_norm else None
+        except Exception:
+            # Never fail project fetch due to malformed persisted file path.
+            files[k] = None
 
     preview_mapping_path = os.path.join(project_dir(r["id"]), "detectors_preview_mapping.json")
     detectors_debug_path = os.path.join(project_dir(r["id"]), "detectors_global_snapping_debug.png")
@@ -270,6 +313,56 @@ async def upload_aligned_mask(project_id: str, file: UploadFile = File(...), use
 
     return _project_row_to_out(r2)
 
+
+@router.post("/projects/{project_id}/regenerate_mask", response_model=ProjectOut)
+def regenerate_project_mask(project_id: str, payload: dict | None = None, user=Depends(get_current_user)):
+    """Regenerate project mask via Gemini using optional instruction, then re-align it."""
+    with db() as con:
+        r = _authorize_project_write(con, project_id, user)
+
+    render_path = r["render_png_path"]
+    if not render_path or not os.path.exists(render_path):
+        raise HTTPException(404, "project render image not available")
+
+    settings = json.loads(r["settings_json"] or "{}")
+    opts = PipelineOptions.from_env().merge_settings(settings)
+
+    instruction = ((payload or {}).get("instruction") or "").strip()
+    out_mask = r["mask_png_path"] or os.path.join(project_dir(project_id), "mask.png")
+    out_aligned = r["aligned_mask_path"] or os.path.join(project_dir(project_id), "mask_aligned.png")
+    retry_prompt = (
+        f"{DEFAULT_PROMPT}\n\n"
+        "You are given two images in this request: "
+        "(1) the original floor plan image and "
+        "(2) the current generated mask image. "
+        "Improve the current mask using the original image as source of truth. "
+        "Preserve geometry/relative positions and fix missed walls, doors, beams, and partitions."
+    )
+    if instruction:
+        retry_prompt = f"{retry_prompt}\n\nAdditional user instruction:\n{instruction}"
+
+    try:
+        generate_mask_image(
+            input_png=render_path,
+            out_mask_png=out_mask,
+            prompt=retry_prompt,
+            model=opts.gemini_model,
+            context_mask_png=out_mask if os.path.exists(out_mask) else None,
+        )
+        align_perfect_tight_box(render_path, out_mask, out_aligned)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(500, f"mask regeneration failed: {exc}") from exc
+
+    with db() as con:
+        con.execute(
+            "UPDATE projects SET mask_png_path=?, aligned_mask_path=?, status=?, error=NULL, updated_at=? WHERE id=?",
+            (out_mask, out_aligned, "awaiting_alignment_review", now(), project_id),
+        )
+        r2 = _authorize_project(con, project_id, user)
+    return _project_row_to_out(r2)
+
 @router.post("/projects/{project_id}/continue_floor_review", response_model=ProjectOut)
 def continue_floor_review(project_id: str, bg: BackgroundTasks, user=Depends(get_current_user)):
     """Resume pipeline after user has reviewed / confirmed floor plan splits."""
@@ -417,6 +510,17 @@ def update_rooms(project_id: str, payload: dict, user=Depends(get_current_user))
     rooms_path = r["rooms_json_path"]
     if not rooms_path:
         rooms_path = os.path.join(project_dir(project_id), "rooms_from_image.json")
+    if os.path.exists(rooms_path):
+        try:
+            with open(rooms_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if isinstance(existing, dict) and isinstance(payload, dict):
+                if "doors" in existing and "doors" not in payload:
+                    payload["doors"] = existing["doors"]
+                if "staircases" in existing and "staircases" not in payload:
+                    payload["staircases"] = existing["staircases"]
+        except Exception:
+            pass
     with open(rooms_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     return payload
@@ -431,12 +535,13 @@ def auto_place_detectors(project_id: str, payload: dict = None, user=Depends(get
     If not given, replace all with smoke detectors.
     """
     from app.pipeline.place_detectors_advanced import place_detectors_from_rooms_json
+    from app.pipeline.mcp_hooter_placement import place_mcp_hooter_from_rooms_payload
     from app.pipeline.sprinkler_routing import place_sprinklers_only
     import uuid as _uuid
 
     equipment_type = (payload or {}).get("equipment_type", "smoke") if payload else "smoke"
     # Validate
-    ALLOWED_TYPES = {"smoke", "sprinkler", "fire_hose", "panel", "hooter", "mcb"}
+    ALLOWED_TYPES = {"smoke", "sprinkler", "fire_hose", "panel", "hooter", "mcb", "mcp_hooter"}
     if equipment_type not in ALLOWED_TYPES:
         equipment_type = "smoke"
 
@@ -472,6 +577,20 @@ def auto_place_detectors(project_id: str, payload: dict = None, user=Depends(get
             {"id": str(_uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0, "dtype": "sprinkler", "locked": 0}
             for x, y in sp_points
         ]
+    elif equipment_type == "mcp_hooter":
+        rooms_payload = rooms_data if isinstance(rooms_data, dict) else {"rooms": rooms}
+        stations = place_mcp_hooter_from_rooms_payload(
+            rooms_payload,
+            world_to_m=opts.world_to_m,
+            gemini_model=opts.gemini_model,
+        )
+        # Place a centered left/right pair around each station.
+        offset = MCP_HOOTER_PAIR_OFFSET_M / max(float(opts.world_to_m), 1e-9)
+        new_dets = []
+        for x, y in stations:
+            half = offset * 0.5
+            new_dets.append({"id": str(_uuid.uuid4())[:8], "x": x - half, "y": y, "z": 0.0, "dtype": "mcb", "locked": 0})
+            new_dets.append({"id": str(_uuid.uuid4())[:8], "x": x + half, "y": y, "z": 0.0, "dtype": "hooter", "locked": 0})
     else:
         placed, _regions = place_detectors_from_rooms_json(
             rooms,
@@ -487,8 +606,11 @@ def auto_place_detectors(project_id: str, payload: dict = None, user=Depends(get
         ]
 
     with db() as con:
-        # Delete only detectors of this type, keep others
-        con.execute("DELETE FROM detectors WHERE project_id=? AND dtype=?", (project_id, equipment_type))
+        # Delete only detectors of this type, keep others.
+        if equipment_type == "mcp_hooter":
+            con.execute("DELETE FROM detectors WHERE project_id=? AND dtype IN ('mcb','hooter')", (project_id,))
+        else:
+            con.execute("DELETE FROM detectors WHERE project_id=? AND dtype=?", (project_id, equipment_type))
         for d in new_dets:
             con.execute(
                 """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,created_at,updated_at)
@@ -691,15 +813,39 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
         all_pipe_segments = []
         all_pipe_sources = []
 
+        # Deduplicate by normalized coordinates + diameter to avoid
+        # overlapping duplicate labels when both aggregate and per-block files exist.
+        seg_seen = set()
+        src_seen = set()
+
+        def _norm_pt(pt):
+            return (round(float(pt[0]), 4), round(float(pt[1]), 4))
+
+        def _add_segment(p_from, p_to, diameter):
+            a = _norm_pt(p_from)
+            b = _norm_pt(p_to)
+            key_endpoints = tuple(sorted([a, b]))
+            key = (key_endpoints[0], key_endpoints[1], str(diameter))
+            if key in seg_seen:
+                return
+            seg_seen.add(key)
+            all_pipe_segments.append(((a, b), str(diameter)))
+
+        def _add_source(src):
+            s = _norm_pt(src)
+            if s in src_seen:
+                return
+            src_seen.add(s)
+            all_pipe_sources.append(s)
+
         pipes_json_path = os.path.join(project_dir(project_id), "sprinkler_pipes.json")
         if os.path.exists(pipes_json_path):
             with open(pipes_json_path, "r", encoding="utf-8") as pf:
                 pipes_data = json.load(pf)
-            all_pipe_segments.extend([
-                (((p["from"][0], p["from"][1]), (p["to"][0], p["to"][1])), p["diameter"])
-                for p in pipes_data.get("pipes", [])
-            ])
-            all_pipe_sources.extend([(s["x"], s["y"]) for s in pipes_data.get("sources", [])])
+            for p in pipes_data.get("pipes", []):
+                _add_segment(p["from"], p["to"], p.get("diameter", "32mm"))
+            for s in pipes_data.get("sources", []):
+                _add_source((s["x"], s["y"]))
 
         # Per-floor-plan pipes
         fp_rows = con.execute(
@@ -711,11 +857,10 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
             if os.path.exists(fp_pipes_path):
                 with open(fp_pipes_path, "r", encoding="utf-8") as pf:
                     fp_pipes = json.load(pf)
-                all_pipe_segments.extend([
-                    (((p["from"][0], p["from"][1]), (p["to"][0], p["to"][1])), p["diameter"])
-                    for p in fp_pipes.get("pipes", [])
-                ])
-                all_pipe_sources.extend([(s["x"], s["y"]) for s in fp_pipes.get("sources", [])])
+                for p in fp_pipes.get("pipes", []):
+                    _add_segment(p["from"], p["to"], p.get("diameter", "32mm"))
+                for s in fp_pipes.get("sources", []):
+                    _add_source((s["x"], s["y"]))
 
         sprinkler_dets = [(float(d["x"]), float(d["y"])) for d in dets if d["dtype"] == "sprinkler"]
         if sprinkler_dets or all_pipe_segments:
@@ -771,6 +916,7 @@ def _floor_plan_row_to_dict(fp) -> dict:
         "project_id": fp["project_id"],
         "block_index": fp["block_index"],
         "status": fp["status"],
+        "height_m": float(fp["height_m"]) if fp["height_m"] is not None else None,
         "world_bbox": json.loads(fp["world_bbox_json"]) if fp["world_bbox_json"] else None,
         "pixel_bbox": json.loads(fp["pixel_bbox_json"]) if fp["pixel_bbox_json"] else None,
         "files": {},
@@ -829,6 +975,67 @@ async def upload_floor_plan_aligned_mask(
     return _floor_plan_row_to_dict(fp2)
 
 
+@router.post("/projects/{project_id}/floor_plans/{fp_id}/regenerate_mask")
+def regenerate_floor_plan_mask(project_id: str, fp_id: str, payload: dict | None = None, user=Depends(get_current_user)):
+    """Regenerate a floor-plan block mask via Gemini using optional instruction, then re-align it."""
+    with db() as con:
+        r = _authorize_project_write(con, project_id, user)
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
+        if not fp:
+            raise HTTPException(404, "floor plan block not found")
+
+    render_path = fp["render_png_path"]
+    if not render_path or not os.path.exists(render_path):
+        raise HTTPException(404, "floor plan render image not available")
+
+    settings = json.loads(r["settings_json"] or "{}")
+    opts = PipelineOptions.from_env().merge_settings(settings)
+
+    instruction = ((payload or {}).get("instruction") or "").strip()
+
+    idx = fp["block_index"]
+    blocks_dir = os.path.join(project_dir(project_id), "blocks")
+    os.makedirs(blocks_dir, exist_ok=True)
+    out_mask = fp["mask_png_path"] or os.path.join(blocks_dir, f"block_{idx}_mask.png")
+    out_aligned = fp["aligned_mask_path"] or os.path.join(blocks_dir, f"block_{idx}_aligned.png")
+    retry_prompt = (
+        f"{DEFAULT_PROMPT}\n\n"
+        "You are given two images in this request: "
+        "(1) the original floor plan image and "
+        "(2) the current generated mask image. "
+        "Improve the current mask using the original image as source of truth. "
+        "Preserve geometry/relative positions and fix missed walls, doors, beams, and partitions."
+    )
+    if instruction:
+        retry_prompt = f"{retry_prompt}\n\nAdditional user instruction:\n{instruction}"
+
+    try:
+        generate_mask_image(
+            input_png=render_path,
+            out_mask_png=out_mask,
+            prompt=retry_prompt,
+            model=opts.gemini_model,
+            context_mask_png=out_mask if os.path.exists(out_mask) else None,
+        )
+        align_perfect_tight_box(render_path, out_mask, out_aligned)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(500, f"mask regeneration failed: {exc}") from exc
+
+    with db() as con:
+        con.execute(
+            "UPDATE floor_plans SET mask_png_path=?, aligned_mask_path=?, status=?, updated_at=? WHERE id=?",
+            (out_mask, out_aligned, "aligned", now(), fp_id),
+        )
+        con.execute(
+            "UPDATE projects SET status=?, error=NULL, updated_at=? WHERE id=?",
+            ("awaiting_alignment_review", now(), project_id),
+        )
+        fp2 = con.execute("SELECT * FROM floor_plans WHERE id=?", (fp_id,)).fetchone()
+    return _floor_plan_row_to_dict(fp2)
+
+
 @router.get("/projects/{project_id}/floor_plans/{fp_id}")
 def get_floor_plan(project_id: str, fp_id: str, user=Depends(get_current_user)):
     """Return a single floor-plan block."""
@@ -838,6 +1045,37 @@ def get_floor_plan(project_id: str, fp_id: str, user=Depends(get_current_user)):
         if not fp:
             raise HTTPException(404, "floor plan block not found")
     return _floor_plan_row_to_dict(fp)
+
+
+@router.put("/projects/{project_id}/floor_plans/{fp_id}")
+def update_floor_plan(project_id: str, fp_id: str, payload: dict, user=Depends(get_current_user)):
+    """Update editable floor-plan metadata (currently height in meters)."""
+    with db() as con:
+        _authorize_project_write(con, project_id, user)
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
+        if not fp:
+            raise HTTPException(404, "floor plan block not found")
+
+    height_m_raw = payload.get("height_m")
+    if height_m_raw is None:
+        raise HTTPException(400, "height_m is required")
+
+    try:
+        height_m = float(height_m_raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, "height_m must be a number") from exc
+
+    if height_m <= 0:
+        raise HTTPException(400, "height_m must be greater than 0")
+
+    with db() as con:
+        con.execute(
+            "UPDATE floor_plans SET height_m=?, updated_at=? WHERE id=?",
+            (height_m, now(), fp_id),
+        )
+        fp2 = con.execute("SELECT * FROM floor_plans WHERE id=?", (fp_id,)).fetchone()
+
+    return _floor_plan_row_to_dict(fp2)
 
 
 # ── Per-floor-plan rooms endpoints ──────────────────────────
@@ -874,6 +1112,17 @@ def update_floor_plan_rooms(project_id: str, fp_id: str, payload: dict, user=Dep
         with db() as con:
             con.execute("UPDATE floor_plans SET rooms_json_path=?, updated_at=? WHERE id=?",
                         (rooms_path, now(), fp_id))
+    if os.path.exists(rooms_path):
+        try:
+            with open(rooms_path, "r", encoding="utf-8") as rf:
+                existing = json.load(rf)
+            if isinstance(existing, dict) and isinstance(payload, dict):
+                if "doors" in existing and "doors" not in payload:
+                    payload["doors"] = existing["doors"]
+                if "staircases" in existing and "staircases" not in payload:
+                    payload["staircases"] = existing["staircases"]
+        except Exception:
+            pass
     with open(rooms_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     return payload
@@ -883,10 +1132,11 @@ def update_floor_plan_rooms(project_id: str, fp_id: str, payload: dict, user=Dep
 def auto_place_floor_plan(project_id: str, fp_id: str, payload: dict = None, user=Depends(get_current_user)):
     """Auto-place detectors for a specific floor-plan block using its rooms."""
     from app.pipeline.place_detectors_advanced import place_detectors_from_rooms_json
+    from app.pipeline.mcp_hooter_placement import place_mcp_hooter_from_rooms_payload
     import uuid as _uuid
 
     equipment_type = (payload or {}).get("equipment_type", "smoke") if payload else "smoke"
-    ALLOWED_TYPES = {"smoke", "sprinkler", "fire_hose", "panel", "hooter", "mcb"}
+    ALLOWED_TYPES = {"smoke", "sprinkler", "fire_hose", "panel", "hooter", "mcb", "mcp_hooter"}
     if equipment_type not in ALLOWED_TYPES:
         equipment_type = "smoke"
 
@@ -924,6 +1174,25 @@ def auto_place_floor_plan(project_id: str, fp_id: str, payload: dict = None, use
              "dtype": "sprinkler", "locked": 0, "floor_plan_id": fp_id}
             for x, y in sp_points
         ]
+    elif equipment_type == "mcp_hooter":
+        rooms_payload = rooms_data if isinstance(rooms_data, dict) else {"rooms": rooms}
+        stations = place_mcp_hooter_from_rooms_payload(
+            rooms_payload,
+            world_to_m=opts.world_to_m,
+            gemini_model=opts.gemini_model,
+        )
+        offset = MCP_HOOTER_PAIR_OFFSET_M / max(float(opts.world_to_m), 1e-9)
+        new_dets = []
+        for x, y in stations:
+            half = offset * 0.5
+            new_dets.append({
+                "id": str(_uuid.uuid4())[:8], "x": x - half, "y": y, "z": 0.0,
+                "dtype": "mcb", "locked": 0, "floor_plan_id": fp_id,
+            })
+            new_dets.append({
+                "id": str(_uuid.uuid4())[:8], "x": x + half, "y": y, "z": 0.0,
+                "dtype": "hooter", "locked": 0, "floor_plan_id": fp_id,
+            })
     else:
         placed, _regions = place_detectors_from_rooms_json(
             rooms,
@@ -941,8 +1210,14 @@ def auto_place_floor_plan(project_id: str, fp_id: str, payload: dict = None, use
 
     with db() as con:
         # Delete only detectors of this type for this floor plan
-        con.execute("DELETE FROM detectors WHERE project_id=? AND dtype=? AND floor_plan_id=?",
-                    (project_id, equipment_type, fp_id))
+        if equipment_type == "mcp_hooter":
+            con.execute(
+                "DELETE FROM detectors WHERE project_id=? AND dtype IN ('mcb','hooter') AND floor_plan_id=?",
+                (project_id, fp_id),
+            )
+        else:
+            con.execute("DELETE FROM detectors WHERE project_id=? AND dtype=? AND floor_plan_id=?",
+                        (project_id, equipment_type, fp_id))
         for d in new_dets:
             con.execute(
                 """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,floor_plan_id,created_at,updated_at)

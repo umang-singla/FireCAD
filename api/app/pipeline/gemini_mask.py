@@ -40,7 +40,7 @@ def _part_to_image(part):
 
     return Image.open(BytesIO(data))
 
-DEFAULT_PROMPT = "Give an masked image of this uploaded floor plan such that walls and unknown lines are represented with red color , doors with blue and room/floor area with green color. Door curves should be filled completely. There should be no line of any element inside the room. Mask background should be white. keep the relative distance between each object intact as in the input image. dont fucking dare to miss any internal line like beam and all every fucking partion is imp for my task dont dare to miss any wall give the fucking image now. Dont fucking add doors from your assumption, add them only whem there is a symbol in the input image. And Make walls, beams and unknown lines to be fucking solid filled red."
+DEFAULT_PROMPT = "Give an masked image of this uploaded floor plan such that walls and unknown lines are represented with red color , doors with blue and room/floor area with green color. Door curves should be filled completely. There should be no line of any element inside the room. Mask background should be white. keep the relative distance between each object intact as in the input image. dont fucking dare to miss any internal line like beam and all every fucking partion is imp for my task dont dare to miss any wall give the fucking image now. Dont fucking add doors from your assumption, add them only whem there is a symbol in the input image. And Make walls, beams and unknown lines to be fucking solid filled red. Dont fucking make walls and beams hollow, make them solid red. Dont fucking miss any wall or beam or partition or door or any line in the input image. And dont fucking add any line which is not in the input image. Just give me the masked image with walls and beams and unknown lines in solid red color, doors in blue color and floor/room area in green color. And keep the relative distance between each object intact as in the input image. Dont fucking miss any internal line like beam and all every fucking partion is imp for my task dont dare to miss any wall give the fucking image now. Dont fucking add doors from your assumption, add them only whem there is a symbol in the input image. And Make walls, beams and unknown lines to be fucking solid filled red. Dont fucking make walls and beams hollow, make them solid red. Dont fucking miss any wall or beam or partition or door or any line in the input image. And dont fucking add any line which is not in the input image. Just give me the masked image with walls and beams and unknown lines in solid red color, doors in blue color and floor/room area in green color. And keep the relative distance between each object intact as in the input image."
 
 
 def generate_mask_image(
@@ -49,6 +49,7 @@ def generate_mask_image(
     prompt: str = DEFAULT_PROMPT,
     model: str = "gemini-3.1-flash-image-preview",
     max_side: int = 2048,
+    context_mask_png: str | None = None,
 ):
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -58,11 +59,17 @@ def generate_mask_image(
     img = Image.open(input_png)
     img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
 
+    contents = [prompt, img]
+    if context_mask_png and os.path.exists(context_mask_png):
+        ctx_img = Image.open(context_mask_png)
+        ctx_img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        contents.append(ctx_img)
+
     client = genai.Client(api_key=api_key)
 
     resp = client.models.generate_content(
         model=model,
-        contents=[prompt, img],
+        contents=contents,
         config={"response_modalities": ["IMAGE"]},
     )
 

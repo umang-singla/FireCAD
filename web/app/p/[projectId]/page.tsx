@@ -6,6 +6,7 @@ import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
 import { getToken, getTenantRole } from "../../lib/auth";
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
+const WS_BASE = (process.env.NEXT_PUBLIC_WS_BASE || "").replace(/\/$/, "");
 
 function resolveApiBase() {
   if (API_BASE) return API_BASE;
@@ -18,7 +19,17 @@ function resolveApiBase() {
   return "";
 }
 
+function resolveWsBase() {
+  if (WS_BASE) return WS_BASE.replace(/^http/, "ws");
+  return resolveApiBase().replace(/^http/, "ws");
+}
+
 const apiUrl = (path: string) => `${resolveApiBase()}${path}`;
+
+function apiMediaUrl(path: string, version: number) {
+  const base = apiUrl(path);
+  return `${base}${base.includes("?") ? "&" : "?"}v=${version}`;
+}
 
 const NETWORK_PENDING_EVENT = "firecad-network-pending";
 let networkPendingCount = 0;
@@ -120,6 +131,7 @@ type FloorPlan = {
   project_id: string;
   block_index: number;
   status: string;
+  height_m?: number | null;
   world_bbox: { xmin: number; ymin: number; xmax: number; ymax: number } | null;
   pixel_bbox: number[] | null;
   files: Record<string, string | null>;
@@ -218,6 +230,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   const [nbcSettingsLabels, setNbcSettingsLabels] = useState<Record<string, string>>({});
   const [nbcSettingsSaving, setNbcSettingsSaving] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
+  const [mediaVersion, setMediaVersion] = useState<number>(Date.now());
 
   const canEdit = (() => {
     const role = getTenantRole();
@@ -274,13 +287,16 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     } else {
       setFloorPlans([]);
     }
+
+    // Force image reload for updated PNG assets (mask/render) after refresh.
+    setMediaVersion(Date.now());
   }
 
   useEffect(() => { refresh(); }, []);
 
-  // Real-time pipeline status via WebSocket
+  // Real-time pipeline status via WebSocket (routed through proxy)
   useEffect(() => {
-    const base = resolveApiBase().replace(/^http/, "ws");
+    const base = resolveWsBase();
     const wsUrl = `${base}/api/projects/${projectId}/ws`;
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -454,7 +470,21 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     await refresh();
   }
 
-  async function continuePipelineAfterFloorReview() {
+  async function continuePipelineAfterFloorReview(floorPlanHeightsM?: Record<string, number>) {
+    if (floorPlanHeightsM && Object.keys(floorPlanHeightsM).length > 0 && floorPlans.length > 0) {
+      await Promise.all(
+        floorPlans.map(async (fp) => {
+          const h = floorPlanHeightsM[fp.id];
+          if (!Number.isFinite(h) || h <= 0) {
+            throw new Error(`Invalid floor height for block ${fp.block_index + 1}`);
+          }
+          await authFetch(`/api/projects/${projectId}/floor_plans/${fp.id}`, {
+            method: "PUT",
+            body: JSON.stringify({ height_m: h }),
+          });
+        }),
+      );
+    }
     setPipelineStage(null);
     await authFetch(`/api/projects/${projectId}/continue_floor_review`, { method:"POST" });
     await refresh();
@@ -503,6 +533,22 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
       await authFetch(`/api/projects/${projectId}/floor_plans/${activeFp.id}/aligned_mask`, { method:"POST", body: fd });
     } else {
       await authFetch(`/api/projects/${projectId}/aligned_mask`, { method:"POST", body: fd });
+    }
+    await refresh();
+  }
+
+  async function retryMaskGeneration(instruction: string) {
+    const activeFp = floorPlans[activeBlockIndex];
+    if (activeFp) {
+      await authFetch(`/api/projects/${projectId}/floor_plans/${activeFp.id}/regenerate_mask`, {
+        method: "POST",
+        body: JSON.stringify({ instruction }),
+      });
+    } else {
+      await authFetch(`/api/projects/${projectId}/regenerate_mask`, {
+        method: "POST",
+        body: JSON.stringify({ instruction }),
+      });
     }
     await refresh();
   }
@@ -938,6 +984,11 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
             renderUrl={apiUrl(project.files.render_png)}
             mapping={mapping}
             floorPlans={floorPlans}
+            initialHeightsByFloorPlanId={Object.fromEntries(
+              floorPlans
+                .filter((fp) => Number.isFinite(fp.height_m as number))
+                .map((fp) => [fp.id, Number(fp.height_m)]),
+            )}
             onConfirm={continuePipelineAfterFloorReview}
             onAddFloorPlan={addFloorPlan}
             onDeleteFloorPlan={deleteFloorPlan}
@@ -982,10 +1033,11 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                     return (
                       <AlignmentReview
                         key={fp.id}
-                        originalUrl={apiUrl(blockRender)}
-                        alignedUrl={apiUrl(blockMask)}
+                        originalUrl={apiMediaUrl(blockRender, mediaVersion)}
+                        alignedUrl={apiMediaUrl(blockMask, mediaVersion)}
                         onContinue={continuePipelineAfterAlignment}
                         onUploadAlignedMask={uploadAlignedMaskFile}
+                        onRetryGeneration={retryMaskGeneration}
                         onRefresh={refresh}
                         blockLabel={floorPlans.length > 1 ? `Block ${fp.block_index + 1} of ${floorPlans.length}` : undefined}
                         canEdit={canEdit}
@@ -1003,10 +1055,11 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
             </div>
           ) : project?.files?.aligned_mask && project?.files?.render_png ? (
             <AlignmentReview
-              originalUrl={apiUrl(project.files.render_png)}
-              alignedUrl={apiUrl(project.files.aligned_mask)}
+              originalUrl={apiMediaUrl(project.files.render_png, mediaVersion)}
+              alignedUrl={apiMediaUrl(project.files.aligned_mask, mediaVersion)}
               onContinue={continuePipelineAfterAlignment}
               onUploadAlignedMask={uploadAlignedMaskFile}
+              onRetryGeneration={retryMaskGeneration}
               onRefresh={refresh}
               canEdit={canEdit}
             />
@@ -1310,6 +1363,7 @@ function FloorPlanReview({
   renderUrl,
   mapping,
   floorPlans,
+  initialHeightsByFloorPlanId,
   onConfirm,
   onAddFloorPlan,
   onDeleteFloorPlan,
@@ -1319,7 +1373,8 @@ function FloorPlanReview({
   renderUrl: string;
   mapping: Mapping;
   floorPlans: FloorPlan[];
-  onConfirm: () => Promise<void>;
+  initialHeightsByFloorPlanId?: Record<string, number>;
+  onConfirm: (heightsByFloorPlanId: Record<string, number>) => Promise<void>;
   onAddFloorPlan: (pixelBbox: number[]) => Promise<void>;
   onDeleteFloorPlan: (fpId: string) => Promise<void>;
   onRefresh: () => Promise<void>;
@@ -1332,6 +1387,7 @@ function FloorPlanReview({
   const [drawEnd, setDrawEnd] = useState<{ px: number; py: number } | null>(null);
   const [hoveredFp, setHoveredFp] = useState<string | null>(null);
   const [isAdding, setIsAdding] = useState(false);
+  const [floorHeights, setFloorHeights] = useState<Record<string, string>>({});
   const svgRef = useRef<SVGSVGElement>(null);
 
   const COLORS = ["#2563EB", "#DC2626", "#059669", "#D97706", "#7C3AED", "#DB2777", "#0891B2", "#65A30D"];
@@ -1363,10 +1419,36 @@ function FloorPlanReview({
     };
   }
 
+  useEffect(() => {
+    setFloorHeights((prev) => {
+      const next: Record<string, string> = { ...prev };
+      for (const fp of floorPlans) {
+        if (next[fp.id] !== undefined) continue;
+        const initial = initialHeightsByFloorPlanId?.[fp.id];
+        next[fp.id] = Number.isFinite(initial as number) ? String(initial) : "";
+      }
+      for (const fpId of Object.keys(next)) {
+        if (!floorPlans.some((fp) => fp.id === fpId)) delete next[fpId];
+      }
+      return next;
+    });
+  }, [floorPlans, initialHeightsByFloorPlanId]);
+
+  const allHeightsEntered = floorPlans.length > 0 && floorPlans.every((fp) => {
+    const v = Number(floorHeights[fp.id]);
+    return Number.isFinite(v) && v > 0;
+  });
+
   async function handleConfirm() {
+    if (!allHeightsEntered) return;
     setIsConfirming(true);
     try {
-      await onConfirm();
+      const heightsByFloorPlanId: Record<string, number> = {};
+      for (const fp of floorPlans) {
+        const v = Number(floorHeights[fp.id]);
+        if (Number.isFinite(v) && v > 0) heightsByFloorPlanId[fp.id] = v;
+      }
+      await onConfirm(heightsByFloorPlanId);
     } finally {
       setIsConfirming(false);
     }
@@ -1444,13 +1526,13 @@ function FloorPlanReview({
         {canEdit && (
         <button
           onClick={handleConfirm}
-          disabled={isConfirming || floorPlans.length === 0}
+          disabled={isConfirming || !allHeightsEntered}
           style={{
             padding: "7px 18px", borderRadius: 10, border: "none",
             background: "#2D6A4F", color: "#fff", cursor: "pointer",
             fontSize: 12, fontWeight: 700,
             boxShadow: "0 4px 12px rgba(45,106,79,0.3)",
-            opacity: isConfirming || floorPlans.length === 0 ? 0.6 : 1,
+            opacity: isConfirming || !allHeightsEntered ? 0.6 : 1,
           }}
         >
           {isConfirming ? "Confirming..." : "Confirm & Continue"}
@@ -1538,6 +1620,32 @@ function FloorPlanReview({
                   );
                 })}
 
+                {/* Height inputs above each highlighted floor plan */}
+                {canEdit && floorPlans.map((fp, i) => {
+                  if (!fp.world_bbox) return null;
+                  const rect = worldBboxToPixelRect(fp.world_bbox);
+                  const val = floorHeights[fp.id] ?? "";
+                  const inputWidth = 132;
+                  const fx = Math.max(0, Math.min(rect.x + rect.width * 0.5 - inputWidth * 0.5, imgDims.w - inputWidth));
+                  const fy = Math.max(0, rect.y - 52);
+                  return (
+                    <foreignObject key={`fp-height-${fp.id}`} x={fx} y={fy} width={inputWidth} height={30}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 4, background: "rgba(255,255,255,0.95)", border: "1px solid #D1D5DB", borderRadius: 8, padding: "2px 6px" }}>
+                        <input
+                          type="number"
+                          min={0.1}
+                          step={0.1}
+                          value={val}
+                          onChange={(e) => setFloorHeights((prev) => ({ ...prev, [fp.id]: e.target.value }))}
+                          placeholder={`H${i + 1} (m)`}
+                          style={{ width: 86, border: "none", outline: "none", fontSize: 11, background: "transparent", color: "#111827" }}
+                        />
+                        <span style={{ fontSize: 11, color: "#374151", fontWeight: 600 }}>m</span>
+                      </div>
+                    </foreignObject>
+                  );
+                })}
+
                 {/* Drawing rectangle */}
                 {drawMode && drawRect && (
                   <rect
@@ -1582,6 +1690,7 @@ function FloorPlanReview({
           ) : null}
           {floorPlans.map((fp, i) => {
             const color = fpColor(i);
+            const heightVal = floorHeights[fp.id] ?? "";
             return (
               <div
                 key={fp.id}
@@ -1605,6 +1714,39 @@ function FloorPlanReview({
                   </div>
                   <div style={{ fontSize: 10, color: "#9CA3AF" }}>
                     Block {fp.block_index}
+                  </div>
+                  <div style={{ marginTop: 6 }}>
+                    {canEdit ? (
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <input
+                          type="number"
+                          min={0.1}
+                          step={0.1}
+                          value={heightVal}
+                          onClick={(e) => e.stopPropagation()}
+                          onChange={(e) => {
+                            e.stopPropagation();
+                            setFloorHeights((prev) => ({ ...prev, [fp.id]: e.target.value }));
+                          }}
+                          placeholder="Height"
+                          style={{
+                            width: 86,
+                            borderRadius: 6,
+                            border: "1px solid #D1D5DB",
+                            padding: "3px 6px",
+                            fontSize: 11,
+                            color: "#1A1A2E",
+                            background: "#FFFFFF",
+                            outline: "none",
+                          }}
+                        />
+                        <span style={{ fontSize: 11, color: "#6B7280", fontWeight: 600 }}>m</span>
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: 11, color: "#6B7280" }}>
+                        Height: {heightVal ? `${heightVal} m` : "Not set"}
+                      </div>
+                    )}
                   </div>
                 </div>
                 {fp.files?.render_png && (
@@ -1649,8 +1791,8 @@ function FloorPlanReview({
             background: "#FEFCE8", border: "1px solid rgba(217,119,6,0.2)",
             fontSize: 11, color: "#92400E", lineHeight: 1.5,
           }}>
-            Review the detected floor plans. You can add more by clicking "Add Floor Plan" and drawing a box, or remove incorrect ones by clicking &times;.
-            When satisfied, click "Confirm & Continue".
+            Review the detected floor plans and enter height (m) for each one.
+            Confirm & Continue is enabled only after all floor plan heights are filled.
           </div>
         </div>
       </div>
@@ -1663,6 +1805,7 @@ function AlignmentReview({
   alignedUrl,
   onContinue,
   onUploadAlignedMask,
+  onRetryGeneration,
   onRefresh,
   blockLabel,
   canEdit = true,
@@ -1671,6 +1814,7 @@ function AlignmentReview({
   alignedUrl: string;
   onContinue: (adjustedMaskBlob: Blob) => Promise<void>;
   onUploadAlignedMask: (e: any) => Promise<void>;
+  onRetryGeneration: (instruction: string) => Promise<void>;
   onRefresh: () => Promise<void>;
   blockLabel?: string;
   canEdit?: boolean;
@@ -1687,6 +1831,10 @@ function AlignmentReview({
   const [isDragging, setIsDragging] = useState(false);
   const [isResizing, setIsResizing] = useState(false);
   const [isContinuing, setIsContinuing] = useState(false);
+  const [isRetrying, setIsRetrying] = useState(false);
+  const [generationInstruction, setGenerationInstruction] = useState("");
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const hasAutoFitRef = useRef(false);
   const dragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null);
   const resizeRef = useRef<{
     sx: number;
@@ -1769,6 +1917,19 @@ function AlignmentReview({
     };
   }, [maskDims, scale, viewZoom]);
 
+  useEffect(() => {
+    if (!origDims || hasAutoFitRef.current) return;
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const availW = Math.max(120, vp.clientWidth - 20);
+    const availH = Math.max(120, vp.clientHeight - 20);
+    const fitZoom = Math.min(availW / origDims.w, availH / origDims.h);
+    if (Number.isFinite(fitZoom) && fitZoom > 0) {
+      setViewZoom(Math.max(0.25, Math.min(3, fitZoom)));
+      hasAutoFitRef.current = true;
+    }
+  }, [origDims]);
+
   function startResize(
     e: React.MouseEvent<HTMLDivElement>,
     dir: "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw"
@@ -1819,6 +1980,15 @@ function AlignmentReview({
       await onContinue(blob);
     } finally {
       setIsContinuing(false);
+    }
+  }
+
+  async function retryGeneration() {
+    setIsRetrying(true);
+    try {
+      await onRetryGeneration(generationInstruction.trim());
+    } finally {
+      setIsRetrying(false);
     }
   }
 
@@ -1894,7 +2064,50 @@ function AlignmentReview({
         )}
       </div>
 
+      {canEdit && (
+        <div
+          style={{
+            borderRadius: 10,
+            border: "1px solid rgba(255,255,255,0.14)",
+            background: "rgba(9, 24, 14, 0.68)",
+            padding: 10,
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+          }}
+        >
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#B7E4C7" }}>Mask Generation Instruction</div>
+          <textarea
+            value={generationInstruction}
+            onChange={(e) => setGenerationInstruction(e.target.value)}
+            placeholder="Optional: add instruction for retry generation (e.g. keep all internal walls and beams fully solid red)."
+            rows={2}
+            style={{
+              width: "100%",
+              resize: "vertical",
+              minHeight: 56,
+              borderRadius: 8,
+              border: "1px solid rgba(255,255,255,0.2)",
+              background: "rgba(2, 10, 5, 0.75)",
+              color: "#D8F3DC",
+              padding: "8px 10px",
+              fontSize: 12,
+              outline: "none",
+            }}
+          />
+          <div style={{ fontSize: 11, color: "#95D5B2" }}>
+            Use this when auto-generated mask misses walls/doors or wrongly fills spaces, then click Retry Generation.
+          </div>
+          <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            <button onClick={retryGeneration} style={{ ...toolBtn(false), flex: "0 0 auto", width: 170 }} disabled={isRetrying}>
+              {isRetrying ? "Retrying..." : "Retry Generation"}
+            </button>
+          </div>
+        </div>
+      )}
+
       <div
+        ref={viewportRef}
         style={{
           position:"relative",
           flex: 1,
@@ -2061,6 +2274,8 @@ function btn(primary=false, compact=false): CSSProperties {
 type Room = {
   id: string;
   label?: string;
+  label_text?: string;
+  label_texts?: string[];
   area_px: number;
   polygon_px: number[][];
   polygon_world: number[][];
@@ -2206,7 +2421,7 @@ function RoomEditor({
 
   // ── Detector state ──
   const [detectors, setDetectors] = useState<Detector[]>([]);
-  const [editorMode, setEditorMode] = useState<"rooms" | "select" | "add" | "erase" | "pan" | "pipe_draw" | "pipe_select">("rooms");
+  const [editorMode, setEditorMode] = useState<"rooms" | "select" | "add" | "erase" | "pan" | "pipe_draw" | "pipe_select" | "measure">("rooms");
   const [addType, setAddType] = useState<ObjectType>("smoke");
   const [selectedDetectorIds, setSelectedDetectorIds] = useState<string[]>([]);
   const [imgDims, setImgDims] = useState<{w:number; h:number} | null>(null);
@@ -2227,6 +2442,9 @@ function RoomEditor({
   const [sidebarTab, setSidebarTab] = useState<"rooms" | "equipment">("rooms");
   const [pipesData, setPipesData] = useState<PipesData | null>(null);
   const [isSavingChanges, setIsSavingChanges] = useState(false);
+  const [measureStart, setMeasureStart] = useState<{px:number; py:number} | null>(null);
+  const [measureEnd, setMeasureEnd] = useState<{px:number; py:number} | null>(null);
+  const [measureLocked, setMeasureLocked] = useState(false);
 
   // ── Helpers ──
   function samePoint(a: {px:number; py:number}, b: {px:number; py:number}, tolerance = 0.5) {
@@ -2288,7 +2506,12 @@ function RoomEditor({
         const res = await authFetch(url);
         const data = await res.json();
         const raw: Room[] = data.rooms || data;
-        setRooms(raw.map((r, i) => ({ ...r, label: r.label || `Room ${i + 1}` })));
+        setRooms(
+          raw.map((r, i) => ({
+            ...r,
+            label: (r.label && r.label.trim()) || (r.label_text && r.label_text.trim()) || `Room ${i + 1}`,
+          }))
+        );
       } catch (e) { console.error("Failed to load rooms", e); }
       finally { setLoading(false); }
     })();
@@ -2321,6 +2544,11 @@ function RoomEditor({
         if (pipeDrawStart) { setPipeDrawStart(null); setPipeDrawEnd(null); }
         if (selectedPipeIdx !== null) setSelectedPipeIdx(null);
         if (selectedDetectorIds.length > 0) setSelectedDetectorIds([]);
+        if (measureStart || measureEnd) {
+          setMeasureStart(null);
+          setMeasureEnd(null);
+          setMeasureLocked(false);
+        }
       }
     }
     window.addEventListener("keydown", handleKey);
@@ -2525,11 +2753,19 @@ function RoomEditor({
         body: JSON.stringify({ equipment_type: equipmentType }),
       });
       const placed: Detector[] = await res.json();
-      // Merge: keep detectors of other types, replace this type with placed result
-      setDetectors(prev => [
-        ...prev.filter(d => d.dtype !== equipmentType),
-        ...placed.filter(d => d.dtype === equipmentType),
-      ]);
+
+      if (equipmentType === "mcp_hooter") {
+        setDetectors(prev => [
+          ...prev.filter(d => d.dtype !== "mcb" && d.dtype !== "hooter"),
+          ...placed.filter(d => d.dtype === "mcb" || d.dtype === "hooter"),
+        ]);
+      } else {
+        // Merge: keep detectors of other types, replace this type with placed result
+        setDetectors(prev => [
+          ...prev.filter(d => d.dtype !== equipmentType),
+          ...placed.filter(d => d.dtype === equipmentType),
+        ]);
+      }
     } catch (e) { console.error("Auto-place failed", e); }
     finally { setIsAutoPlacing(null); }
   }
@@ -2629,6 +2865,10 @@ function RoomEditor({
   }
 
   function clearEquipmentType(equipmentType: string) {
+    if (equipmentType === "mcp_hooter") {
+      setDetectors(prev => prev.filter(d => d.dtype !== "mcb" && d.dtype !== "hooter"));
+      return;
+    }
     setDetectors(prev => prev.filter(d => d.dtype !== equipmentType));
     if (equipmentType === "sprinkler") {
       setPipesData(null);
@@ -2723,6 +2963,7 @@ function RoomEditor({
     if (editorMode === "pan") return "grab";
     if (editorMode === "add") return "crosshair";
     if (editorMode === "erase") return "not-allowed";
+    if (editorMode === "measure") return "crosshair";
     if (editorMode === "rooms" && splitMode) return "crosshair";
     if (editorMode === "pipe_draw") return "crosshair";
     if (editorMode === "pipe_select") return "pointer";
@@ -2773,6 +3014,9 @@ function RoomEditor({
                   {canEdit && <button onClick={() => { setEditorMode("add"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "add")}>Add</button>}
                   {canEdit && <button onClick={() => { setEditorMode("erase"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "erase")}>Erase</button>}
                   <button onClick={() => { setEditorMode("pan"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "pan")}>Pan</button>
+                  <button onClick={() => { setEditorMode("measure"); setSplitMode(false); resetSplitState(); setSelectedDetectorIds([]); setMarquee(null); }} style={ceToolBtn(editorMode === "measure")}>
+                    Measure
+                  </button>
                   {canEdit && (
                   <>
                   <div style={{ width: 1, height: 20, background: "#E8EAED" }} />
@@ -2898,6 +3142,17 @@ function RoomEditor({
                         const point = toImagePoint(e);
                         if (!point) return;
                         const { px, py } = point;
+                        if (editorMode === "measure") {
+                          if (!measureStart || measureLocked) {
+                            setMeasureStart({ px, py });
+                            setMeasureEnd({ px, py });
+                            setMeasureLocked(false);
+                          } else {
+                            setMeasureEnd({ px, py });
+                            setMeasureLocked(true);
+                          }
+                          return;
+                        }
                         if (editorMode === "rooms") return;
                         // Pipe draw mode
                         if (editorMode === "pipe_draw") {
@@ -2936,6 +3191,10 @@ function RoomEditor({
                           setSplitHover(snapped);
                           return;
                         }
+                        if (editorMode === "measure") {
+                          if (measureStart && !measureLocked) setMeasureEnd(point);
+                          return;
+                        }
                         setHoverPoint(point);
                         // Pipe draw preview
                         if (editorMode === "pipe_draw" && pipeDrawStart) {
@@ -2955,6 +3214,7 @@ function RoomEditor({
                         setGroupPreview(next);
                       }}
                       onMouseUp={() => {
+                        if (editorMode === "measure") return;
                         // Finalize pipe draw
                         if (editorMode === "pipe_draw" && pipeDrawStart && pipeDrawEnd) {
                           const dist = Math.hypot(pipeDrawEnd.px - pipeDrawStart.px, pipeDrawEnd.py - pipeDrawStart.py);
@@ -3174,6 +3434,35 @@ function RoomEditor({
                           <line x1={hoverPoint.px} y1={hoverPoint.py - 9} x2={hoverPoint.px} y2={hoverPoint.py + 9} stroke="#2D6A4F" strokeWidth={2} />
                         </g>
                       ) : null}
+
+                      {/* Measure stencil */}
+                      {measureStart && measureEnd ? (() => {
+                        const worldA = pixelToWorld(mapping, measureStart.px, measureStart.py);
+                        const worldB = pixelToWorld(mapping, measureEnd.px, measureEnd.py);
+                        const dWorld = Math.hypot(worldB.x - worldA.x, worldB.y - worldA.y);
+                        const dMeters = dWorld * 0.001;
+                        const midX = (measureStart.px + measureEnd.px) * 0.5;
+                        const midY = (measureStart.py + measureEnd.py) * 0.5;
+                        return (
+                          <g style={{ pointerEvents: "none" }}>
+                            <line
+                              x1={measureStart.px}
+                              y1={measureStart.py}
+                              x2={measureEnd.px}
+                              y2={measureEnd.py}
+                              stroke="#2563EB"
+                              strokeWidth={2.5}
+                              strokeDasharray="8 4"
+                            />
+                            <circle cx={measureStart.px} cy={measureStart.py} r={5} fill="#DBEAFE" stroke="#2563EB" strokeWidth={2} />
+                            <circle cx={measureEnd.px} cy={measureEnd.py} r={5} fill="#DBEAFE" stroke="#2563EB" strokeWidth={2} />
+                            <rect x={midX - 60} y={midY - 24} width={120} height={22} rx={8} fill="rgba(37,99,235,0.92)" />
+                            <text x={midX} y={midY - 9} textAnchor="middle" fill="#ffffff" fontSize={12} fontWeight={700}>
+                              {`${dMeters.toFixed(2)} m`}
+                            </text>
+                          </g>
+                        );
+                      })() : null}
                     </svg>
                   ) : null}
                 </div>
@@ -3277,6 +3566,24 @@ function RoomEditor({
               </p>
             </div>
 
+            {canEdit && (
+            <div style={{ padding: "0 14px 6px" }}>
+              <button
+                onClick={() => autoPlaceEquipment(addType === "mcb" || addType === "hooter" ? "mcp_hooter" : addType)}
+                disabled={!!isAutoPlacing || rooms.length === 0}
+                style={{
+                  width: "100%", padding: "8px 10px", borderRadius: 8,
+                  border: "none", background: "#2D6A4F", color: "#fff",
+                  fontWeight: 700, fontSize: 12,
+                  cursor: (!!isAutoPlacing || rooms.length === 0) ? "wait" : "pointer",
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                }}
+              >
+                {!!isAutoPlacing ? "Auto-placing..." : `Auto-place Selected (${addType === "mcb" || addType === "hooter" ? "MCP & Hooter" : addType})`}
+              </button>
+            </div>
+            )}
+
             {/* Per-equipment auto-place buttons */}
             {canEdit && (
             <div style={{ padding: "6px 14px", display: "flex", flexDirection: "column", gap: 6 }}>
@@ -3303,8 +3610,8 @@ function RoomEditor({
                     icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="6" y="4" width="12" height="16" rx="2"/><line x1="10" y1="2" x2="14" y2="2"/><line x1="12" y1="8" x2="12" y2="14"/></svg>,
                   },
                   {
-                    key: "manual_fire_alarm", dtype: "hooter",
-                    label: "Manual Fire Alarms",
+                    key: "manual_fire_alarm", dtype: "mcp_hooter",
+                    label: "MCP & Hooter",
                     icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>,
                   },
                 ];
@@ -3319,7 +3626,9 @@ function RoomEditor({
                   const nbcInfo = nbcMap[btn.key];
                   const isRequired = nbcInfo?.required ?? false;
                   const isPlacing = isAutoPlacing === btn.dtype;
-                  const placedCount = detCounts[btn.dtype] || 0;
+                  const placedCount = btn.dtype === "mcp_hooter"
+                    ? (detCounts["mcb"] || 0) + (detCounts["hooter"] || 0)
+                    : (detCounts[btn.dtype] || 0);
 
                   return (
                     <div key={btn.key} style={{
@@ -3562,6 +3871,19 @@ function RoomEditor({
         {editorMode === "rooms" && splitMode && selectedRoom ? (
           <div style={{ padding: "0 14px 8px", fontSize: 12, color: "#6B7280" }}>
             Click two points on the selected room boundary to split.
+          </div>
+        ) : null}
+        {editorMode === "measure" ? (
+          <div style={{ padding: "0 14px 8px", fontSize: 12, color: "#6B7280", display: "flex", alignItems: "center", gap: 8 }}>
+            Click first point, click second to lock. Click again to start a new measurement.
+            {(measureStart || measureEnd) ? (
+              <button
+                onClick={() => { setMeasureStart(null); setMeasureEnd(null); setMeasureLocked(false); }}
+                style={{ ...ceRoomBtn, padding: "4px 8px", fontSize: 11 }}
+              >
+                Clear Measure
+              </button>
+            ) : null}
           </div>
         ) : null}
 
@@ -3885,7 +4207,7 @@ function Editor({
 }) {
   const [imgDims, setImgDims] = useState<{w:number;h:number}|null>(null);
   const readOnly = isReady;
-  const [tool, setTool] = useState<"select"|"add"|"erase"|"pan">(isReady ? "pan" : "select");
+  const [tool, setTool] = useState<"select"|"add"|"erase"|"pan"|"measure">(isReady ? "pan" : "select");
   const [addType, setAddType] = useState<ObjectType>("smoke");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [marquee, setMarquee] = useState<{sx:number; sy:number; ex:number; ey:number} | null>(null);
@@ -3899,6 +4221,9 @@ function Editor({
   const [transformState, setTransformState] = useState({ scale: 0.18, positionX: 0, positionY: 0 });
   const [isSaving, setIsSaving] = useState(false);
   const [isExporting, setIsExporting] = useState<null | "dxf" | "png">(null);
+  const [measureStart, setMeasureStart] = useState<{px:number; py:number} | null>(null);
+  const [measureEnd, setMeasureEnd] = useState<{px:number; py:number} | null>(null);
+  const [measureLocked, setMeasureLocked] = useState(false);
 
   // Local mutable copies of detectors and pipes (client-side editing)
   const [detectors, setDetectors] = useState<Detector[]>(detectorsProp);
@@ -4095,6 +4420,7 @@ function Editor({
     if (tool === "pan") return "grab";
     if (tool === "add") return "crosshair";
     if (tool === "erase") return "not-allowed";
+    if (tool === "measure") return "crosshair";
     if (groupDrag) return "grabbing";
     return "default";
   }
@@ -4182,6 +4508,10 @@ function Editor({
               {!readOnly && canEdit && <button onClick={() => setTool("add")} style={toolBtn(tool === "add")}>Add</button>}
               {!readOnly && canEdit && <button onClick={() => setTool("erase")} style={toolBtn(tool === "erase")}>Erase</button>}
               <button onClick={() => setTool("pan")} style={toolBtn(tool === "pan")}>Pan</button>
+              <button onClick={() => setTool("measure")} style={toolBtn(tool === "measure")}>Measure</button>
+              {tool === "measure" && (measureStart || measureEnd) ? (
+                <button onClick={() => { setMeasureStart(null); setMeasureEnd(null); setMeasureLocked(false); }} style={toolBtn(false)}>Clear Measure</button>
+              ) : null}
               {!readOnly && canEdit && (
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 2 }}>
                 {OBJECT_TYPES.map((otype) => {
@@ -4293,10 +4623,22 @@ function Editor({
                     height={imgDims.h}
                     viewBox={`0 0 ${imgDims.w} ${imgDims.h}`}
                     style={{ position:"absolute", left:0, top:0, cursor: readOnly ? "default" : canvasCursor() }}
-                    onMouseDown={readOnly ? undefined : (e)=> {
+                    onMouseDown={(e)=> {
                       const point = toImagePoint(e);
                       if (!point) return;
                       const { px, py } = point;
+                      if (tool === "measure") {
+                        if (!measureStart || measureLocked) {
+                          setMeasureStart({ px, py });
+                          setMeasureEnd({ px, py });
+                          setMeasureLocked(false);
+                        } else {
+                          setMeasureEnd({ px, py });
+                          setMeasureLocked(true);
+                        }
+                        return;
+                      }
+                      if (readOnly) return;
                       const id = hitTest(px, py);
                       if (tool === "select") {
                         if (id) {
@@ -4321,9 +4663,14 @@ function Editor({
                         return;
                       }
                     }}
-                    onMouseMove={readOnly ? undefined : (e)=> {
+                    onMouseMove={(e)=> {
                       const point = toImagePoint(e);
                       if (!point) return;
+                      if (tool === "measure") {
+                        if (measureStart && !measureLocked) setMeasureEnd(point);
+                        return;
+                      }
+                      if (readOnly) return;
                       setHoverPoint(point);
                       if (tool !== "select" && tool !== "erase") return;
                       if (marquee) {
@@ -4341,7 +4688,9 @@ function Editor({
                       }
                       setGroupPreview(next);
                     }}
-                    onMouseUp={readOnly ? undefined : (e)=> {
+                    onMouseUp={(e)=> {
+                      if (tool === "measure") return;
+                      if (readOnly) return;
                       if (tool !== "select" && tool !== "erase") return;
                       if (marquee) {
                         const p1 = { px: marquee.sx, py: marquee.sy };
@@ -4360,7 +4709,7 @@ function Editor({
                       setGroupDrag(null);
                       setGroupPreview(null);
                     }}
-                    onMouseLeave={readOnly ? undefined : ()=> {
+                    onMouseLeave={()=> {
                       setHoverPoint(null);
                       if (marquee) setMarquee(null);
                       if (groupDrag) setGroupDrag(null);
@@ -4432,6 +4781,34 @@ function Editor({
                         <line x1={hoverPoint.px} y1={hoverPoint.py - 9} x2={hoverPoint.px} y2={hoverPoint.py + 9} stroke="#52B788" strokeWidth={2} />
                       </g>
                     ) : null}
+
+                    {measureStart && measureEnd ? (() => {
+                      const worldA = pixelToWorld(mapping, measureStart.px, measureStart.py);
+                      const worldB = pixelToWorld(mapping, measureEnd.px, measureEnd.py);
+                      const dWorld = Math.hypot(worldB.x - worldA.x, worldB.y - worldA.y);
+                      const dMeters = dWorld * 0.001;
+                      const midX = (measureStart.px + measureEnd.px) * 0.5;
+                      const midY = (measureStart.py + measureEnd.py) * 0.5;
+                      return (
+                        <g style={{ pointerEvents: "none" }}>
+                          <line
+                            x1={measureStart.px}
+                            y1={measureStart.py}
+                            x2={measureEnd.px}
+                            y2={measureEnd.py}
+                            stroke="#2563EB"
+                            strokeWidth={2.5}
+                            strokeDasharray="8 4"
+                          />
+                          <circle cx={measureStart.px} cy={measureStart.py} r={5} fill="#DBEAFE" stroke="#2563EB" strokeWidth={2} />
+                          <circle cx={measureEnd.px} cy={measureEnd.py} r={5} fill="#DBEAFE" stroke="#2563EB" strokeWidth={2} />
+                          <rect x={midX - 60} y={midY - 24} width={120} height={22} rx={8} fill="rgba(37,99,235,0.92)" />
+                          <text x={midX} y={midY - 9} textAnchor="middle" fill="#ffffff" fontSize={12} fontWeight={700}>
+                            {`${dMeters.toFixed(2)} m`}
+                          </text>
+                        </g>
+                      );
+                    })() : null}
                   </svg>
                 ) : null}
               </div>

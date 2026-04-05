@@ -106,6 +106,10 @@ def init_db():
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_floor_plans_project_id ON floor_plans(project_id)")
 
+    floor_plan_cols = {row[1] for row in cur.execute("PRAGMA table_info(floor_plans)").fetchall()}
+    if "height_m" not in floor_plan_cols:
+        cur.execute("ALTER TABLE floor_plans ADD COLUMN height_m REAL")
+
     # ── Tenants (companies / teams) ──
     cur.execute("""
     CREATE TABLE IF NOT EXISTS tenants (
