@@ -12,7 +12,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import cv2
-from shapely.geometry import Polygon, LineString, Point, LinearRing
+from shapely.geometry import Polygon, LineString, Point, LinearRing, box
 from shapely.validation import make_valid
 from shapely.affinity import rotate
 from shapely.ops import split, unary_union
@@ -43,8 +43,10 @@ SPRINKLER_SPACING_M = 3.0
 MIN_REGION_AREA_M2 = 2.5
 NOISE_TOLERANCE_M = 0.15
 MIN_WALL_LENGTH_M = 0.05
-WALL_BUFFER_M = 0.5
-ALIGNMENT_TOLERANCE_M = 2.0
+WALL_BUFFER_M = 0.20       # STRICT 200mm minimum distance from all walls
+ALIGN_TOLERANCE_M = 0.5    # Maximum distance to snap points to the global grid
+
+PIPE_SIZES = ['25mm', '32mm', '40mm', '50mm', '65mm', '80mm', '90mm']
 
 # Hazard categories used by sprinkler placement logic.
 HAZARD_LH = "LH"
@@ -64,12 +66,15 @@ _OH_KEYWORDS = {
 _WASHROOM_KEYWORDS = {
     "WASHROOM", "TOILET", "WC", "RESTROOM", "BATHROOM",
 }
+_SKIP_KEYWORDS = {
+    "ELECTRICAL", "PANEL", "SWITCHGEAR", "TRANSFORMER", "ELEC", "ELECT",
+}
 
 # Rule-based sprinkler geometry constraints by hazard type.
 _HAZARD_PARAMS = {
-    HAZARD_HH: {"max_area": 9.0, "max_spacing": 3.75, "max_wall": 1.875},
-    HAZARD_OH: {"max_area": 12.0, "max_spacing": 4.5, "max_wall": 2.25},
-    HAZARD_LH: {"max_area": 21.0, "max_spacing": 4.5, "max_wall": 2.25},
+    HAZARD_HH: {"max_area": 9.0, "max_spacing": 3.75, "min_spacing": 1.8, "max_wall": 1.875},
+    HAZARD_OH: {"max_area": 12.0, "max_spacing": 4.5, "min_spacing": 1.8, "max_wall": 2.25},
+    HAZARD_LH: {"max_area": 21.0, "max_spacing": 4.5, "min_spacing": 1.8, "max_wall": 2.25},
 }
 
 _VALID_GEMINI_HAZARDS = {HAZARD_LH, HAZARD_OH, HAZARD_HH, HAZARD_WASHROOM, "IGNORE", "MANUAL_REVIEW"}
@@ -122,6 +127,9 @@ def _deterministic_hazard_from_label(merged_label: str) -> str | None:
 
     words = set(merged_label.split())
 
+    # Dedicated electrical rooms: skip sprinkler placement entirely.
+    if words & _SKIP_KEYWORDS:
+        return "IGNORE"
     if words & _WASHROOM_KEYWORDS:
         return HAZARD_WASHROOM
     if words & _HH_KEYWORDS:
@@ -423,7 +431,13 @@ def _get_grid_points(poly: Polygon, hazard_type: str = HAZARD_LH):
     rot_poly = rotate(poly, -angle_deg, origin=(cx, cy))
     minx, miny, maxx, maxy = rot_poly.bounds
     width, height = maxx - minx, maxy - miny
+
+    # Dimension filter: skip if either dimension is less than 1 metre.
+    if width < (1.0 / WORLD_TO_M) or height < (1.0 / WORLD_TO_M):
+        return []
+
     max_spacing_world = min(SPRINKLER_SPACING_M, params["max_spacing"]) / WORLD_TO_M
+    min_spacing_world = params["min_spacing"] / WORLD_TO_M
     max_area_world = params["max_area"] / (WORLD_TO_M ** 2)
     max_wall_world = params["max_wall"] / WORLD_TO_M
 
@@ -447,6 +461,16 @@ def _get_grid_points(poly: Polygon, hazard_type: str = HAZARD_LH):
         ny_pts += 1
         step_y = height / ny_pts
 
+    # Enforce minimum spacing: reduce grid count so step never < 1.8 m.
+    max_nx = max(1, int(width / min_spacing_world))
+    max_ny = max(1, int(height / min_spacing_world))
+    if nx_pts > max_nx:
+        nx_pts = max_nx
+        step_x = width / nx_pts
+    if ny_pts > max_ny:
+        ny_pts = max_ny
+        step_y = height / ny_pts
+
     points = []
     for i in range(nx_pts):
         for j in range(ny_pts):
@@ -460,8 +484,10 @@ def _get_grid_points(poly: Polygon, hazard_type: str = HAZARD_LH):
 
 
 def _process_room(room_poly: Polygon, hazard_type: str = HAZARD_LH):
+    """Returns ``(points, regions, bboxes)``."""
     points: List[Tuple[float, float]] = []
     regions: List[Polygon] = []
+    bboxes: List[Polygon] = []
     tolerance_world = NOISE_TOLERANCE_M / WORLD_TO_M
     clean_poly = room_poly.simplify(tolerance_world, preserve_topology=True)
 
@@ -479,12 +505,21 @@ def _process_room(room_poly: Polygon, hazard_type: str = HAZARD_LH):
         if poly.area < min_area_world:
             continue
         regions.append(poly)
+
+        # Compute rotated bounding box for visualization.
+        angle_rad, (cx, cy) = _get_longest_wall_angle(poly)
+        angle_deg = math.degrees(angle_rad)
+        rot_poly = rotate(poly, -angle_deg, origin=(cx, cy))
+        local_bbox = box(*rot_poly.bounds)
+        world_bbox = rotate(local_bbox, angle_deg, origin=(cx, cy))
+        bboxes.append(world_bbox)
+
         grid = _get_grid_points(poly, hazard_type=hazard_type)
         if not grid:
             rep = poly.representative_point()
             grid = [(rep.x, rep.y)]
         points.extend(grid)
-    return points, regions
+    return points, regions, bboxes
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -506,6 +541,23 @@ def get_pipe_diameter_label(num_sprinklers: int) -> str:
     return "90mm"
 
 
+def _get_base_size_idx(num_sprinklers: int) -> int:
+    """Return a PIPE_SIZES index for the downstream sprinkler count."""
+    if num_sprinklers <= 2:
+        return 0
+    elif num_sprinklers <= 3:
+        return 1
+    elif num_sprinklers <= 5:
+        return 2
+    elif num_sprinklers <= 10:
+        return 3
+    elif num_sprinklers <= 30:
+        return 4
+    elif num_sprinklers <= 60:
+        return 5
+    return 6
+
+
 def _diameter_label_to_mm(label: str) -> int:
     m = re.search(r"(\d+)", str(label))
     return int(m.group(1)) if m else 25
@@ -518,25 +570,48 @@ def _ensure_min_diameter(label: str, min_mm: int) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────
-# Orthogonal pipe routing
+# Orthogonal pipe routing – data-driven
 # ──────────────────────────────────────────────────────────────────
-def _cluster_values(values: List[float], tolerance: float) -> List[List[int]]:
-    """Group indices of *values* into clusters where members are within
-    *tolerance* of each other.  Returns list of index-groups."""
-    indexed = sorted(enumerate(values), key=lambda iv: iv[1])
-    clusters: List[List[int]] = []
-    cur_cluster: List[int] = []
-    cur_val = None
-    for idx, val in indexed:
-        if cur_val is None or abs(val - cur_val) <= tolerance:
-            cur_cluster.append(idx)
+def _get_data_driven_lines(coords: List[float], min_spacing_m: float = 2.0) -> List[float]:
+    """Cluster nearby coordinate values and merge those closer than *min_spacing_m*."""
+    if not coords:
+        return []
+    min_spacing = min_spacing_m / WORLD_TO_M
+    tolerance = 0.1 / WORLD_TO_M
+    sorted_coords = sorted(coords)
+
+    clusters: list = []
+    current_cluster = [sorted_coords[0]]
+    for val in sorted_coords[1:]:
+        if val - current_cluster[0] <= tolerance:
+            current_cluster.append(val)
         else:
-            clusters.append(cur_cluster)
-            cur_cluster = [idx]
-        cur_val = val
-    if cur_cluster:
-        clusters.append(cur_cluster)
-    return clusters
+            avg_val = sum(current_cluster) / len(current_cluster)
+            clusters.append({"val": avg_val, "weight": len(current_cluster)})
+            current_cluster = [val]
+    clusters.append({"val": sum(current_cluster) / len(current_cluster), "weight": len(current_cluster)})
+
+    # Iteratively merge clusters that are too close together.
+    while True:
+        min_dist = float("inf")
+        merge_idx = -1
+        for i in range(len(clusters) - 1):
+            dist = clusters[i + 1]["val"] - clusters[i]["val"]
+            if dist < min_dist:
+                min_dist, merge_idx = dist, i
+        if min_dist >= min_spacing or merge_idx == -1:
+            break
+        c1, c2 = clusters[merge_idx], clusters[merge_idx + 1]
+        if c1["weight"] > c2["weight"]:
+            new_val = c1["val"]
+        elif c2["weight"] > c1["weight"]:
+            new_val = c2["val"]
+        else:
+            new_val = (c1["val"] + c2["val"]) / 2.0
+        clusters[merge_idx] = {"val": new_val, "weight": c1["weight"] + c2["weight"]}
+        clusters.pop(merge_idx + 1)
+
+    return [c["val"] for c in clusters]
 
 
 def route_pipes(
@@ -546,8 +621,9 @@ def route_pipes(
 ) -> Tuple[List[Tuple[Tuple[Tuple[float, float], Tuple[float, float]], str]], List[Tuple[float, float]]]:
     """Route orthogonal pipes from *source* to each sprinkler.
 
-    Clusters sprinklers by their actual column/row positions, creates branch
-    lines through each cluster, and connects branches with a perpendicular trunk.
+    Uses data-driven branch clustering, trunk offset, out-of-bounds pipe
+    clipping with reconnection, arm-pipe tee junctions, and region-aware
+    pipe sizing.
 
     Returns ``(pipe_segments, snapped_sprinklers)`` where each pipe segment is
     ``((pt1, pt2), diameter_label)``.
@@ -559,178 +635,235 @@ def route_pipes(
         return [], []
 
     source = (round(source[0], 4), round(source[1], 4))
-    sprinklers = [(round(s[0], 4), round(s[1], 4)) for s in sprinklers]
-
-    def _is_room_crossing_segment(u_pt, v_pt) -> bool:
-        """True when a segment crosses through/into multiple room regions.
-
-        This is intentionally geometric (line vs polygons) and does not rely
-        only on endpoint region assignment, which can be brittle near borders.
-        """
-        if not valid_regions:
-            return False
-
-        seg = LineString([u_pt, v_pt])
-        if seg.length <= 1e-6:
-            return False
-
-        eps = 0.05 / WORLD_TO_M
-        touched_indices = []
-        for i, reg in enumerate(valid_regions):
-            if reg.buffer(eps).intersects(seg):
-                touched_indices.append(i)
-                if len(touched_indices) >= 2:
-                    return True
-
-        # If it traverses across a single room boundary with both endpoints
-        # outside that room, treat it as a crossing segment too.
-        if len(touched_indices) == 1:
-            reg = valid_regions[touched_indices[0]]
-            rp = reg.buffer(eps)
-            u_in = rp.contains(Point(u_pt[0], u_pt[1]))
-            v_in = rp.contains(Point(v_pt[0], v_pt[1]))
-            if (not u_in and not v_in) and seg.crosses(reg):
-                return True
-
-        return False
-
-    xs = [s[0] for s in sprinklers]
-    ys = [s[1] for s in sprinklers]
+    original_sprinklers = [(round(s[0], 4), round(s[1], 4)) for s in sprinklers]
+    xs = [s[0] for s in original_sprinklers]
+    ys = [s[1] for s in original_sprinklers]
     is_horizontal_trunk = (max(xs) - min(xs)) > (max(ys) - min(ys))
 
-    # Tolerance: sprinklers whose column/row coords differ by less than this
-    # are considered part of the same column/row.
-    cluster_tol = (SPRINKLER_SPACING_M * 0.4) / WORLD_TO_M
+    trunk_offset_world = 1.5 / WORLD_TO_M
 
+    # ── 1. Build ideal strictly orthogonal layout ─────────────────
     G = nx.Graph()
     G.add_node(source)
-    sprinkler_set = set(sprinklers)
-    for s in sprinklers:
+    sprinkler_set = set(original_sprinklers)
+    for s in original_sprinklers:
         G.add_node(s)
 
     if is_horizontal_trunk:
-        # Group sprinklers into vertical columns by x-coordinate
-        col_clusters = _cluster_values(xs, cluster_tol)
-        # Representative x for each column = mean of member x values
-        columns: List[Tuple[float, List[Tuple[float, float]]]] = []
-        for cluster_indices in col_clusters:
-            col_x = round(sum(xs[i] for i in cluster_indices) / len(cluster_indices), 4)
-            members = [sprinklers[i] for i in cluster_indices]
-            columns.append((col_x, members))
+        trunk_y = source[1] + trunk_offset_world
+        branch_xs = _get_data_driven_lines(xs, min_spacing_m=2.0)
+        branch_nodes: Dict = {bx: [(bx, trunk_y)] for bx in branch_xs}
 
-        # Trunk runs horizontally at the median y of all sprinklers
-        all_y = sorted(ys)
-        trunk_y = round(all_y[len(all_y) // 2], 4)
+        for s in original_sprinklers:
+            best_bx = min(branch_xs, key=lambda x: abs(x - s[0]))
+            j_pt = (best_bx, s[1])
+            branch_nodes[best_bx].append(j_pt)
+            if j_pt != s:
+                G.add_edge(j_pt, s)
 
-        trunk_points = set()
+        trunk_nodes_list = [(source[0], trunk_y)]
+        for bx, nodes in branch_nodes.items():
+            nodes = list(set(nodes))
+            trunk_nodes_list.append((bx, trunk_y))
+            nodes_up = sorted([n for n in nodes if n[1] >= trunk_y], key=lambda n: n[1])
+            nodes_down = sorted([n for n in nodes if n[1] <= trunk_y], key=lambda n: n[1], reverse=True)
+            for i in range(len(nodes_up) - 1):
+                G.add_edge(nodes_up[i], nodes_up[i + 1])
+            for i in range(len(nodes_down) - 1):
+                G.add_edge(nodes_down[i], nodes_down[i + 1])
 
-        for col_x, members in columns:
-            # Trunk junction for this column
-            trunk_pt = (col_x, trunk_y)
-            trunk_points.add(trunk_pt)
-
-            # Gather all points on this vertical branch: trunk junction + sprinklers
-            branch_nodes = [trunk_pt]
-            for s in members:
-                # If sprinkler has same x as column, it sits on the branch line.
-                # Otherwise add a junction at (col_x, s_y) and a short horizontal stub.
-                junction = (col_x, s[1])
-                branch_nodes.append(junction)
-                if junction != s:
-                    G.add_edge(junction, s)
-
-            # Connect branch nodes vertically (sorted by y)
-            branch_nodes = sorted(set(branch_nodes), key=lambda p: p[1])
-            for i in range(len(branch_nodes) - 1):
-                G.add_edge(branch_nodes[i], branch_nodes[i + 1])
-
-        # Connect source to trunk
-        feed_pt = (source[0], trunk_y)
-        G.add_edge(source, feed_pt)
-        trunk_points.add(feed_pt)
-
-        # Connect trunk points horizontally
-        trunk_nodes = sorted(trunk_points, key=lambda p: p[0])
-        for i in range(len(trunk_nodes) - 1):
-            G.add_edge(trunk_nodes[i], trunk_nodes[i + 1])
-
+        trunk_nodes_list = sorted(set(trunk_nodes_list), key=lambda n: n[0])
+        for i in range(len(trunk_nodes_list) - 1):
+            G.add_edge(trunk_nodes_list[i], trunk_nodes_list[i + 1])
+        G.add_edge(source, (source[0], trunk_y))
     else:
-        # Group sprinklers into horizontal rows by y-coordinate
-        row_clusters = _cluster_values(ys, cluster_tol)
-        rows: List[Tuple[float, List[Tuple[float, float]]]] = []
-        for cluster_indices in row_clusters:
-            row_y = round(sum(ys[i] for i in cluster_indices) / len(cluster_indices), 4)
-            members = [sprinklers[i] for i in cluster_indices]
-            rows.append((row_y, members))
+        trunk_x = source[0] + trunk_offset_world
+        branch_ys = _get_data_driven_lines(ys, min_spacing_m=2.0)
+        branch_nodes = {by: [(trunk_x, by)] for by in branch_ys}
 
-        # Trunk runs vertically at the median x of all sprinklers
-        all_x = sorted(xs)
-        trunk_x = round(all_x[len(all_x) // 2], 4)
+        for s in original_sprinklers:
+            best_by = min(branch_ys, key=lambda y: abs(y - s[1]))
+            j_pt = (s[0], best_by)
+            branch_nodes[best_by].append(j_pt)
+            if j_pt != s:
+                G.add_edge(j_pt, s)
 
-        trunk_points = set()
+        trunk_nodes_list = [(trunk_x, source[1])]
+        for by, nodes in branch_nodes.items():
+            nodes = list(set(nodes))
+            trunk_nodes_list.append((trunk_x, by))
+            nodes_right = sorted([n for n in nodes if n[0] >= trunk_x], key=lambda n: n[0])
+            nodes_left = sorted([n for n in nodes if n[0] <= trunk_x], key=lambda n: n[0], reverse=True)
+            for i in range(len(nodes_right) - 1):
+                G.add_edge(nodes_right[i], nodes_right[i + 1])
+            for i in range(len(nodes_left) - 1):
+                G.add_edge(nodes_left[i], nodes_left[i + 1])
 
-        for row_y, members in rows:
-            trunk_pt = (trunk_x, row_y)
-            trunk_points.add(trunk_pt)
+        trunk_nodes_list = sorted(set(trunk_nodes_list), key=lambda n: n[1])
+        for i in range(len(trunk_nodes_list) - 1):
+            G.add_edge(trunk_nodes_list[i], trunk_nodes_list[i + 1])
+        G.add_edge(source, (trunk_x, source[1]))
 
-            branch_nodes = [trunk_pt]
-            for s in members:
-                junction = (s[0], row_y)
-                branch_nodes.append(junction)
-                if junction != s:
-                    G.add_edge(junction, s)
+    # ── 2. Delete out-of-bounds pipes and reconnect ───────────────
+    if valid_regions:
+        footprint = unary_union(valid_regions).buffer(1.2 / WORLD_TO_M)
 
-            branch_nodes = sorted(set(branch_nodes), key=lambda p: p[0])
-            for i in range(len(branch_nodes) - 1):
-                G.add_edge(branch_nodes[i], branch_nodes[i + 1])
+        edges_to_remove = [(u, v) for u, v in G.edges() if not footprint.contains(LineString([u, v]))]
+        G.remove_edges_from(edges_to_remove)
 
-        # Connect source to trunk
-        feed_pt = (trunk_x, source[1])
-        G.add_edge(source, feed_pt)
-        trunk_points.add(feed_pt)
+        # Reconnect disconnected islands via L-shaped orthogonal paths.
+        components = list(nx.connected_components(G))
+        while len(components) > 1:
+            comp_a = components[0]
+            best_dist = float("inf")
+            best_edges: list = []
+            best_comp_idx = -1
 
-        # Connect trunk points vertically
-        trunk_nodes = sorted(trunk_points, key=lambda p: p[1])
-        for i in range(len(trunk_nodes) - 1):
-            G.add_edge(trunk_nodes[i], trunk_nodes[i + 1])
+            for ci in range(1, len(components)):
+                comp_b = components[ci]
+                for u in comp_a:
+                    for v in comp_b:
+                        dist = abs(u[0] - v[0]) + abs(u[1] - v[1])
+                        if dist >= best_dist:
+                            continue
+                        for corner in [(v[0], u[1]), (u[0], v[1])]:
+                            valid = True
+                            if u != corner:
+                                valid = valid and footprint.contains(LineString([u, corner]))
+                            if corner != v:
+                                valid = valid and footprint.contains(LineString([corner, v]))
+                            if valid:
+                                best_dist = dist
+                                best_edges = [(u, corner), (corner, v)]
+                                best_comp_idx = ci
+                                break
 
-    # Directed tree via BFS from source
+            if not best_edges:
+                # Failsafe: force the absolute closest L-shape.
+                fallback_dist = float("inf")
+                for ci in range(1, len(components)):
+                    for u in comp_a:
+                        for v in components[ci]:
+                            dist = abs(u[0] - v[0]) + abs(u[1] - v[1])
+                            if dist < fallback_dist:
+                                fallback_dist = dist
+                                corner = (v[0], u[1])
+                                best_edges = [(u, corner), (corner, v)]
+                                best_comp_idx = ci
+
+            for e in best_edges:
+                if e[0] != e[1]:
+                    G.add_edge(*e)
+            components[0] = components[0].union(components[best_comp_idx])
+            components.pop(best_comp_idx)
+
+    # ── 3. BFS tree from source ───────────────────────────────────
     try:
         directed_tree = nx.bfs_tree(G, source=source)
     except Exception as e:
         logger.warning("route_pipes bfs_tree failed: %s", e)
-        return [], sprinklers
+        return [], original_sprinklers
 
-    node_cost = {node: (1 if node in sprinkler_set else 0) for node in directed_tree.nodes()}
+    # ── 4. Subtree counts and node-to-region mapping ──────────────
+    node_to_region: Dict = {}
+    if valid_regions:
+        eps = 0.15 / WORLD_TO_M
+        for node in directed_tree.nodes():
+            pt = Point(node[0], node[1])
+            found = -1
+            for i, reg in enumerate(valid_regions):
+                if reg.buffer(eps).contains(pt):
+                    found = i
+                    break
+            node_to_region[node] = found
 
     subtree_counts: Dict = {}
     for node in reversed(list(nx.topological_sort(directed_tree))):
-        count = node_cost[node]
+        count = 1 if node in sprinkler_set else 0
         for child in directed_tree.successors(node):
-            count += subtree_counts[child]
+            count += subtree_counts.get(child, 0)
         subtree_counts[node] = count
 
-    raw_segments = []
-    for u, v in directed_tree.edges():
-        fed = subtree_counts[v]
-        if fed > 0:
-            label = get_pipe_diameter_label(fed)
-            is_arm_segment = (u in sprinkler_set) or (v in sprinkler_set)
-            # Keep 25mm only for final arm segments connected directly to a sprinkler.
-            if not is_arm_segment:
-                label = _ensure_min_diameter(label, 32)
-            # Rule: if a segment crosses room regions, enforce minimum 32mm.
-            if _is_room_crossing_segment(u, v):
-                label = _ensure_min_diameter(label, 32)
-            raw_segments.append((u, v, label))
+    # ── 5. Arm-pipe tee creation ──────────────────────────────────
+    arm_length = 0.4 / WORLD_TO_M
+    edges_to_remove = []
+    edges_to_add = []
+    tees_created = set()
 
-    # Keep each routed edge as its own segment so every joint-to-joint pipe
-    # can be labeled independently downstream.
+    for s in list(sprinkler_set):
+        load = subtree_counts.get(s, 0)
+        if load <= 10:
+            continue
+        preds = list(directed_tree.predecessors(s))
+        succs = list(directed_tree.successors(s))
+        if not preds:
+            continue
+        p = preds[0]
+        dx, dy = s[0] - p[0], s[1] - p[1]
+        if abs(dx) < 1e-3 and abs(dy) < 1e-3:
+            continue
+
+        is_horiz = abs(dx) > abs(dy)
+        dir_y = -1 if dy > 0 else 1
+        dir_x = -1 if dx > 0 else 1
+        if is_horiz:
+            tee = (s[0], s[1] + arm_length * dir_y)
+        else:
+            tee = (s[0] + arm_length * dir_x, s[1])
+
+        edges_to_remove.append((p, s))
+        edges_to_add.append((p, tee))
+        for child in succs:
+            edges_to_remove.append((s, child))
+            edges_to_add.append((tee, child))
+        edges_to_add.append((tee, s))
+        tees_created.add(tee)
+
+        if s in node_to_region:
+            node_to_region[tee] = node_to_region[s]
+        subtree_counts[tee] = load
+        subtree_counts[s] = 1
+
+    for u, v in edges_to_remove:
+        if directed_tree.has_edge(u, v):
+            directed_tree.remove_edge(u, v)
+    for u, v in edges_to_add:
+        directed_tree.add_edge(u, v)
+    try:
+        directed_tree = nx.bfs_tree(directed_tree, source=source)
+    except Exception:
+        pass
+
+    # ── 6. Region-aware pipe sizing ───────────────────────────────
+    node_size_idx = {n: _get_base_size_idx(subtree_counts.get(n, 0)) for n in directed_tree.nodes()}
+    for node in reversed(list(nx.topological_sort(directed_tree))):
+        idx = node_size_idx[node]
+        for child in directed_tree.successors(node):
+            child_idx = node_size_idx[child]
+            if valid_regions:
+                reg_u = node_to_region.get(node, -1)
+                reg_v = node_to_region.get(child, -1)
+                if reg_u != reg_v and reg_v != -1:
+                    child_idx = max(child_idx, 1)
+                    node_size_idx[child] = child_idx
+            idx = max(idx, child_idx)
+        node_size_idx[node] = idx
+
     final_segments: List[Tuple[Tuple[Tuple[float, float], Tuple[float, float]], str]] = []
-    for u, v, label in raw_segments:
-        final_segments.append(((u, v), label))
+    for u, v in directed_tree.edges():
+        if subtree_counts.get(v, 0) > 0:
+            idx = node_size_idx.get(v, 0)
+            label = PIPE_SIZES[idx]
+            if valid_regions:
+                reg_u = node_to_region.get(u, -1)
+                reg_v = node_to_region.get(v, -1)
+                if reg_u != reg_v and reg_v != -1:
+                    label = f"{label} (Entry)"
+            if u in tees_created and v in sprinkler_set:
+                label = "25mm (Arm)"
+            final_segments.append(((u, v), label))
 
-    return final_segments, sprinklers
+    return final_segments, original_sprinklers
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -742,6 +875,7 @@ def visualize_sprinkler_routing(
     all_pipes: list,
     source: Tuple[float, float],
     output_path: str,
+    all_bboxes: List[Polygon] | None = None,
 ):
     if not all_regions and not all_points:
         return
@@ -770,6 +904,12 @@ def visualize_sprinkler_routing(
         cv2.addWeighted(overlay, 0.5, img, 0.5, 0, img)
         cv2.polylines(img, [pts], True, (200, 200, 200), 1)
 
+    # Draw bounding boxes in magenta
+    if all_bboxes:
+        for bbox_poly in all_bboxes:
+            pts = np.array([to_px(x, y) for x, y in bbox_poly.exterior.coords], dtype=np.int32)
+            cv2.polylines(img, [pts], True, (255, 0, 255), 1)
+
     for (pt1, pt2), label in all_pipes:
         px1, py1 = to_px(pt1[0], pt1[1])
         px2, py2 = to_px(pt2[0], pt2[1])
@@ -793,6 +933,90 @@ def visualize_sprinkler_routing(
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     cv2.imwrite(output_path, img)
     logger.info("visualize_sprinkler_routing saved=%s", output_path)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Global grid alignment
+# ──────────────────────────────────────────────────────────────────
+def align_to_global_lines(
+    detectors: List[Tuple[float, float]],
+    regions: List[Polygon],
+    tolerance_m: float = ALIGN_TOLERANCE_M,
+) -> List[Tuple[float, float]]:
+    """Snap sprinkler points to global X/Y grid lines while staying inside
+    the wall-buffered safe zone of their parent region."""
+    if not detectors:
+        return []
+    tolerance_world = tolerance_m / WORLD_TO_M
+    wall_buffer_world = WALL_BUFFER_M / WORLD_TO_M
+
+    def _extract_global_lines(coords):
+        sorted_coords = sorted(coords)
+        if not sorted_coords:
+            return []
+        lines = []
+        current_group = [sorted_coords[0]]
+        for val in sorted_coords[1:]:
+            if val - current_group[0] <= tolerance_world:
+                current_group.append(val)
+            else:
+                lines.append(sum(current_group) / len(current_group))
+                current_group = [val]
+        lines.append(sum(current_group) / len(current_group))
+        return lines
+
+    global_x_lines = _extract_global_lines([d[0] for d in detectors])
+    global_y_lines = _extract_global_lines([d[1] for d in detectors])
+    aligned: List[Tuple[float, float]] = []
+
+    for x, y in detectors:
+        pt = Point(x, y)
+        parent_region = next(
+            (r for r in regions if r.contains(pt) or r.distance(pt) < 1e-3), None
+        )
+        if not parent_region:
+            aligned.append((x, y))
+            continue
+
+        safe_zone = parent_region.buffer(-wall_buffer_world)
+        if safe_zone.is_empty or safe_zone.area <= 0:
+            safe_zone = parent_region.buffer(-0.1 / WORLD_TO_M)
+            if safe_zone.is_empty:
+                safe_zone = parent_region
+
+        valid_x = sorted(
+            [gx for gx in global_x_lines if abs(gx - x) <= tolerance_world],
+            key=lambda gx: abs(gx - x),
+        ) or [x]
+        valid_y = sorted(
+            [gy for gy in global_y_lines if abs(gy - y) <= tolerance_world],
+            key=lambda gy: abs(gy - y),
+        ) or [y]
+
+        best_pt = None
+        # Try snapping both axes
+        for gx in valid_x:
+            for gy in valid_y:
+                if safe_zone.contains(Point(gx, gy)):
+                    best_pt = (gx, gy)
+                    break
+            if best_pt:
+                break
+        # Fallback: X axis only
+        if not best_pt:
+            for gx in valid_x:
+                if safe_zone.contains(Point(gx, y)):
+                    best_pt = (gx, y)
+                    break
+        # Fallback: Y axis only
+        if not best_pt:
+            for gy in valid_y:
+                if safe_zone.contains(Point(x, gy)):
+                    best_pt = (x, gy)
+                    break
+        aligned.append(best_pt if best_pt else (x, y))
+
+    return aligned
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -910,7 +1134,7 @@ def place_sprinklers_from_rooms_json(
     rooms: List[Dict],
     dxf_path: str,
     spacing_m: float = 3.0,
-    wall_buffer_m: float = 0.5,
+    wall_buffer_m: float = 0.20,
     world_to_m: float = 0.001,
     source_labels: List[str] | None = None,
     debug_png_path: str | None = None,
@@ -930,11 +1154,16 @@ def place_sprinklers_from_rooms_json(
 
     all_points: List[Tuple[float, float]] = []
     all_regions: List[Polygon] = []
+    all_bboxes: List[Polygon] = []
 
     hazard_counts: Dict[str, int] = {HAZARD_LH: 0, HAZARD_OH: 0, HAZARD_HH: 0, HAZARD_WASHROOM: 0}
     room_hazards = _classify_room_hazards(rooms)
 
     for room, hazard in zip(rooms, room_hazards):
+        # Skip rooms classified as IGNORE (e.g. electrical rooms).
+        if hazard == "IGNORE":
+            continue
+
         poly = _parse_polygon(room.get("polygon_world"))
         if poly is None:
             continue
@@ -951,13 +1180,17 @@ def place_sprinklers_from_rooms_json(
 
         hazard_counts[hazard] = hazard_counts.get(hazard, 0) + 1
 
-        pts, regs = _process_room(poly, hazard_type=hazard)
+        pts, regs, bboxes = _process_room(poly, hazard_type=hazard)
         all_points.extend(pts)
         all_regions.extend(regs)
+        all_bboxes.extend(bboxes)
 
     if not all_points:
         logger.info("place_sprinklers_from_rooms_json no sprinklers placed (no valid rooms)")
         return [], [], [], []
+
+    # Global grid alignment
+    all_points = align_to_global_lines(all_points, all_regions, tolerance_m=ALIGN_TOLERANCE_M)
 
     # Determine source
     min_x = min(p[0] for p in all_points)
@@ -990,7 +1223,7 @@ def place_sprinklers_from_rooms_json(
     )
 
     if debug_png_path:
-        visualize_sprinkler_routing(all_regions, snapped_sprinklers, pipe_segments, source, debug_png_path)
+        visualize_sprinkler_routing(all_regions, snapped_sprinklers, pipe_segments, source, debug_png_path, all_bboxes=all_bboxes)
 
     return snapped_sprinklers, pipe_segments, [source], all_regions
 
@@ -1001,7 +1234,7 @@ def place_sprinklers_from_rooms_json(
 def place_sprinklers_only(
     rooms: List[Dict],
     spacing_m: float = 3.0,
-    wall_buffer_m: float = 0.5,
+    wall_buffer_m: float = 0.20,
     world_to_m: float = 0.001,
 ) -> List[Tuple[float, float]]:
     """Place sprinklers for all rooms WITHOUT routing pipes.
@@ -1011,9 +1244,12 @@ def place_sprinklers_only(
     _set_runtime_config(spacing_m=spacing_m, wall_buffer_m=wall_buffer_m, world_to_m=world_to_m)
 
     all_points: List[Tuple[float, float]] = []
+    all_regions: List[Polygon] = []
 
     room_hazards = _classify_room_hazards(rooms)
     for room, hazard in zip(rooms, room_hazards):
+        if hazard == "IGNORE":
+            continue
         poly = _parse_polygon(room.get("polygon_world"))
         if poly is None:
             continue
@@ -1025,8 +1261,12 @@ def place_sprinklers_only(
         if hazard == HAZARD_LH and area_m2 > 126.0:
             hazard = HAZARD_OH
 
-        pts, _regs = _process_room(poly, hazard_type=hazard)
+        pts, regs, _bboxes = _process_room(poly, hazard_type=hazard)
         all_points.extend(pts)
+        all_regions.extend(regs)
+
+    # Global grid alignment
+    all_points = align_to_global_lines(all_points, all_regions, tolerance_m=ALIGN_TOLERANCE_M)
 
     logger.info("place_sprinklers_only sprinklers=%d", len(all_points))
     return all_points
@@ -1040,7 +1280,7 @@ def route_pipes_for_sprinklers(
     rooms: List[Dict],
     dxf_path: str,
     spacing_m: float = 3.0,
-    wall_buffer_m: float = 0.5,
+    wall_buffer_m: float = 0.20,
     world_to_m: float = 0.001,
     source_labels: List[str] | None = None,
     override_source: Tuple[float, float] | None = None,
@@ -1063,6 +1303,8 @@ def route_pipes_for_sprinklers(
     all_regions: List[Polygon] = []
     room_hazards = _classify_room_hazards(rooms)
     for room, hazard in zip(rooms, room_hazards):
+        if hazard == "IGNORE":
+            continue
         poly = _parse_polygon(room.get("polygon_world"))
         if poly is None:
             continue
@@ -1074,7 +1316,7 @@ def route_pipes_for_sprinklers(
         if hazard == HAZARD_LH and area_m2 > 126.0:
             hazard = HAZARD_OH
 
-        _pts, regs = _process_room(poly, hazard_type=hazard)
+        _pts, regs, _bboxes = _process_room(poly, hazard_type=hazard)
         all_regions.extend(regs)
 
     # Determine source

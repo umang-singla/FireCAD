@@ -15,7 +15,7 @@ from app.pipeline.run_pipeline import (
 )
 from app.pipeline.gemini_mask import generate_mask_image, DEFAULT_PROMPT
 from app.pipeline.mask_align import align_perfect_tight_box
-from app.pipeline.dxf_export import write_detectors_to_dxf
+from app.pipeline.dxf_export import write_detectors_to_dxf, write_combined_sheets_dxf
 from app.pipeline.render import render_dwg_to_png_with_qcad, write_mapping_from_dxf_and_png
 from app.pipeline.nbc_rules import (
     get_questions as nbc_get_questions,
@@ -870,6 +870,18 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
                 world_to_m=opts.world_to_m, world_bbox=world_bbox,
             )
 
+        # Combined multi-sheet DXF (separate tabs for fire alarm vs sprinkler)
+        out_combined = os.path.join(project_dir(project_id), "detectors_combined_sheets.dxf")
+        write_combined_sheets_dxf(
+            base_dxf=dxf_path,
+            out_combined_dxf=out_combined,
+            detectors=dets,
+            sprinkler_pipes=all_pipe_segments,
+            sprinkler_sources=list(all_pipe_sources),
+            world_to_m=opts.world_to_m,
+            world_bbox=world_bbox,
+        )
+
         out_png = os.path.join(project_dir(project_id), "detectors_preview.png")
         out_map = os.path.join(project_dir(project_id), "detectors_preview_mapping.json")
 
@@ -888,7 +900,7 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
 
         con.execute(
             "UPDATE projects SET output_dxf_path=?, output_preview_png_path=?, status=?, error=NULL, updated_at=? WHERE id=?",
-            (out_dxf, out_png, "ready", now(), project_id),
+            (out_combined, out_png, "ready", now(), project_id),
         )
         log_activity(con, user, "saved_project", "project", project_id, r["name"])
         r2 = _authorize_project(con, project_id, user)

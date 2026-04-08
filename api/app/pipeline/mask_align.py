@@ -1,6 +1,14 @@
 import cv2
 import numpy as np
 import logging
+from PIL import Image
+
+from .gemini_mask import (
+    detect_marker_centers,
+    get_marker_target_points,
+    remove_markers_from_mask,
+    MARKER_SIZE,
+)
 
 logger = logging.getLogger("firecad.pipeline.mask_align")
 
@@ -83,6 +91,35 @@ def get_pixel_perfect_components(image, is_mask=False):
     """Compatibility wrapper returning [{'box': (...)}] format."""
     return [{"box": box} for box in get_tight_components(image, is_mask=is_mask)]
 
+
+def _try_marker_alignment(mask_img, target_shape, marker_size=MARKER_SIZE):
+    """Attempt perspective-transform alignment using corner markers.
+
+    Returns the aligned mask (BGR ndarray matching target_shape) or None
+    if fewer than 4 markers were detected in the mask.
+    """
+    mask_pil = Image.fromarray(cv2.cvtColor(mask_img, cv2.COLOR_BGR2RGB))
+    src_pts = detect_marker_centers(mask_pil)
+    if src_pts is None:
+        return None
+
+    h, w = target_shape[:2]
+    dst_pts = get_marker_target_points(w, h, marker_size)
+
+    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    aligned = cv2.warpPerspective(
+        mask_img, M, (w, h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+
+    # Remove marker remnants from the aligned mask
+    aligned = remove_markers_from_mask(aligned, marker_size)
+    logger.info("mask_align marker-based alignment succeeded target=%sx%s", w, h)
+    return aligned
+
+
 def align_perfect_tight_box(input_png: str, mask_png: str, out_aligned_png: str,
                             overlay_debug: str | None = None, boxes_debug: str | None = None):
     input_img = cv2.imread(input_png)
@@ -90,6 +127,19 @@ def align_perfect_tight_box(input_png: str, mask_png: str, out_aligned_png: str,
 
     if input_img is None or mask_img is None:
         raise RuntimeError("Could not load input/mask images.")
+
+    # ── Try marker-based perspective alignment first ───────────
+    aligned_via_markers = _try_marker_alignment(mask_img, input_img.shape)
+    if aligned_via_markers is not None:
+        cv2.imwrite(out_aligned_png, aligned_via_markers)
+        if overlay_debug:
+            overlay = cv2.addWeighted(input_img, 0.6, aligned_via_markers, 0.4, 0)
+            cv2.imwrite(overlay_debug, overlay)
+        logger.info("mask_align done (marker path) output=%s", out_aligned_png)
+        return
+
+    # ── Fallback: tight-box component matching ─────────────────
+    logger.info("mask_align markers not detected, falling back to tight-box alignment")
 
     if mask_img.shape[:2] != input_img.shape[:2]:
         logger.info(
@@ -100,20 +150,6 @@ def align_perfect_tight_box(input_png: str, mask_png: str, out_aligned_png: str,
             input_img.shape[0],
         )
         mask_img = cv2.resize(mask_img, (input_img.shape[1], input_img.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-    if mask_img.shape[:2] != input_img.shape[:2]:
-        logger.info(
-            "mask_align resize mask from=%sx%s to=%sx%s for coordinate-space alignment",
-            mask_img.shape[1],
-            mask_img.shape[0],
-            input_img.shape[1],
-            input_img.shape[0],
-        )
-        mask_img = cv2.resize(
-            mask_img,
-            (input_img.shape[1], input_img.shape[0]),
-            interpolation=cv2.INTER_NEAREST,
-        )
 
     in_boxes = get_tight_components(input_img, is_mask=False)
     mk_boxes = get_tight_components(mask_img, is_mask=True)

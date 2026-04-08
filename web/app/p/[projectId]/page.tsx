@@ -4297,10 +4297,11 @@ function Editor({
 
       // Save data first, then generate DXF via /save, then download
       await saveEdits();
-      await authFetch(`/api/projects/${projectId}/save`, { method: "POST" });
-      const url = exportDxfUrl;
-      if (!url) return;
-      await downloadFresh(url, `project_${projectId}_${Date.now()}.dxf`);
+      const saveResp = await authFetch(`/api/projects/${projectId}/save`, { method: "POST" });
+      const saved = await saveResp.json();
+      const freshUrl = saved?.files?.output_dxf ? apiUrl(saved.files.output_dxf) : exportDxfUrl;
+      if (!freshUrl) return;
+      await downloadFresh(freshUrl, `project_${projectId}_${Date.now()}.dxf`);
     } finally {
       setIsExporting(null);
     }

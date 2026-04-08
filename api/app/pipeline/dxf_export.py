@@ -1,6 +1,7 @@
 import ezdxf
 import math
 import logging
+from ezdxf import recover
 from ezdxf.enums import TextEntityAlignment
 
 logger = logging.getLogger("firecad.pipeline.dxf_export")
@@ -415,3 +416,248 @@ def write_detectors_to_dxf(
     )
 
     doc.saveas(out_dxf)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Combined multi-sheet DXF export (viewport + layer-freeze approach)
+# ──────────────────────────────────────────────────────────────────
+
+# Fire-alarm device types (everything except sprinkler)
+_FIRE_ALARM_DTYPES = {"smoke", "panel", "mcb", "hooter"}
+
+# Layout/sheet names
+_LAYOUT_ORIGINAL = "01_ORIGINAL_PLAN"
+_LAYOUT_FIRE = "02_FIRE_ALARM_PLAN"
+_LAYOUT_SPRINKLER = "03_SPRINKLER_PLAN"
+
+# Sheet dimensions (A1 landscape, mm)
+_PAGE_W = 841.0
+_PAGE_H = 594.0
+_OUTER_MARGIN = 12.0
+_INNER_MARGIN = 24.0
+
+_LAYER_BORDER = "SHEET_BORDER"
+_LAYER_TITLE = "SHEET_TITLE"
+
+# Layers grouped by system
+_FIRE_LAYERS = [DXF_LAYER_SMOKE, DXF_LAYER_PANEL, DXF_LAYER_HOOTER, DXF_LAYER_MCB]
+_SPRINKLER_LAYERS = [DXF_LAYER_SPRINKLER, DXF_LAYER_PIPES, DXF_LAYER_SOURCE]
+_ALL_AI_LAYERS = _FIRE_LAYERS + _SPRINKLER_LAYERS + [DXF_LAYER_LEGEND]
+
+
+def _read_dxf_safe(path: str):
+    try:
+        return ezdxf.readfile(path)
+    except Exception:
+        doc, _ = recover.readfile(path)
+        return doc
+
+
+def _modelspace_extents(doc):
+    """Return (min_x, min_y, max_x, max_y) from modelspace or header."""
+    from ezdxf import bbox as _bbox
+
+    msp = doc.modelspace()
+    try:
+        ext = _bbox.extents(msp)
+        if ext is not None and ext.has_data:
+            return (float(ext.extmin.x), float(ext.extmin.y),
+                    float(ext.extmax.x), float(ext.extmax.y))
+    except Exception:
+        pass
+    try:
+        mn = doc.header.get("$EXTMIN", (0, 0, 0))
+        mx = doc.header.get("$EXTMAX", (1, 1, 0))
+        if float(mx[0]) > float(mn[0]) and float(mx[1]) > float(mn[1]):
+            return (float(mn[0]), float(mn[1]), float(mx[0]), float(mx[1]))
+    except Exception:
+        pass
+    raise RuntimeError("Cannot determine modelspace extents")
+
+
+def _add_sheet_frame(psp, title: str, subtitle: str):
+    """Draw outer/inner borders and title text on a paperspace layout."""
+    W, H = _PAGE_W, _PAGE_H
+    OM, IM = _OUTER_MARGIN, _INNER_MARGIN
+    attr = {"layer": _LAYER_BORDER}
+
+    psp.add_lwpolyline(
+        [(OM, OM), (W - OM, OM), (W - OM, H - OM), (OM, H - OM), (OM, OM)],
+        dxfattribs=attr,
+    )
+    psp.add_lwpolyline(
+        [(IM, IM), (W - IM, IM), (W - IM, H - IM), (IM, H - IM), (IM, IM)],
+        dxfattribs=attr,
+    )
+
+    title_x, title_y = IM, H - 20.0
+    try:
+        psp.add_text(title, dxfattribs={"layer": _LAYER_TITLE, "height": 8.0}).set_placement(
+            (title_x, title_y)
+        )
+    except Exception:
+        psp.add_text(title, dxfattribs={"layer": _LAYER_TITLE, "height": 8.0, "insert": (title_x, title_y)})
+    try:
+        psp.add_text(subtitle, dxfattribs={"layer": _LAYER_TITLE, "height": 4.0}).set_placement(
+            (title_x, title_y - 8.0)
+        )
+    except Exception:
+        psp.add_text(subtitle, dxfattribs={"layer": _LAYER_TITLE, "height": 4.0, "insert": (title_x, title_y - 8.0)})
+
+
+def _add_viewport_with_frozen_layers(psp, doc, extents, freeze_layer_names):
+    """Add a viewport centered in the drawable area, freezing specified layers."""
+    min_x, min_y, max_x, max_y = extents
+    view_cx = (min_x + max_x) / 2.0
+    view_cy = (min_y + max_y) / 2.0
+    view_w = max(max_x - min_x, 1.0)
+    view_h = max(max_y - min_y, 1.0)
+
+    # Drawable area on the paper (inside inner border)
+    draw_x0 = _INNER_MARGIN
+    draw_y0 = 28.0
+    draw_x1 = _PAGE_W - _INNER_MARGIN
+    draw_y1 = _PAGE_H - 46.0
+    draw_w = draw_x1 - draw_x0
+    draw_h = draw_y1 - draw_y0
+
+    # Viewport center on paper
+    vp_cx = (draw_x0 + draw_x1) / 2.0
+    vp_cy = (draw_y0 + draw_y1) / 2.0
+
+    # Scale view_height so drawing fits the viewport with a small margin.
+    # The viewport's aspect ratio determines what view_width is used.
+    paper_aspect = draw_w / draw_h
+    model_aspect = view_w / view_h
+    if model_aspect > paper_aspect:
+        # Drawing is wider than viewport → height must be increased
+        effective_view_h = view_w / paper_aspect
+    else:
+        effective_view_h = view_h
+    effective_view_h *= 1.04  # small padding
+
+    vp = psp.add_viewport(
+        center=(vp_cx, vp_cy),
+        size=(draw_w, draw_h),
+        view_center_point=(view_cx, view_cy),
+        view_height=effective_view_h,
+        status=1,  # 1 = on / active
+    )
+
+    for layer_name in freeze_layer_names:
+        if layer_name in doc.layers:
+            vp.freeze(layer_name)
+
+    return vp
+
+
+def write_combined_sheets_dxf(
+    base_dxf: str,
+    out_combined_dxf: str,
+    detectors: list[dict],
+    sprinkler_pipes: list | None = None,
+    sprinkler_sources: list | None = None,
+    world_to_m: float = 0.001,
+    world_bbox: dict | None = None,
+):
+    """Create a combined DXF with 3 layout sheets using viewports.
+
+    Everything lives in Model (floor plan + all overlays).
+    Each layout tab is a viewport into Model with per-viewport layer
+    freezes so only the relevant system is visible:
+
+      - Model              – floor plan + fire alarm + sprinkler (all visible)
+      - 01_ORIGINAL_PLAN   – viewport: all AI layers frozen (clean plan)
+      - 02_FIRE_ALARM_PLAN – viewport: sprinkler layers frozen
+      - 03_SPRINKLER_PLAN  – viewport: fire alarm layers frozen
+
+    Changes to Model are automatically reflected in all layout viewports.
+    """
+    import os, shutil, tempfile
+
+    sprinkler_pipes = sprinkler_pipes or []
+    sprinkler_sources = sprinkler_sources or []
+
+    # ── Build a single DXF with everything in modelspace ──
+    tmpdir = tempfile.mkdtemp(prefix="firecad_combined_")
+    try:
+        tmp_dxf = os.path.join(tmpdir, "all_overlay.dxf")
+        shutil.copy2(base_dxf, tmp_dxf)
+
+        # Add all detector symbols (smoke, panel, hooter, mcp, sprinkler)
+        sym_r, txt_h = compute_symbol_sizes(world_to_m, detectors, world_bbox)
+        write_detectors_to_dxf(
+            tmp_dxf, tmp_dxf, detectors,
+            world_to_m=world_to_m, world_bbox=world_bbox,
+            symbol_radius_world=sym_r, text_height_world=txt_h,
+        )
+
+        # Add sprinkler pipes + sources
+        sprinkler_dets = [d for d in detectors
+                          if _normalize_dtype(d.get("dtype", "smoke")) == "sprinkler"]
+        if sprinkler_dets or sprinkler_pipes:
+            from app.pipeline.sprinkler_routing import write_sprinklers_to_dxf
+            write_sprinklers_to_dxf(
+                tmp_dxf, tmp_dxf,
+                [(float(d["x"]), float(d["y"])) for d in sprinkler_dets],
+                sprinkler_pipes, sprinkler_sources,
+                world_to_m=world_to_m, world_bbox=world_bbox,
+                symbol_radius_world=sym_r, text_height_world=txt_h,
+            )
+
+        # ── Open the fully-populated DXF and add layout tabs ──
+        doc = _read_dxf_safe(tmp_dxf)
+        extents = _modelspace_extents(doc)
+
+        # Ensure border/title layers
+        for lyr in [_LAYER_BORDER, _LAYER_TITLE]:
+            if lyr not in doc.layers:
+                doc.layers.new(lyr, dxfattribs={"color": 7})
+
+        # Create 3 layout tabs (Layout1 stays as-is)
+        psp_original = doc.layouts.new(_LAYOUT_ORIGINAL)
+        psp_fire = doc.layouts.new(_LAYOUT_FIRE)
+        psp_sprinkler = doc.layouts.new(_LAYOUT_SPRINKLER)
+
+        # Page setup
+        for psp in [psp_original, psp_fire, psp_sprinkler]:
+            try:
+                psp.page_setup(
+                    size=(_PAGE_W, _PAGE_H), margins=(0, 0, 0, 0), units="mm",
+                )
+            except Exception:
+                pass
+
+        # ── Populate each sheet ──
+        sheets = [
+            (psp_original, "ORIGINAL FLOOR PLAN",
+             os.path.basename(base_dxf), _ALL_AI_LAYERS),
+            (psp_fire, "FIRE ALARM PLAN",
+             "Smoke Detectors, MCP, Hooter, FACP", _SPRINKLER_LAYERS),
+            (psp_sprinkler, "SPRINKLER PLAN",
+             "Sprinklers, Pipes & Sources", _FIRE_LAYERS),
+        ]
+
+        for psp, title, subtitle, freeze_layers in sheets:
+            _add_sheet_frame(psp, title, subtitle)
+            _add_viewport_with_frozen_layers(psp, doc, extents, freeze_layers)
+
+        # Make first layout active on open
+        try:
+            doc.layouts.set_active_layout(_LAYOUT_ORIGINAL)
+        except Exception:
+            pass
+        try:
+            doc.header["$CTAB"] = _LAYOUT_ORIGINAL
+            doc.header["$TILEMODE"] = 0
+        except Exception:
+            pass
+
+        doc.saveas(out_combined_dxf)
+
+        logger.info(
+            "write_combined_sheets_dxf saved=%s layouts=%s extents=%s",
+            out_combined_dxf, doc.layout_names(), extents,
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
