@@ -18,7 +18,7 @@ from app.pipeline.gemini_mask import generate_mask_image
 from app.pipeline.mask_align import align_perfect_tight_box
 from app.pipeline.wall_fix import fix_walls
 from app.pipeline.rooms_from_image import extract_rooms
-from app.pipeline.dxf_export import write_detectors_to_dxf
+from app.pipeline.dxf_export import write_detectors_to_dxf, write_combined_sheets_dxf
 from app.pipeline.place_detectors_advanced import place_detectors_from_rooms_json
 from app.pipeline.dxf_text_filter import filter_rooms_by_dxf_text
 from app.pipeline.sprinkler_routing import (
@@ -534,7 +534,19 @@ def _run_post_room_review_steps(
             world_to_m=opts.world_to_m,
             world_bbox=combined_bbox,
         )
-    stage_done("export_dxf", stage_ts, out_dxf=out_dxf)
+
+    # Combined multi-sheet DXF (separate tabs for fire alarm vs sprinkler)
+    out_combined = os.path.join(pdir, "detectors_combined_sheets.dxf")
+    write_combined_sheets_dxf(
+        base_dxf=dxf_path,
+        out_combined_dxf=out_combined,
+        detectors=combined_dets,
+        sprinkler_pipes=all_sprinkler_pipes,
+        sprinkler_sources=[(s[0], s[1]) for s in all_sprinkler_sources] if all_sprinkler_sources else [],
+        world_to_m=opts.world_to_m,
+        world_bbox=combined_bbox,
+    )
+    stage_done("export_dxf", stage_ts, out_dxf=out_dxf, out_combined=out_combined)
 
     # 10) Render output preview PNG
     stage_ts = time.perf_counter()
@@ -559,7 +571,7 @@ def _run_post_room_review_steps(
     with db() as con:
         _set_project(con, project_id,
                      status="ready",
-                     output_dxf_path=out_dxf,
+                     output_dxf_path=out_combined,
                      output_preview_png_path=out_png,
                      error=None)
 
