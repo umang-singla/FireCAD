@@ -18,6 +18,12 @@ from shapely.affinity import rotate
 from shapely.ops import split, unary_union
 
 try:
+    from pydantic import BaseModel as _BaseModel
+    _PYDANTIC_OK = True
+except ImportError:
+    _PYDANTIC_OK = False
+
+try:
     import networkx as nx
     _NX_OK = True
 except ImportError:
@@ -25,12 +31,16 @@ except ImportError:
 
 try:
     import ezdxf
+    from ezdxf import bbox as _ezbbox
+    from ezdxf import recover as _ezdxf_recover
+    from ezdxf.addons import MTextExplode as _MTextExplode
     _EZDXF_OK = True
 except ImportError:
     _EZDXF_OK = False
 
 try:
     from google import genai
+    from google.genai import types as _genai_types
     _GENAI_OK = True
 except ImportError:
     _GENAI_OK = False
@@ -53,21 +63,49 @@ HAZARD_LH = "LH"
 HAZARD_OH = "OH"
 HAZARD_HH = "HH"
 HAZARD_WASHROOM = "WASHROOM"
+HAZARD_NONE = "NONE"
 
-# Deterministic room classification patterns (kept local/offline).
-_HH_KEYWORDS = {
-    "BOILER", "DG", "GENERATOR", "TURBINE", "FURNACE", "OVEN", "KILN",
-    "CHEMICAL", "PAINT", "FLAMMABLE", "BATTERY",
+# Deterministic room classification patterns – rule-ID based with priorities.
+DETERMINISTIC_RULES = {
+    "GENERIC_NORMAL_ROOM": {"interpreted_room": "Generic Room", "phrases": ["OFFICE", "CABIN", "MEETING ROOM", "CONFERENCE ROOM", "RECEPTION", "HALL", "BEDROOM", "STORE", "ROOM"], "keywords": ["OFFICE", "CABIN", "MEETING", "CONFERENCE", "ROOM"], "priority": 5},
+    "PLANT_AREA": {"interpreted_room": "Plant Area", "phrases": ["PLANT ROOM", "MECHANICAL PLANT", "MACHINE ROOM"], "keywords": ["PLANT", "MECHANICAL", "MACHINE"], "priority": 25},
+    "GARAGE_REPAIR": {"interpreted_room": "Garage/Repair", "phrases": ["GARAGE", "REPAIR SHOP", "WORKSHOP"], "keywords": ["GARAGE", "WORKSHOP"], "priority": 40},
+    "STORE_FLAMMABLE_CONFINED": {"interpreted_room": "Flammable Store", "phrases": ["CHEMICAL STORE", "PAINT STORE", "FLAMMABLE STORE"], "keywords": ["CHEMICAL", "PAINT", "FLAMMABLE"], "priority": 42},
+    "COMPUTER_EDP_ROOM": {"interpreted_room": "IT Room", "phrases": ["COMPUTER ROOM", "EDP ROOM", "IT ROOM", "DATA ROOM"], "keywords": ["COMPUTER", "EDP", "IT", "DATA"], "priority": 48},
+    "ESCAPE_ROUTE": {"interpreted_room": "Escape Route", "phrases": ["ESCAPE ROUTE", "CORRIDOR", "PASSAGE", "LOBBY"], "keywords": ["ESCAPE", "CORRIDOR", "PASSAGE", "LOBBY"], "priority": 50},
+    "WASHROOM_TOILET_WC": {"interpreted_room": "Washroom", "phrases": ["WASHROOM", "TOILET", "WC", "RESTROOM", "BATHROOM"], "keywords": ["WASHROOM", "TOILET", "WC", "RESTROOM", "BATHROOM"], "priority": 53},
+    "BOILER_GENERATOR_TURBINE_FURNACE": {"interpreted_room": "Heavy Mech/Generator", "phrases": ["BOILER ROOM", "DG ROOM", "GENERATOR", "OVEN"], "keywords": ["BOILER", "DG", "GENERATOR", "OVEN", "TURBINE", "FURNACE", "KILN"], "priority": 54},
+    "KITCHEN_PANTRY": {"interpreted_room": "Kitchen/Pantry", "phrases": ["KITCHEN", "PANTRY", "FOOD PREP"], "keywords": ["KITCHEN", "PANTRY"], "priority": 55},
+    "DEDICATED_ELECTRICAL_ROOM": {"interpreted_room": "Electrical Room", "phrases": ["ELECTRICAL ROOM", "PANEL ROOM", "SWITCH ROOM", "TRANSFORMER ROOM"], "keywords": ["ELECTRICAL", "PANEL", "SWITCHGEAR", "TRANSFORMER", "ELEC", "ELECT", "UPS", "BATTERY"], "priority": 999},
 }
-_OH_KEYWORDS = {
-    "KITCHEN", "PANTRY", "GARAGE", "WORKSHOP", "REPAIR", "PLANT", "MECHANICAL",
-    "MACHINE", "SERVICE",
+
+DIRECT_ALIASES = {
+    "KITCHEN": "KITCHEN_PANTRY", "PANTRY": "KITCHEN_PANTRY",
+    "TOILET": "WASHROOM_TOILET_WC", "WC": "WASHROOM_TOILET_WC",
+    "WASHROOM": "WASHROOM_TOILET_WC", "RESTROOM": "WASHROOM_TOILET_WC",
+    "ELECTRICAL ROOM": "DEDICATED_ELECTRICAL_ROOM",
+    "PANEL ROOM": "DEDICATED_ELECTRICAL_ROOM",
 }
-_WASHROOM_KEYWORDS = {
-    "WASHROOM", "TOILET", "WC", "RESTROOM", "BATHROOM",
+
+GENERIC_EXCLUSION_HINTS = {
+    "KITCHEN", "PANTRY", "TOILET", "WC", "WASHROOM", "RESTROOM",
+    "ELECTRICAL", "PANEL", "PLANT", "MECHANICAL", "GENERATOR",
+    "DG", "BOILER", "BATTERY", "UPS",
 }
-_SKIP_KEYWORDS = {
-    "ELECTRICAL", "PANEL", "SWITCHGEAR", "TRANSFORMER", "ELEC", "ELECT",
+
+# Mapping from rule-ID to hazard type.
+_RULE_ID_TO_HAZARD = {
+    "DEDICATED_ELECTRICAL_ROOM": HAZARD_NONE,
+    "BOILER_GENERATOR_TURBINE_FURNACE": HAZARD_HH,
+    "STORE_FLAMMABLE_CONFINED": HAZARD_HH,
+    "KITCHEN_PANTRY": HAZARD_OH,
+    "GARAGE_REPAIR": HAZARD_OH,
+    "PLANT_AREA": HAZARD_OH,
+    "WASHROOM_TOILET_WC": HAZARD_WASHROOM,
+    "GENERIC_NORMAL_ROOM": HAZARD_LH,
+    "COMPUTER_EDP_ROOM": HAZARD_LH,
+    "ESCAPE_ROUTE": HAZARD_LH,
+    "MANUAL_REVIEW": HAZARD_LH,
 }
 
 # Rule-based sprinkler geometry constraints by hazard type.
@@ -77,8 +115,42 @@ _HAZARD_PARAMS = {
     HAZARD_LH: {"max_area": 21.0, "max_spacing": 4.5, "min_spacing": 1.8, "max_wall": 2.25},
 }
 
-_VALID_GEMINI_HAZARDS = {HAZARD_LH, HAZARD_OH, HAZARD_HH, HAZARD_WASHROOM, "IGNORE", "MANUAL_REVIEW"}
+_VALID_RULE_IDS = list(DETERMINISTIC_RULES.keys()) + ["MANUAL_REVIEW"]
+_RULE_CATALOG_FOR_LLM = [
+    {"rule_id": k, "interpreted_room": v["interpreted_room"], "sample_labels": v["phrases"][:3]}
+    for k, v in DETERMINISTIC_RULES.items()
+]
 _GEMINI_LABEL_CACHE: Dict[str, str] = {}
+
+_FIRE_SAFETY_RULES = """
+Here is the comprehensive list of exact text labels for rooms, occupancies, and areas categorized by the placement rules for sprinklers and piping.
+
+1. Heat Detectors CANNOT be placed / Smoke Detectors CAN be placed
+Escape Routes, Circulation Areas, Computer / EDP Centres, Electronic Equipment Rooms, Slow-burning / Air-conditioned premises, Archives, High-value Libraries.
+
+2. Heat Detectors CAN be placed / Smoke Detectors CANNOT or are UNSUITABLE
+Kitchens, Pantries, Boiler Rooms, DG (Diesel Generator) Sets, Generator Enclosures, Turbine Enclosures, Oven and Furnace Areas, Garages, Repair Shops, Battery Rooms, Store Areas.
+
+3. Sprinklers SHOULD NOT be placed (Obligatory Exceptions - Strictly Prohibited)
+Dedicated Electrical Equipment Rooms (Only if dry-type equipment, 120-min fire-rated enclosure, cable coated, and zero storage).
+
+4. Sprinklers Optional (Optional Exceptions - Can be omitted)
+Stairs (if fire separated), Spaces below stair headings, Lift Wells (if fire separated), Washrooms, Toilets, and WCs (Area less than 5 m²).
+"""
+
+_GEMINI_SYSTEM_PROMPT = f"""
+You are an expert MEP and Fire Safety Engineer AI.
+Your task is NOT to invent new fire-safety categories. Map EACH CAD label to EXACTLY ONE fixed rule_id.
+
+Important rules:
+1. Expand abbreviations where reasonable.
+2. If the label is dimension text, coordinates, sheet references, or you are unsure of the abbreviation, return "MANUAL_REVIEW".
+3. If the label is an ordinary room and does not clearly fall into an exception, return "GENERIC_NORMAL_ROOM".
+4. Return exactly one item for every input label in the same order.
+
+Rulebook:
+{_FIRE_SAFETY_RULES}
+"""
 
 # DXF layers
 DXF_LAYER_SPRINKLER = "AI_FIRE_SPRINKLERS"
@@ -121,25 +193,327 @@ def _merge_room_label_text(room: Dict) -> str:
     return " ".join(_normalize_label_for_match(c) for c in candidates if c).strip()
 
 
-def _deterministic_hazard_from_label(merged_label: str) -> str | None:
-    if not merged_label:
+def _deterministic_classify_rule_id(raw_label: str) -> str | None:
+    """Classify a room label to a rule ID using deterministic rules with priorities.
+
+    Scans ALL rules and picks the highest-priority match so that specific
+    categories (e.g. BOILER_GENERATOR at priority 54) always win over
+    GENERIC_NORMAL_ROOM (priority 5).
+
+    Returns the rule ID (e.g. 'KITCHEN_PANTRY'), 'MANUAL_REVIEW' for
+    dimension-like text, or ``None`` if genuinely unknown.
+    """
+    norm = _normalize_label_for_match(raw_label)
+    if not norm:
         return None
 
-    words = set(merged_label.split())
+    # Pure numeric / dimension text → manual review
+    if re.fullmatch(r"^[\d\s\.\-Xx]+$", norm):
+        return "MANUAL_REVIEW"
 
-    # Dedicated electrical rooms: skip sprinkler placement entirely.
-    if words & _SKIP_KEYWORDS:
-        return "IGNORE"
-    if words & _WASHROOM_KEYWORDS:
-        return HAZARD_WASHROOM
-    if words & _HH_KEYWORDS:
-        return HAZARD_HH
-    if words & _OH_KEYWORDS:
-        return HAZARD_OH
-    # Ordinary office/meeting/etc. usually contains ROOM and should be LH.
-    if "ROOM" in words:
-        return HAZARD_LH
+    # Direct alias match
+    if norm in DIRECT_ALIASES:
+        return DIRECT_ALIASES[norm]
+
+    # Scan ALL rules, collect every match, pick highest priority.
+    words = set(norm.split())
+    best_rule: str | None = None
+    best_priority = -1
+
+    for r_id, r_data in DETERMINISTIC_RULES.items():
+        matched = False
+        if norm in r_data["phrases"] or norm in r_data["keywords"]:
+            matched = True
+        else:
+            for kw in r_data["keywords"]:
+                if kw in words:
+                    matched = True
+                    break
+        if matched and r_data["priority"] > best_priority:
+            best_priority = r_data["priority"]
+            best_rule = r_id
+
+    if best_rule is not None:
+        return best_rule
+
+    # Fallback: if it contains "ROOM" and no exclusion hints, treat as generic
+    if "ROOM" in words and not (words & GENERIC_EXCLUSION_HINTS):
+        return "GENERIC_NORMAL_ROOM"
+
     return None
+
+
+def _rule_id_to_hazard(rule_id: str) -> str:
+    """Map a rule-ID (or MANUAL_REVIEW) to a hazard type string."""
+    return _RULE_ID_TO_HAZARD.get(rule_id, HAZARD_LH)
+
+
+# ──────────────────────────────────────────────────────────────────
+# DXF text extraction & spatial room assignment
+# ──────────────────────────────────────────────────────────────────
+def _text_cleanup(text: str) -> str:
+    text = str(text).replace("\n", " ").replace("\r", " ").replace("\\P", " ").strip()
+    return " ".join(text.split())
+
+
+def _bbox_to_dict(bb) -> dict | None:
+    if bb is None or not getattr(bb, "has_data", False):
+        return None
+    return {
+        "xmin": float(bb.extmin.x), "ymin": float(bb.extmin.y),
+        "xmax": float(bb.extmax.x), "ymax": float(bb.extmax.y),
+    }
+
+
+def _center_of_bbox(b: dict) -> Tuple[float, float]:
+    return (b["xmin"] + b["xmax"]) / 2.0, (b["ymin"] + b["ymax"]) / 2.0
+
+
+def extract_text_lines_world(dxf_path: str) -> List[Dict]:
+    """Extract all text entities from DXF with world coordinates.
+
+    Uses MTextExplode to convert MTEXT → TEXT, collects bbox-based centres,
+    and clusters nearby text fragments into label groups.
+
+    Returns list of ``{"label": str, "x": float, "y": float}`` dicts.
+    """
+    if not _EZDXF_OK or not os.path.exists(dxf_path):
+        return []
+
+    try:
+        doc, _ = _ezdxf_recover.readfile(dxf_path)
+    except Exception as e:
+        logger.warning("extract_text_lines_world: could not read %s: %s", dxf_path, e)
+        return []
+
+    msp = doc.modelspace()
+
+    # Explode MTEXT into simple TEXT entities for reliable bbox calculation.
+    mtexts = list(msp.query("MTEXT"))
+    if mtexts:
+        try:
+            with _MTextExplode(msp) as xpl:
+                for mt in mtexts:
+                    try:
+                        xpl.explode(mt, destroy=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    raw_items: list = []
+
+    def _process(entity, source_type: str = "TEXT"):
+        txt = _text_cleanup(
+            entity.plain_text() if hasattr(entity, "plain_text")
+            else getattr(entity.dxf, "text", "")
+        )
+        if not txt:
+            return
+        try:
+            bb = _ezbbox.extents([entity], fast=False)
+            bd = _bbox_to_dict(bb)
+            if bd is None:
+                return
+            cx, cy = _center_of_bbox(bd)
+            raw_items.append({"text": txt, "cx": cx, "cy": cy})
+        except Exception:
+            pass
+
+    for e in msp.query("TEXT"):
+        _process(e, "TEXT")
+    for e in msp.query("MTEXT"):
+        _process(e, "MTEXT_FALLBACK")
+    for insert in msp.query("INSERT"):
+        try:
+            for vent in insert.virtual_entities():
+                if vent.dxftype() in ("TEXT", "MTEXT"):
+                    _process(vent, "BLOCK_TEXT")
+        except Exception:
+            pass
+
+    if not raw_items:
+        return []
+
+    # Sort top-to-bottom, left-to-right and cluster nearby fragments.
+    raw_items.sort(key=lambda e: (-e["cy"], e["cx"]))
+    max_dist = 1500  # world units (mm typically) – cluster radius
+    clustered: List[Dict] = []
+    current: list = [raw_items[0]]
+
+    for item in raw_items[1:]:
+        last = current[-1]
+        if math.hypot(item["cx"] - last["cx"], item["cy"] - last["cy"]) < max_dist:
+            current.append(item)
+        else:
+            clustered.append({
+                "label": " ".join(e["text"] for e in current),
+                "x": sum(e["cx"] for e in current) / len(current),
+                "y": sum(e["cy"] for e in current) / len(current),
+            })
+            current = [item]
+
+    clustered.append({
+        "label": " ".join(e["text"] for e in current),
+        "x": sum(e["cx"] for e in current) / len(current),
+        "y": sum(e["cy"] for e in current) / len(current),
+    })
+
+    logger.info("extract_text_lines_world: %d text clusters from %s", len(clustered), dxf_path)
+    return clustered
+
+
+def _assign_dxf_text_to_rooms(
+    rooms: List[Dict],
+    dxf_text_clusters: List[Dict],
+    proximity_threshold: float = 1500.0,
+) -> List[List[Dict]]:
+    """Spatially assign DXF text clusters to room polygons.
+
+    Two-pass: first containment, then nearest-proximity fallback within
+    *proximity_threshold* world units.
+
+    Returns a list parallel to *rooms* where each element is a list of
+    matched text clusters.
+    """
+    room_polys: List[Polygon | None] = []
+    for room in rooms:
+        poly = _parse_polygon(room.get("polygon_world"))
+        room_polys.append(poly)
+
+    assigned: List[List[Dict]] = [[] for _ in rooms]
+
+    # Track which clusters got assigned via containment.
+    cluster_assigned = [False] * len(dxf_text_clusters)
+
+    # Pass 1: strict containment
+    for ci, cluster in enumerate(dxf_text_clusters):
+        pt = Point(cluster["x"], cluster["y"])
+        for ri, poly in enumerate(room_polys):
+            if poly is not None and poly.contains(pt):
+                assigned[ri].append(cluster)
+                cluster_assigned[ci] = True
+                break
+
+    # Pass 2: proximity fallback for unassigned clusters
+    for ci, cluster in enumerate(dxf_text_clusters):
+        if cluster_assigned[ci]:
+            continue
+        pt = Point(cluster["x"], cluster["y"])
+        best_dist = proximity_threshold
+        best_ri = -1
+        for ri, poly in enumerate(room_polys):
+            if poly is None:
+                continue
+            dist = poly.distance(pt)
+            if dist < best_dist:
+                best_dist = dist
+                best_ri = ri
+        if best_ri >= 0:
+            assigned[best_ri].append(cluster)
+
+    return assigned
+
+
+def _classify_room_hazards_with_dxf_text(
+    rooms: List[Dict],
+    dxf_path: str | None = None,
+) -> List[str]:
+    """Classify rooms using DXF text extraction + spatial assignment + priority rules.
+
+    1. Extract all text from DXF (MTEXT exploded → TEXT → bbox centres).
+    2. Spatially assign text clusters to room polygons (containment then proximity).
+    3. For each room, classify ALL assigned text clusters via deterministic rules.
+    4. Pick the *highest-priority* rule-ID across all clusters for that room.
+    5. Gemini fallback for genuinely unknown labels only.
+    6. Map final rule-ID → hazard type.
+    """
+    n = len(rooms)
+    hazards: List[str] = [HAZARD_LH] * n
+
+    # Step 1: Extract DXF text
+    dxf_text_clusters: List[Dict] = []
+    if dxf_path and os.path.exists(dxf_path):
+        dxf_text_clusters = extract_text_lines_world(dxf_path)
+
+    if dxf_text_clusters:
+        # Step 2: Spatial assignment
+        room_text = _assign_dxf_text_to_rooms(rooms, dxf_text_clusters)
+
+        unknown_labels: List[str] = []
+        unknown_indices: List[int] = []
+
+        for i in range(n):
+            # Combine room's own labels AND DXF text assigned to it.
+            merged_own = _merge_room_label_text(rooms[i])
+            all_labels = [merged_own] if merged_own else []
+            for cluster in room_text[i]:
+                norm = _normalize_label_for_match(cluster["label"])
+                if norm:
+                    all_labels.append(norm)
+
+            if not all_labels:
+                hazards[i] = HAZARD_LH
+                continue
+
+            # Step 3-4: Classify each label, pick highest priority.
+            best_rule_id: str | None = None
+            best_priority = -1
+            has_unknown = False
+
+            for label in all_labels:
+                rule_id = _deterministic_classify_rule_id(label)
+                if rule_id is not None:
+                    priority = DETERMINISTIC_RULES.get(rule_id, {}).get("priority", 10)
+                    if priority > best_priority:
+                        best_priority = priority
+                        best_rule_id = rule_id
+                else:
+                    # Check cache
+                    cached = _GEMINI_LABEL_CACHE.get(label)
+                    if cached:
+                        # cached is a hazard, convert back to check priority
+                        hazards[i] = cached
+                    else:
+                        has_unknown = True
+
+            if best_rule_id is not None:
+                hazards[i] = _rule_id_to_hazard(best_rule_id)
+                logger.debug(
+                    "Room %d classified as %s (rule=%s) from labels: %s",
+                    i, hazards[i], best_rule_id,
+                    "; ".join(all_labels[:3]),
+                )
+            elif has_unknown:
+                # Collect for Gemini batch
+                combined = " ".join(all_labels)
+                unknown_labels.append(combined)
+                unknown_indices.append(i)
+
+        # Step 5: Gemini fallback
+        if unknown_labels:
+            gemini_map = _classify_unknown_labels_with_gemini(sorted(set(unknown_labels)))
+            for idx in unknown_indices:
+                merged_own = _merge_room_label_text(rooms[idx])
+                all_labels = [merged_own] if merged_own else []
+                for cluster in room_text[idx]:
+                    norm = _normalize_label_for_match(cluster["label"])
+                    if norm:
+                        all_labels.append(norm)
+                combined = " ".join(all_labels)
+                gem_rule = gemini_map.get(combined)
+                if gem_rule:
+                    hazard = _rule_id_to_hazard(gem_rule)
+                    hazards[idx] = hazard
+                    _GEMINI_LABEL_CACHE[combined] = hazard
+                else:
+                    hazards[idx] = HAZARD_LH
+                    _GEMINI_LABEL_CACHE[combined] = HAZARD_LH
+    else:
+        # No DXF text available — fall back to room dict labels only.
+        hazards = _classify_room_hazards(rooms)
+
+    return hazards
 
 
 def _gemini_enabled_for_hazards() -> bool:
@@ -150,64 +524,67 @@ def _gemini_enabled_for_hazards() -> bool:
 
 
 def _classify_unknown_labels_with_gemini(labels: List[str]) -> Dict[str, str]:
-    """Classify unknown labels only; returns map normalized_label -> hazard."""
+    """Classify unknown labels via Gemini; returns map label -> rule_id."""
     if not labels or not _gemini_enabled_for_hazards():
-        return {}
+        return {l: "MANUAL_REVIEW" for l in labels}
 
     try:
+        import json as _json
         client = genai.Client(api_key=os.getenv("GEMINI_API_KEY", "").strip())
         model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip() or "gemini-2.5-flash-lite"
 
         payload = {
-            "valid_hazards": ["LH", "OH", "HH", "WASHROOM", "IGNORE", "MANUAL_REVIEW"],
-            "labels": labels,
-            "notes": [
-                "Map each label to exactly one valid_hazard.",
-                "Use IGNORE for non-room text.",
-                "Use MANUAL_REVIEW only if truly ambiguous.",
-            ],
+            "valid_rule_ids": _VALID_RULE_IDS,
+            "rule_catalog": _RULE_CATALOG_FOR_LLM,
+            "labels": [{"original_label": l, "normalized_label": _normalize_label_for_match(l)} for l in labels],
         }
 
-        prompt = (
-            "You are a fire-safety room classifier. Return strict JSON as: "
-            '{"items":[{"label":"...","hazard":"LH|OH|HH|WASHROOM|IGNORE|MANUAL_REVIEW"}]} '
-            "for all labels in input order."
-        )
+        # Build config – use structured schema when pydantic is available.
+        config_kwargs: Dict = {
+            "system_instruction": _GEMINI_SYSTEM_PROMPT,
+            "temperature": 0,
+            "response_mime_type": "application/json",
+        }
+        if _PYDANTIC_OK:
+            class _GeminiLabelDecision(_BaseModel):
+                original_label: str
+                mapped_rule_id: str
+                interpreted_room: str
+
+            class _GeminiBatchDecision(_BaseModel):
+                items: list[_GeminiLabelDecision]
+
+            config_kwargs["response_schema"] = _GeminiBatchDecision
+
+        config = _genai_types.GenerateContentConfig(**config_kwargs)
 
         response = client.models.generate_content(
             model=model,
-            contents=[prompt, str(payload)],
+            contents=_json.dumps(payload),
+            config=config,
         )
+
         raw = (response.text or "").strip()
-        data = None
-        try:
-            data = __import__("json").loads(raw)
-        except Exception:
-            match = re.search(r"\{[\s\S]*\}", raw)
-            if match:
-                data = __import__("json").loads(match.group(0))
+        data = _json.loads(raw)
+        items = data.get("items", []) if isinstance(data, dict) else []
 
         out: Dict[str, str] = {}
-        items = (data or {}).get("items", []) if isinstance(data, dict) else []
         for item in items:
-            label = _normalize_label_for_match(item.get("label", ""))
-            hazard = str(item.get("hazard", "")).upper().strip()
+            label = item.get("original_label", "")
+            rule_id = str(item.get("mapped_rule_id", "MANUAL_REVIEW")).upper().strip()
             if not label:
                 continue
-            if hazard not in _VALID_GEMINI_HAZARDS:
-                continue
-            if hazard in {"IGNORE", "MANUAL_REVIEW"}:
-                out[label] = HAZARD_LH
-            else:
-                out[label] = hazard
+            if rule_id not in _VALID_RULE_IDS:
+                rule_id = "MANUAL_REVIEW"
+            out[label] = rule_id
         return out
     except Exception as e:
-        logger.warning("Gemini hazard classification failed: %s", e)
-        return {}
+        logger.warning("Gemini rule-id classification failed: %s", e)
+        return {l: "MANUAL_REVIEW" for l in labels}
 
 
 def _classify_room_hazards(rooms: List[Dict]) -> List[str]:
-    """Deterministic first, optional Gemini fallback for unknown labels only."""
+    """Deterministic rule-ID classification first, optional Gemini fallback."""
     hazards: List[str] = [HAZARD_LH] * len(rooms)
     unknown_labels: List[str] = []
     unknown_indices: List[int] = []
@@ -218,9 +595,9 @@ def _classify_room_hazards(rooms: List[Dict]) -> List[str]:
             hazards[i] = HAZARD_LH
             continue
 
-        det = _deterministic_hazard_from_label(merged)
-        if det is not None:
-            hazards[i] = det
+        rule_id = _deterministic_classify_rule_id(merged)
+        if rule_id is not None:
+            hazards[i] = _rule_id_to_hazard(rule_id)
             continue
 
         cached = _GEMINI_LABEL_CACHE.get(merged)
@@ -235,10 +612,11 @@ def _classify_room_hazards(rooms: List[Dict]) -> List[str]:
 
     for idx in unknown_indices:
         merged = _merge_room_label_text(rooms[idx])
-        gem = gemini_map.get(merged)
-        if gem:
-            hazards[idx] = gem
-            _GEMINI_LABEL_CACHE[merged] = gem
+        gem_rule = gemini_map.get(merged)
+        if gem_rule:
+            hazard = _rule_id_to_hazard(gem_rule)
+            hazards[idx] = hazard
+            _GEMINI_LABEL_CACHE[merged] = hazard
         else:
             hazards[idx] = HAZARD_LH
             _GEMINI_LABEL_CACHE[merged] = HAZARD_LH
@@ -514,6 +892,10 @@ def _process_room(room_poly: Polygon, hazard_type: str = HAZARD_LH):
         world_bbox = rotate(local_bbox, angle_deg, origin=(cx, cy))
         bboxes.append(world_bbox)
 
+        # NONE hazard → record region/bbox but place zero sprinklers.
+        if hazard_type == HAZARD_NONE:
+            continue
+
         grid = _get_grid_points(poly, hazard_type=hazard_type)
         if not grid:
             rep = poly.representative_point()
@@ -570,201 +952,277 @@ def _ensure_min_diameter(label: str, min_mm: int) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────
-# Orthogonal pipe routing – data-driven
+# Orthogonal pipe routing – Manhattan header + branches
 # ──────────────────────────────────────────────────────────────────
-def _get_data_driven_lines(coords: List[float], min_spacing_m: float = 2.0) -> List[float]:
-    """Cluster nearby coordinate values and merge those closer than *min_spacing_m*."""
+def _get_merged_lines(coords: List[float], merge_dist_m: float = 0.5) -> List[float]:
+    """Gap-based 1-D clustering for coordinate grouping.
+
+    Consecutive *sorted* values within *merge_dist_m* of their predecessor
+    belong to the same cluster.  Returns the mean of each cluster.  The
+    default tolerance (0.5 m) merges sprinklers in the same row/column
+    without chaining separate rows together.
+    """
     if not coords:
         return []
-    min_spacing = min_spacing_m / WORLD_TO_M
-    tolerance = 0.1 / WORLD_TO_M
-    sorted_coords = sorted(coords)
-
-    clusters: list = []
-    current_cluster = [sorted_coords[0]]
-    for val in sorted_coords[1:]:
-        if val - current_cluster[0] <= tolerance:
-            current_cluster.append(val)
+    gap = merge_dist_m / WORLD_TO_M
+    sc = sorted(coords)
+    groups: list = [[sc[0]]]
+    for v in sc[1:]:
+        if v - groups[-1][-1] <= gap:
+            groups[-1].append(v)
         else:
-            avg_val = sum(current_cluster) / len(current_cluster)
-            clusters.append({"val": avg_val, "weight": len(current_cluster)})
-            current_cluster = [val]
-    clusters.append({"val": sum(current_cluster) / len(current_cluster), "weight": len(current_cluster)})
-
-    # Iteratively merge clusters that are too close together.
-    while True:
-        min_dist = float("inf")
-        merge_idx = -1
-        for i in range(len(clusters) - 1):
-            dist = clusters[i + 1]["val"] - clusters[i]["val"]
-            if dist < min_dist:
-                min_dist, merge_idx = dist, i
-        if min_dist >= min_spacing or merge_idx == -1:
-            break
-        c1, c2 = clusters[merge_idx], clusters[merge_idx + 1]
-        if c1["weight"] > c2["weight"]:
-            new_val = c1["val"]
-        elif c2["weight"] > c1["weight"]:
-            new_val = c2["val"]
-        else:
-            new_val = (c1["val"] + c2["val"]) / 2.0
-        clusters[merge_idx] = {"val": new_val, "weight": c1["weight"] + c2["weight"]}
-        clusters.pop(merge_idx + 1)
-
-    return [c["val"] for c in clusters]
+            groups.append([v])
+    return [sum(g) / len(g) for g in groups]
 
 
 def route_pipes(
     sprinklers: List[Tuple[float, float]],
     source: Tuple[float, float],
+    branch_spacing: float | None = None,
     valid_regions: List[Polygon] | None = None,
 ) -> Tuple[List[Tuple[Tuple[Tuple[float, float], Tuple[float, float]], str]], List[Tuple[float, float]]]:
-    """Route orthogonal pipes from *source* to each sprinkler.
+    """Orthogonal pipe routing: straight header → straight branches through sprinklers.
 
-    Uses data-driven branch clustering, trunk offset, out-of-bounds pipe
-    clipping with reconnection, arm-pipe tee junctions, and region-aware
-    pipe sizing.
+    Algorithm
+    ---------
+    1. **Header**: one straight horizontal/vertical pipe through the floor
+       plan at the median sprinkler row/column.  Source connects to it via
+       an L-turn.
+    2. **Branches**: perpendicular straight pipes placed at each sprinkler
+       column/row, running directly through the sprinklers.
+    3. **Merge close branches**: if two branch lines are < 1.8 m apart,
+       drop the one with fewer sprinklers and reconnect orphans to the
+       nearest surviving branch.
+    4. **Clip OOB pipes**: remove edges outside the floor plan and reconnect
+       disconnected components via internal L-paths.
+    5. BFS tree, subtree sizing, arm injection, labelling.
 
-    Returns ``(pipe_segments, snapped_sprinklers)`` where each pipe segment is
-    ``((pt1, pt2), diameter_label)``.
+    Returns ``(pipe_segments, snapped_sprinklers)``.
     """
-    if not _NX_OK:
-        raise RuntimeError("networkx is required for pipe routing")
-
     if not sprinklers:
         return [], []
+
+    safe_area = unary_union(valid_regions).buffer(1.0 / WORLD_TO_M) if valid_regions else None
 
     source = (round(source[0], 4), round(source[1], 4))
     original_sprinklers = [(round(s[0], 4), round(s[1], 4)) for s in sprinklers]
     xs = [s[0] for s in original_sprinklers]
     ys = [s[1] for s in original_sprinklers]
-    is_horizontal_trunk = (max(xs) - min(xs)) > (max(ys) - min(ys))
+    is_horizontal_header = (max(xs) - min(xs)) >= (max(ys) - min(ys))
 
-    trunk_offset_world = 1.5 / WORLD_TO_M
+    CLOSE_BRANCH_M = 1.8
+    close_gap = CLOSE_BRANCH_M / WORLD_TO_M
 
-    # ── 1. Build ideal strictly orthogonal layout ─────────────────
     G = nx.Graph()
     G.add_node(source)
     sprinkler_set = set(original_sprinklers)
     for s in original_sprinklers:
         G.add_node(s)
 
-    if is_horizontal_trunk:
-        trunk_y = source[1] + trunk_offset_world
-        branch_xs = _get_data_driven_lines(xs, min_spacing_m=2.0)
-        branch_nodes: Dict = {bx: [(bx, trunk_y)] for bx in branch_xs}
+    # ── 1. GROUP SPRINKLERS INTO LINES (actual positions, not grid) ──
+    # Cluster sprinkler coordinates into rows/columns so branches align
+    # with where sprinklers really are.
 
+    if is_horizontal_header:
+        # Header runs horizontally; branches run vertically at each column.
+        col_xs = _get_merged_lines(xs)     # actual sprinkler column positions
+        row_ys = _get_merged_lines(ys)     # for choosing header Y
+
+        # Assign every sprinkler to its nearest column
+        columns: Dict[float, List[Tuple[float, float]]] = {cx: [] for cx in col_xs}
         for s in original_sprinklers:
-            best_bx = min(branch_xs, key=lambda x: abs(x - s[0]))
-            j_pt = (best_bx, s[1])
-            branch_nodes[best_bx].append(j_pt)
-            if j_pt != s:
-                G.add_edge(j_pt, s)
+            best_cx = min(col_xs, key=lambda c: abs(c - s[0]))
+            columns[best_cx].append(s)
 
-        trunk_nodes_list = [(source[0], trunk_y)]
-        for bx, nodes in branch_nodes.items():
-            nodes = list(set(nodes))
-            trunk_nodes_list.append((bx, trunk_y))
-            nodes_up = sorted([n for n in nodes if n[1] >= trunk_y], key=lambda n: n[1])
-            nodes_down = sorted([n for n in nodes if n[1] <= trunk_y], key=lambda n: n[1], reverse=True)
-            for i in range(len(nodes_up) - 1):
-                G.add_edge(nodes_up[i], nodes_up[i + 1])
-            for i in range(len(nodes_down) - 1):
-                G.add_edge(nodes_down[i], nodes_down[i + 1])
+        # ── 1a. MERGE CLOSE COLUMNS ──
+        col_sorted = sorted(col_xs)
+        i = 0
+        while i < len(col_sorted) - 1:
+            ca, cb = col_sorted[i], col_sorted[i + 1]
+            if cb - ca < close_gap:
+                # keep the column with more sprinklers
+                if len(columns.get(ca, [])) <= len(columns.get(cb, [])):
+                    drop, keep = ca, cb
+                else:
+                    drop, keep = cb, ca
+                # move orphaned sprinklers to the survivor
+                columns.setdefault(keep, []).extend(columns.pop(drop, []))
+                col_sorted.remove(drop)
+                # don't advance i — recheck against next neighbour
+            else:
+                i += 1
+        col_xs = col_sorted
 
-        trunk_nodes_list = sorted(set(trunk_nodes_list), key=lambda n: n[0])
-        for i in range(len(trunk_nodes_list) - 1):
-            G.add_edge(trunk_nodes_list[i], trunk_nodes_list[i + 1])
-        G.add_edge(source, (source[0], trunk_y))
+        # ── 2. HEADER – straight horizontal pipe at median Y ──
+        sorted_rows = sorted(row_ys)
+        n = len(sorted_rows)
+        header_y = sorted_rows[n // 2] if n % 2 == 1 else (sorted_rows[n // 2 - 1] + sorted_rows[n // 2]) / 2.0
+
+        # Header spans from leftmost to rightmost column
+        header_pts = sorted(set([(cx, header_y) for cx in col_xs]), key=lambda p: p[0])
+        for i in range(len(header_pts) - 1):
+            G.add_edge(header_pts[i], header_pts[i + 1])
+
+        # Source → header: L-turn to nearest header junction
+        nearest_hj = min(header_pts, key=lambda h: abs(h[0] - source[0]) + abs(h[1] - source[1]))
+        corner = (source[0], header_y)
+        if source != corner:
+            G.add_edge(source, corner)
+        if corner != nearest_hj:
+            # make sure the source stub also connects into the header line
+            G.add_edge(corner, nearest_hj)
+
+        # ── 3. BRANCHES – straight vertical pipes through sprinklers ──
+        for cx in col_xs:
+            col_sprs = columns.get(cx, [])
+            header_jn = (cx, header_y)
+
+            # All Y values on this branch (header junction + sprinkler junctions)
+            branch_y_vals = [header_y]
+            for s in col_sprs:
+                branch_y_vals.append(s[1])
+            branch_y_vals = sorted(set(branch_y_vals))
+
+            # Straight vertical pipe through all junctions
+            for i in range(len(branch_y_vals) - 1):
+                G.add_edge((cx, branch_y_vals[i]), (cx, branch_y_vals[i + 1]))
+
+            # Short horizontal arms for sprinklers whose X differs from cx
+            for s in col_sprs:
+                pipe_pt = (cx, s[1])
+                if s != pipe_pt:
+                    G.add_edge(pipe_pt, s)
+
     else:
-        trunk_x = source[0] + trunk_offset_world
-        branch_ys = _get_data_driven_lines(ys, min_spacing_m=2.0)
-        branch_nodes = {by: [(trunk_x, by)] for by in branch_ys}
+        # Header runs vertically; branches run horizontally at each row.
+        row_ys = _get_merged_lines(ys)
+        col_xs = _get_merged_lines(xs)
 
+        rows: Dict[float, List[Tuple[float, float]]] = {ry: [] for ry in row_ys}
         for s in original_sprinklers:
-            best_by = min(branch_ys, key=lambda y: abs(y - s[1]))
-            j_pt = (s[0], best_by)
-            branch_nodes[best_by].append(j_pt)
-            if j_pt != s:
-                G.add_edge(j_pt, s)
+            best_ry = min(row_ys, key=lambda r: abs(r - s[1]))
+            rows[best_ry].append(s)
 
-        trunk_nodes_list = [(trunk_x, source[1])]
-        for by, nodes in branch_nodes.items():
-            nodes = list(set(nodes))
-            trunk_nodes_list.append((trunk_x, by))
-            nodes_right = sorted([n for n in nodes if n[0] >= trunk_x], key=lambda n: n[0])
-            nodes_left = sorted([n for n in nodes if n[0] <= trunk_x], key=lambda n: n[0], reverse=True)
-            for i in range(len(nodes_right) - 1):
-                G.add_edge(nodes_right[i], nodes_right[i + 1])
-            for i in range(len(nodes_left) - 1):
-                G.add_edge(nodes_left[i], nodes_left[i + 1])
+        # ── 1a. MERGE CLOSE ROWS ──
+        row_sorted = sorted(row_ys)
+        i = 0
+        while i < len(row_sorted) - 1:
+            ra, rb = row_sorted[i], row_sorted[i + 1]
+            if rb - ra < close_gap:
+                if len(rows.get(ra, [])) <= len(rows.get(rb, [])):
+                    drop, keep = ra, rb
+                else:
+                    drop, keep = rb, ra
+                rows.setdefault(keep, []).extend(rows.pop(drop, []))
+                row_sorted.remove(drop)
+            else:
+                i += 1
+        row_ys = row_sorted
 
-        trunk_nodes_list = sorted(set(trunk_nodes_list), key=lambda n: n[1])
-        for i in range(len(trunk_nodes_list) - 1):
-            G.add_edge(trunk_nodes_list[i], trunk_nodes_list[i + 1])
-        G.add_edge(source, (trunk_x, source[1]))
+        # ── 2. HEADER – straight vertical pipe at median X ──
+        sorted_cols = sorted(col_xs)
+        n = len(sorted_cols)
+        header_x = sorted_cols[n // 2] if n % 2 == 1 else (sorted_cols[n // 2 - 1] + sorted_cols[n // 2]) / 2.0
 
-    # ── 2. Delete out-of-bounds pipes and reconnect ───────────────
-    if valid_regions:
-        footprint = unary_union(valid_regions).buffer(1.2 / WORLD_TO_M)
+        header_pts = sorted(set([(header_x, ry) for ry in row_ys]), key=lambda p: p[1])
+        for i in range(len(header_pts) - 1):
+            G.add_edge(header_pts[i], header_pts[i + 1])
 
-        edges_to_remove = [(u, v) for u, v in G.edges() if not footprint.contains(LineString([u, v]))]
-        G.remove_edges_from(edges_to_remove)
+        nearest_hj = min(header_pts, key=lambda h: abs(h[0] - source[0]) + abs(h[1] - source[1]))
+        corner = (header_x, source[1])
+        if source != corner:
+            G.add_edge(source, corner)
+        if corner != nearest_hj:
+            G.add_edge(corner, nearest_hj)
 
-        # Reconnect disconnected islands via L-shaped orthogonal paths.
-        components = list(nx.connected_components(G))
-        while len(components) > 1:
-            comp_a = components[0]
+        # ── 3. BRANCHES – straight horizontal pipes through sprinklers ──
+        for ry in row_ys:
+            row_sprs = rows.get(ry, [])
+            header_jn = (header_x, ry)
+
+            branch_x_vals = [header_x]
+            for s in row_sprs:
+                branch_x_vals.append(s[0])
+            branch_x_vals = sorted(set(branch_x_vals))
+
+            for i in range(len(branch_x_vals) - 1):
+                G.add_edge((branch_x_vals[i], ry), (branch_x_vals[i + 1], ry))
+
+            for s in row_sprs:
+                pipe_pt = (s[0], ry)
+                if s != pipe_pt:
+                    G.add_edge(pipe_pt, s)
+
+    # ── 4. CLIP OUT-OF-BOUNDS PIPES & RECONNECT ──────────────────
+    if safe_area:
+        for u, v in list(G.edges()):
+            seg = LineString([u, v])
+            if not safe_area.contains(seg) and not safe_area.covers(seg):
+                G.remove_edge(u, v)
+
+        for node in list(G.nodes()):
+            if node != source and node not in sprinkler_set and G.degree(node) == 0:
+                G.remove_node(node)
+
+        comps = list(nx.connected_components(G))
+        comps.sort(key=lambda c: 0 if source in c else 1)
+
+        while len(comps) > 1:
+            main = comps[0]
             best_dist = float("inf")
             best_edges: list = []
-            best_comp_idx = -1
+            best_ci = -1
 
-            for ci in range(1, len(components)):
-                comp_b = components[ci]
-                for u in comp_a:
-                    for v in comp_b:
-                        dist = abs(u[0] - v[0]) + abs(u[1] - v[1])
-                        if dist >= best_dist:
+            for ci in range(1, len(comps)):
+                for uu in main:
+                    for vv in comps[ci]:
+                        d = abs(uu[0] - vv[0]) + abs(uu[1] - vv[1])
+                        if d >= best_dist:
                             continue
-                        for corner in [(v[0], u[1]), (u[0], v[1])]:
-                            valid = True
-                            if u != corner:
-                                valid = valid and footprint.contains(LineString([u, corner]))
-                            if corner != v:
-                                valid = valid and footprint.contains(LineString([corner, v]))
-                            if valid:
-                                best_dist = dist
-                                best_edges = [(u, corner), (corner, v)]
-                                best_comp_idx = ci
-                                break
+                        c1 = (vv[0], uu[1])
+                        c2 = (uu[0], vv[1])
+                        p1 = LineString([uu, c1, vv])
+                        p2 = LineString([uu, c2, vv])
+                        if safe_area.contains(p1) or safe_area.covers(p1):
+                            best_dist, best_edges, best_ci = d, [(uu, c1), (c1, vv)], ci
+                        elif safe_area.contains(p2) or safe_area.covers(p2):
+                            best_dist, best_edges, best_ci = d, [(uu, c2), (c2, vv)], ci
 
-            if not best_edges:
-                # Failsafe: force the absolute closest L-shape.
-                fallback_dist = float("inf")
-                for ci in range(1, len(components)):
-                    for u in comp_a:
-                        for v in components[ci]:
-                            dist = abs(u[0] - v[0]) + abs(u[1] - v[1])
-                            if dist < fallback_dist:
-                                fallback_dist = dist
-                                corner = (v[0], u[1])
-                                best_edges = [(u, corner), (corner, v)]
-                                best_comp_idx = ci
+            if best_edges:
+                for e in best_edges:
+                    if e[0] != e[1]:
+                        G.add_edge(*e)
+                comps[0] = comps[0].union(comps[best_ci])
+                comps.pop(best_ci)
+            else:
+                fb_dist = float("inf")
+                fb_edges: list = []
+                fb_ci = -1
+                for ci in range(1, len(comps)):
+                    for uu in main:
+                        for vv in comps[ci]:
+                            d = Point(uu).distance(Point(vv))
+                            if d < fb_dist:
+                                fb_dist = d
+                                corner = (vv[0], uu[1])
+                                fb_edges = [(uu, corner), (corner, vv)]
+                                fb_ci = ci
+                if fb_edges:
+                    for e in fb_edges:
+                        if e[0] != e[1]:
+                            G.add_edge(*e)
+                    comps[0] = comps[0].union(comps[fb_ci])
+                    comps.pop(fb_ci)
+                else:
+                    break
 
-            for e in best_edges:
-                if e[0] != e[1]:
-                    G.add_edge(*e)
-            components[0] = components[0].union(components[best_comp_idx])
-            components.pop(best_comp_idx)
-
-    # ── 3. BFS tree from source ───────────────────────────────────
+    # ── 2. BFS tree from source ───────────────────────────────────
     try:
         directed_tree = nx.bfs_tree(G, source=source)
-    except Exception as e:
-        logger.warning("route_pipes bfs_tree failed: %s", e)
+    except Exception:
         return [], original_sprinklers
 
-    # ── 4. Subtree counts and node-to-region mapping ──────────────
+    # ── 3. Map nodes to room regions ──────────────────────────────
     node_to_region: Dict = {}
     if valid_regions:
         eps = 0.15 / WORLD_TO_M
@@ -777,65 +1235,43 @@ def route_pipes(
                     break
             node_to_region[node] = found
 
-    subtree_counts: Dict = {}
+    # ── 4. Initial flow (subtree sprinkler counts) ────────────────
+    final_subtree_counts: Dict = {}
     for node in reversed(list(nx.topological_sort(directed_tree))):
         count = 1 if node in sprinkler_set else 0
         for child in directed_tree.successors(node):
-            count += subtree_counts.get(child, 0)
-        subtree_counts[node] = count
+            count += final_subtree_counts.get(child, 0)
+        final_subtree_counts[node] = count
 
-    # ── 5. Arm-pipe tee creation ──────────────────────────────────
+    # ── 5. Inject explicit arm pipes for large (>50 mm) mains ────
+    # Add a short perpendicular arm as a *leaf* from the sprinkler
+    # position.  The main pipe keeps running straight through the
+    # sprinkler node — no edges are redirected, so no diagonals.
+    LARGE_PIPE_THRESHOLD = 10
     arm_length = 0.4 / WORLD_TO_M
-    edges_to_remove = []
-    edges_to_add = []
-    tees_created = set()
+    tees_created: set = set()
 
     for s in list(sprinkler_set):
-        load = subtree_counts.get(s, 0)
-        if load <= 10:
-            continue
-        preds = list(directed_tree.predecessors(s))
-        succs = list(directed_tree.successors(s))
-        if not preds:
-            continue
-        p = preds[0]
-        dx, dy = s[0] - p[0], s[1] - p[1]
-        if abs(dx) < 1e-3 and abs(dy) < 1e-3:
-            continue
+        load = final_subtree_counts.get(s, 0)
+        if load > LARGE_PIPE_THRESHOLD:
+            preds = list(directed_tree.predecessors(s))
+            if preds:
+                p = preds[0]
+                dx, dy = s[0] - p[0], s[1] - p[1]
+                is_horiz = abs(dx) > abs(dy)
+                tee = (s[0], s[1] + arm_length) if is_horiz else (s[0] + arm_length, s[1])
 
-        is_horiz = abs(dx) > abs(dy)
-        dir_y = -1 if dy > 0 else 1
-        dir_x = -1 if dx > 0 else 1
-        if is_horiz:
-            tee = (s[0], s[1] + arm_length * dir_y)
-        else:
-            tee = (s[0] + arm_length * dir_x, s[1])
+                # Leaf arm — no rerouting of parent or children
+                directed_tree.add_edge(s, tee)
+                tees_created.add(tee)
 
-        edges_to_remove.append((p, s))
-        edges_to_add.append((p, tee))
-        for child in succs:
-            edges_to_remove.append((s, child))
-            edges_to_add.append((tee, child))
-        edges_to_add.append((tee, s))
-        tees_created.add(tee)
+                if s in node_to_region:
+                    node_to_region[tee] = node_to_region[s]
+                final_subtree_counts[tee] = 1
 
-        if s in node_to_region:
-            node_to_region[tee] = node_to_region[s]
-        subtree_counts[tee] = load
-        subtree_counts[s] = 1
+    # ── 6. Dynamically cascade room entries ───────────────────────
+    node_size_idx = {n: _get_base_size_idx(final_subtree_counts.get(n, 0)) for n in directed_tree.nodes()}
 
-    for u, v in edges_to_remove:
-        if directed_tree.has_edge(u, v):
-            directed_tree.remove_edge(u, v)
-    for u, v in edges_to_add:
-        directed_tree.add_edge(u, v)
-    try:
-        directed_tree = nx.bfs_tree(directed_tree, source=source)
-    except Exception:
-        pass
-
-    # ── 6. Region-aware pipe sizing ───────────────────────────────
-    node_size_idx = {n: _get_base_size_idx(subtree_counts.get(n, 0)) for n in directed_tree.nodes()}
     for node in reversed(list(nx.topological_sort(directed_tree))):
         idx = node_size_idx[node]
         for child in directed_tree.successors(node):
@@ -849,18 +1285,23 @@ def route_pipes(
             idx = max(idx, child_idx)
         node_size_idx[node] = idx
 
+    # ── 7. Compile final segments with labels ─────────────────────
     final_segments: List[Tuple[Tuple[Tuple[float, float], Tuple[float, float]], str]] = []
+
     for u, v in directed_tree.edges():
-        if subtree_counts.get(v, 0) > 0:
+        if final_subtree_counts.get(v, 0) > 0:
             idx = node_size_idx.get(v, 0)
             label = PIPE_SIZES[idx]
+
             if valid_regions:
                 reg_u = node_to_region.get(u, -1)
                 reg_v = node_to_region.get(v, -1)
                 if reg_u != reg_v and reg_v != -1:
-                    label = f"{label} (Entry)"
-            if u in tees_created and v in sprinkler_set:
-                label = "25mm (Arm)"
+                    label = f"{label}"
+
+            if v in tees_created:
+                label = "25mm"
+
             final_segments.append(((u, v), label))
 
     return final_segments, original_sprinklers
@@ -1156,22 +1597,33 @@ def place_sprinklers_from_rooms_json(
     all_regions: List[Polygon] = []
     all_bboxes: List[Polygon] = []
 
-    hazard_counts: Dict[str, int] = {HAZARD_LH: 0, HAZARD_OH: 0, HAZARD_HH: 0, HAZARD_WASHROOM: 0}
-    room_hazards = _classify_room_hazards(rooms)
+    hazard_counts: Dict[str, int] = {}
+    room_hazards = _classify_room_hazards_with_dxf_text(rooms, dxf_path=dxf_path)
+
+    # Collect per-room polygons with their resolved hazard for HH-zone logic.
+    _room_entries: List[Tuple[Polygon, str]] = []
 
     for room, hazard in zip(rooms, room_hazards):
-        # Skip rooms classified as IGNORE (e.g. electrical rooms).
-        if hazard == "IGNORE":
-            continue
-
         poly = _parse_polygon(room.get("polygon_world"))
         if poly is None:
             continue
         area_m2 = float(poly.area) * (world_to_m ** 2)
-        # Optional washroom exception: skip tiny washrooms.
-        if hazard == HAZARD_WASHROOM and area_m2 < 5.0:
+
+        # NONE hazard (e.g. electrical rooms): record region but zero sprinklers.
+        if hazard == HAZARD_NONE:
+            pts, regs, bboxes = _process_room(poly, hazard_type=HAZARD_NONE)
+            all_regions.extend(regs)
+            all_bboxes.extend(bboxes)
+            hazard_counts[HAZARD_NONE] = hazard_counts.get(HAZARD_NONE, 0) + 1
             continue
+
+        # Washroom exception: tiny washrooms get NONE; larger ones become LH.
         if hazard == HAZARD_WASHROOM:
+            if area_m2 < 5.0:
+                pts, regs, bboxes = _process_room(poly, hazard_type=HAZARD_NONE)
+                all_regions.extend(regs)
+                all_bboxes.extend(bboxes)
+                continue
             hazard = HAZARD_LH
 
         # Large LH spaces are treated as OH to avoid under-protection.
@@ -1179,15 +1631,37 @@ def place_sprinklers_from_rooms_json(
             hazard = HAZARD_OH
 
         hazard_counts[hazard] = hazard_counts.get(hazard, 0) + 1
+        _room_entries.append((poly, hazard))
 
-        pts, regs, bboxes = _process_room(poly, hazard_type=hazard)
-        all_points.extend(pts)
-        all_regions.extend(regs)
-        all_bboxes.extend(bboxes)
+    # HH buffer zone: areas near HH rooms get denser coverage.
+    hh_polys = [p for p, h in _room_entries if h == HAZARD_HH]
+    hh_zone = unary_union(hh_polys).buffer(6.0 / world_to_m) if hh_polys else None
+
+    for poly, hazard in _room_entries:
+        if hh_zone and hazard in (HAZARD_LH, HAZARD_OH) and hh_zone.intersects(poly):
+            # Portion inside HH buffer → treat as HH.
+            inside = poly.intersection(hh_zone)
+            if not inside.is_empty:
+                pts, regs, bboxes = _process_room(inside, hazard_type=HAZARD_HH)
+                all_points.extend(pts)
+                all_regions.extend(regs)
+                all_bboxes.extend(bboxes)
+            # Remainder keeps original hazard.
+            outside = poly.difference(hh_zone)
+            if not outside.is_empty:
+                pts, regs, bboxes = _process_room(outside, hazard_type=hazard)
+                all_points.extend(pts)
+                all_regions.extend(regs)
+                all_bboxes.extend(bboxes)
+        else:
+            pts, regs, bboxes = _process_room(poly, hazard_type=hazard)
+            all_points.extend(pts)
+            all_regions.extend(regs)
+            all_bboxes.extend(bboxes)
 
     if not all_points:
         logger.info("place_sprinklers_from_rooms_json no sprinklers placed (no valid rooms)")
-        return [], [], [], []
+        return [], [], [], all_regions
 
     # Global grid alignment
     all_points = align_to_global_lines(all_points, all_regions, tolerance_m=ALIGN_TOLERANCE_M)
@@ -1236,6 +1710,7 @@ def place_sprinklers_only(
     spacing_m: float = 3.0,
     wall_buffer_m: float = 0.20,
     world_to_m: float = 0.001,
+    dxf_path: str | None = None,
 ) -> List[Tuple[float, float]]:
     """Place sprinklers for all rooms WITHOUT routing pipes.
 
@@ -1246,9 +1721,9 @@ def place_sprinklers_only(
     all_points: List[Tuple[float, float]] = []
     all_regions: List[Polygon] = []
 
-    room_hazards = _classify_room_hazards(rooms)
+    room_hazards = _classify_room_hazards_with_dxf_text(rooms, dxf_path=dxf_path)
     for room, hazard in zip(rooms, room_hazards):
-        if hazard == "IGNORE":
+        if hazard == HAZARD_NONE:
             continue
         poly = _parse_polygon(room.get("polygon_world"))
         if poly is None:
@@ -1301,9 +1776,9 @@ def route_pipes_for_sprinklers(
 
     # Build regions from rooms for safe-path checking
     all_regions: List[Polygon] = []
-    room_hazards = _classify_room_hazards(rooms)
+    room_hazards = _classify_room_hazards_with_dxf_text(rooms, dxf_path=dxf_path)
     for room, hazard in zip(rooms, room_hazards):
-        if hazard == "IGNORE":
+        if hazard == HAZARD_NONE:
             continue
         poly = _parse_polygon(room.get("polygon_world"))
         if poly is None:
