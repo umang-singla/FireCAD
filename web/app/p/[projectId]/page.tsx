@@ -123,6 +123,7 @@ type Project = {
     warnings?: string[];
   } | null;
   nbc_answers?: Record<string, any> | null;
+  settings?: Record<string, any> | null;
   floor_plans_count?: number;
 };
 
@@ -256,6 +257,11 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   async function refresh() {
     const p: Project = await (await authFetch(`/api/projects/${projectId}`)).json();
     setProject(p);
+
+    // Hydrate local settings from server-side settings_json
+    if (p.settings) {
+      setSettings((prev: any) => ({ ...prev, ...p.settings }));
+    }
 
     const d: Detector[] = await (await authFetch(`/api/projects/${projectId}/detectors`)).json();
     setDetectors(d);
