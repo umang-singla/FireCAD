@@ -12,11 +12,11 @@ permissions:
 env:
   RESOURCE_GROUP: FireCAD
   LOCATION: eastus
-  ACR_NAME: firecadregistry
-  ACR_LOGIN_SERVER: firecadregistry.azurecr.io
+  ACR_NAME: firemepregistry
+  ACR_LOGIN_SERVER: firemepregistry.azurecr.io
   IMAGE_NAME: firecad-api
   CONTAINER_GROUP_NAME: firecad-api
-  ACR_PULL_ID: /subscriptions/11fa53d4-8489-49f7-8076-1c1cea18c2e1/resourceGroups/FireCAD/providers/Microsoft.ManagedIdentity/userAssignedIdentities/firecad-identity
+  ACR_PULL_ID: /subscriptions/e1e67928-a190-494d-9ec7-2b8d97669e93/resourceGroups/FireCAD/providers/Microsoft.ManagedIdentity/userAssignedIdentities/firecad-identity
 
 jobs:
   build-and-deploy:
@@ -38,7 +38,7 @@ jobs:
 
       - name: Build and push image
         run: |
-          docker build -f api/Dockerfile -t firecadregistry.azurecr.io/firecad-api:${GITHUB_SHA} .
+          docker build -f api/Dockerfile -t $ACR_LOGIN_SERVER/$IMAGE_NAME:${GITHUB_SHA} .
           docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:${GITHUB_SHA}
 
       - name: Delete existing container group if present
