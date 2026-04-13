@@ -11,7 +11,7 @@ permissions:
 
 env:
   RESOURCE_GROUP: FireCAD
-  LOCATION: eastus2
+  LOCATION: eastus
   ACR_NAME: firemepregistry
   ACR_LOGIN_SERVER: firemepregistry.azurecr.io
   IMAGE_NAME: firecad-api
