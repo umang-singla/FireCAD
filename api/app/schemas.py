@@ -15,6 +15,7 @@ class ProjectOut(BaseModel):
     files: Dict[str, Optional[str]] = {}
     nbc_evaluation: Optional[Dict[str, Any]] = None
     nbc_answers: Optional[Dict[str, Any]] = None
+    settings: Optional[Dict[str, Any]] = None
     input_filename: Optional[str] = None
     floor_plans_count: int = 0
 

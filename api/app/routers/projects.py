@@ -147,14 +147,16 @@ def _project_row_to_out(r) -> ProjectOut:
             (r["id"],),
         ).fetchone()[0]
 
+    parsed_settings = json.loads(r["settings_json"] or "{}")
     return ProjectOut(
         id=r["id"],
         name=r["name"],
         status=r["status"],
         error=r["error"],
         files=files,
-        nbc_evaluation=json.loads(r["settings_json"] or "{}").get("nbc_evaluation"),
-        nbc_answers=json.loads(r["settings_json"] or "{}").get("nbc_answers"),
+        nbc_evaluation=parsed_settings.get("nbc_evaluation"),
+        nbc_answers=parsed_settings.get("nbc_answers"),
+        settings=parsed_settings,
         input_filename=r["input_filename"],
         floor_plans_count=fp_count,
     )
@@ -228,8 +230,10 @@ def get_project(project_id: str, user=Depends(get_current_user)):
 def update_settings(project_id: str, payload: ProjectUpdateSettings, user=Depends(get_current_user)):
     with db() as con:
         r = _authorize_project_write(con, project_id, user)
+        existing = json.loads(r["settings_json"] or "{}")
+        merged = {**existing, **payload.settings}
         con.execute("UPDATE projects SET settings_json=?, updated_at=? WHERE id=?",
-                    (json.dumps(payload.settings), now(), project_id))
+                    (json.dumps(merged), now(), project_id))
         r2 = _authorize_project(con, project_id, user)
     return _project_row_to_out(r2)
 
