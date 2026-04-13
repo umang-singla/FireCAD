@@ -58,7 +58,7 @@ jobs:
             --assign-identity $ACR_PULL_ID \
             --acr-identity $ACR_PULL_ID \
             --ip-address Public \
-            --dns-name-label ${CONTAINER_GROUP_NAME} \
+            --dns-name-label ${CONTAINER_GROUP_NAME}-2 \
             --ports 80 8000\
             --os-type Linux \
             --cpu 1 \
