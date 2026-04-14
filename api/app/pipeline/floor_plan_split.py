@@ -425,7 +425,7 @@ def _render_block(
 
     exe = os.getenv("QCAD_DWG2BMP", "/opt/qcad/dwg2bmp")
 
-    run_env, qcad_dir, build_exec_cmd = _qcad_env_and_launcher(exe)
+    run_env, qcad_dir, build_exec_cmd, _use_direct = _qcad_env_and_launcher(exe)
 
     # Common args (without color flag and output path)
     base_args = [

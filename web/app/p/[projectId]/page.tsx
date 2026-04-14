@@ -76,6 +76,16 @@ function deriveWorldToMFromUnits(units: string) {
   return WORLD_TO_M_BY_UNIT[key] ?? 0.001;
 }
 
+function resolveDxfToWorldFromSettings(settingsObj: any, fallbackUnits: string) {
+  const worldToM = Number(settingsObj?.world_to_m);
+  if (Number.isFinite(worldToM) && worldToM > 0) return worldToM;
+
+  const dxfToWorld = Number(settingsObj?.dxf_to_world);
+  if (Number.isFinite(dxfToWorld) && dxfToWorld > 0) return dxfToWorld;
+
+  return deriveWorldToMFromUnits(String(fallbackUnits || "mm"));
+}
+
 async function authFetch(path: string, init?: RequestInit) {
   const token = getToken();
   const headers: Record<string, string> = {
@@ -453,6 +463,28 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     await refresh();
   }
 
+  async function updateProjectUnits(nextUnits: string) {
+    const normalizedUnit = (nextUnits || "mm").trim().toLowerCase();
+    const nextScale = deriveWorldToMFromUnits(normalizedUnit);
+    const normalizedSettings = {
+      ...settings,
+      units: normalizedUnit,
+      qcad_input_unit: normalizedUnit,
+      // Keep both scale keys in sync with selected unit for measurement and pipeline use.
+      dxf_to_world: nextScale,
+      world_to_m: nextScale,
+      nbc_answers: settings.nbc_answers,
+      nbc_evaluation: project?.nbc_evaluation || settings.nbc_evaluation,
+    };
+
+    setSettings(normalizedSettings);
+    await authFetch(`/api/projects/${projectId}/settings`, {
+      method: "POST",
+      body: JSON.stringify({ settings: normalizedSettings }),
+    });
+    await refresh();
+  }
+
   async function runPipeline() {
     await saveSettings();
     setPipelineStage(null);
@@ -470,6 +502,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   const isRunning = !!project && !IDLE_STATUSES.has(project.status);
   const isQuestionnaireMode = !editorOpen;
   const showGlobalLoader = project === null || networkPending > 0;
+  const reviewUnits = String(settings?.units || "mm").toLowerCase();
+  const reviewWorldToM = resolveDxfToWorldFromSettings(settings, reviewUnits);
 
   async function saveLayout() {
     await authFetch(`/api/projects/${projectId}/save`, { method:"POST" });
@@ -1098,6 +1132,20 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                     Block {fp.block_index + 1}
                   </button>
                 ))}
+                <div style={{ flex: 1 }} />
+                <span style={{ fontSize: 12, color: "#4B5563", fontWeight: 600 }}>Units</span>
+                <select
+                  value={reviewUnits}
+                  disabled={!canEdit}
+                  onChange={async (e) => { await updateProjectUnits(e.target.value); }}
+                  style={{ width: 96, padding: "4px 8px", borderRadius: 8, border: "1px solid #D1D5DB", background: "#FFFFFF", fontSize: 12 }}
+                >
+                  <option value="mm">mm</option>
+                  <option value="cm">cm</option>
+                  <option value="m">m</option>
+                  <option value="ft">ft</option>
+                  <option value="in">in</option>
+                </select>
               </div>
               <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
                 {(() => {
@@ -1122,6 +1170,8 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                       nbcEquipment={project?.nbc_evaluation?.equipment || []}
                       onSave={saveRoomsOnly}
                       onContinue={saveRoomsAndContinue}
+                      displayUnit={reviewUnits}
+                      worldToM={reviewWorldToM}
                       canEdit={canEdit}
                     />
                   );
@@ -1129,15 +1179,39 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
               </div>
             </div>
           ) : (
-            <RoomEditor
-              renderUrl={apiUrl(project.files.render_png)}
-              mapping={mapping}
-              projectId={projectId}
-              nbcEquipment={project?.nbc_evaluation?.equipment || []}
-              onSave={saveRoomsOnly}
-              onContinue={saveRoomsAndContinue}
-              canEdit={canEdit}
-            />
+            <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+              <div style={{
+                display: "flex", alignItems: "center", gap: 8, padding: "8px 12px",
+                borderBottom: "1px solid #E8EAED", background: "#F8FAF9", flexShrink: 0,
+              }}>
+                <span style={{ fontSize: 12, color: "#4B5563", fontWeight: 600 }}>Units</span>
+                <select
+                  value={reviewUnits}
+                  disabled={!canEdit}
+                  onChange={async (e) => { await updateProjectUnits(e.target.value); }}
+                  style={{ width: 96, padding: "4px 8px", borderRadius: 8, border: "1px solid #D1D5DB", background: "#FFFFFF", fontSize: 12 }}
+                >
+                  <option value="mm">mm</option>
+                  <option value="cm">cm</option>
+                  <option value="m">m</option>
+                  <option value="ft">ft</option>
+                  <option value="in">in</option>
+                </select>
+              </div>
+              <div style={{ flex: 1, minHeight: 0 }}>
+                <RoomEditor
+                  renderUrl={apiUrl(project.files.render_png)}
+                  mapping={mapping}
+                  projectId={projectId}
+                  nbcEquipment={project?.nbc_evaluation?.equipment || []}
+                  onSave={saveRoomsOnly}
+                  onContinue={saveRoomsAndContinue}
+                  displayUnit={reviewUnits}
+                  worldToM={reviewWorldToM}
+                  canEdit={canEdit}
+                />
+              </div>
+            </div>
           )
         ) : !project?.files?.render_png || !mapping ? (
           <div style={styles.emptyState}>
@@ -1194,6 +1268,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                       exportPngUrl={project?.files?.output_preview_png ? apiUrl(project.files.output_preview_png) : null}
                       onSave={saveLayout}
                       onChanged={refresh}
+                      worldToM={reviewWorldToM}
                       canEdit={canEdit}
                     />
                   );
@@ -1212,6 +1287,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
               exportPngUrl={project?.files?.output_preview_png ? apiUrl(project.files.output_preview_png) : null}
               onSave={saveLayout}
               onChanged={refresh}
+              worldToM={reviewWorldToM}
               canEdit={canEdit}
             />
           )
@@ -2297,7 +2373,7 @@ type NBCEquipmentItem = {
 
 /* ── Wrapper: loads floor-plan mapping then renders RoomEditor ── */
 function FloorPlanRoomEditor({
-  renderUrl, mappingUrl, projectId, floorPlanId, nbcEquipment, onSave, onContinue, canEdit = true,
+  renderUrl, mappingUrl, projectId, floorPlanId, nbcEquipment, onSave, onContinue, displayUnit, worldToM, canEdit = true,
 }: {
   renderUrl: string;
   mappingUrl: string;
@@ -2306,6 +2382,8 @@ function FloorPlanRoomEditor({
   nbcEquipment: NBCEquipmentItem[];
   onSave: (rooms: Room[]) => Promise<void>;
   onContinue: (rooms: Room[]) => Promise<void>;
+  displayUnit: string;
+  worldToM: number;
   canEdit?: boolean;
 }) {
   const [fpMapping, setFpMapping] = useState<Mapping | null>(null);
@@ -2327,6 +2405,8 @@ function FloorPlanRoomEditor({
       nbcEquipment={nbcEquipment}
       onSave={onSave}
       onContinue={onContinue}
+      displayUnit={displayUnit}
+      worldToM={worldToM}
       canEdit={canEdit}
     />
   );
@@ -2334,7 +2414,7 @@ function FloorPlanRoomEditor({
 
 /* ── Wrapper: loads floor-plan mapping + detectors then renders Editor ── */
 function FloorPlanEditor({
-  renderUrl, mappingUrl, projectId, floorPlanId, floorPlan, isReady, exportDxfUrl, exportPngUrl, onSave, onChanged, canEdit = true,
+  renderUrl, mappingUrl, projectId, floorPlanId, floorPlan, isReady, exportDxfUrl, exportPngUrl, onSave, onChanged, worldToM, canEdit = true,
 }: {
   renderUrl: string;
   mappingUrl: string;
@@ -2346,6 +2426,7 @@ function FloorPlanEditor({
   exportPngUrl: string | null;
   onSave: () => void;
   onChanged: () => void;
+  worldToM: number;
   canEdit?: boolean;
 }) {
   const [fpMapping, setFpMapping] = useState<Mapping | null>(null);
@@ -2388,6 +2469,7 @@ function FloorPlanEditor({
       exportPngUrl={exportPngUrl}
       onSave={onSave}
       onChanged={() => { loadData(); onChanged(); }}
+      worldToM={worldToM}
       canEdit={canEdit}
     />
   );
@@ -2401,6 +2483,8 @@ function RoomEditor({
   floorPlanId,
   onSave,
   onContinue,
+  displayUnit,
+  worldToM,
   canEdit = true,
 }: {
   renderUrl: string;
@@ -2410,6 +2494,8 @@ function RoomEditor({
   floorPlanId?: string | null;
   onSave: (rooms: Room[]) => Promise<void>;
   onContinue: (rooms: Room[]) => Promise<void>;
+  displayUnit: string;
+  worldToM: number;
   canEdit?: boolean;
 }) {
   // ── Room state ──
@@ -3446,7 +3532,7 @@ function RoomEditor({
                         const worldA = pixelToWorld(mapping, measureStart.px, measureStart.py);
                         const worldB = pixelToWorld(mapping, measureEnd.px, measureEnd.py);
                         const dWorld = Math.hypot(worldB.x - worldA.x, worldB.y - worldA.y);
-                        const dMeters = dWorld * 0.001;
+                        const dMeters = dWorld * worldToM;
                         const midX = (measureStart.px + measureEnd.px) * 0.5;
                         const midY = (measureStart.py + measureEnd.py) * 0.5;
                         return (
@@ -4196,7 +4282,7 @@ async function uploadFile(projectId: string, e: any, refresh: ()=>void) {
 }
 
 function Editor({
-  renderUrl, mapping, detectors: detectorsProp, projectId, isReady, pipesData: pipesProp, floorPlanId, exportDxfUrl, exportPngUrl, onSave, onChanged, canEdit = true,
+  renderUrl, mapping, detectors: detectorsProp, projectId, isReady, pipesData: pipesProp, floorPlanId, exportDxfUrl, exportPngUrl, onSave, onChanged, worldToM = 0.001, canEdit = true,
 }: {
   renderUrl: string;
   mapping: Mapping;
@@ -4209,6 +4295,7 @@ function Editor({
   exportPngUrl: string | null;
   onSave: ()=>void;
   onChanged: ()=>void;
+  worldToM?: number;
   canEdit?: boolean;
 }) {
   const [imgDims, setImgDims] = useState<{w:number;h:number}|null>(null);
@@ -4793,7 +4880,7 @@ function Editor({
                       const worldA = pixelToWorld(mapping, measureStart.px, measureStart.py);
                       const worldB = pixelToWorld(mapping, measureEnd.px, measureEnd.py);
                       const dWorld = Math.hypot(worldB.x - worldA.x, worldB.y - worldA.y);
-                      const dMeters = dWorld * 0.001;
+                        const dMeters = dWorld * worldToM;
                       const midX = (measureStart.px + measureEnd.px) * 0.5;
                       const midY = (measureStart.py + measureEnd.py) * 0.5;
                       return (
