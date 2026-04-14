@@ -480,6 +480,18 @@ def _qcad_env_and_launcher(exe: str):
     if ld_prev:
         ld_parts.extend([p for p in ld_prev.split(":") if p])
     run_env["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(ld_parts))
+
+    qcad_lib_candidates = [
+        os.path.join(qcad_dir, "libqcadecmaapi.so"),
+        "/usr/lib/libqcadecmaapi.so",
+        "/usr/lib/x86_64-linux-gnu/libqcadecmaapi.so",
+    ]
+    qcad_lib = next((p for p in qcad_lib_candidates if os.path.exists(p)), None)
+    force_preload = os.getenv("QCAD_FORCE_PRELOAD", "0").strip().lower() in ("1", "true", "yes")
+    if qcad_lib and force_preload:
+        preload_prev = run_env.get("LD_PRELOAD", "").strip()
+        run_env["LD_PRELOAD"] = f"{qcad_lib}:{preload_prev}" if preload_prev else qcad_lib
+
     run_env.setdefault("QT_PLUGIN_PATH", qcad_dir)
     run_env.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", os.path.join(qcad_dir, "platforms"))
     run_env.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -488,20 +500,31 @@ def _qcad_env_and_launcher(exe: str):
     inline_env = []
     if run_env.get("LD_LIBRARY_PATH"):
         inline_env.append(f"LD_LIBRARY_PATH={run_env['LD_LIBRARY_PATH']}")
+    if run_env.get("LD_PRELOAD"):
+        inline_env.append(f"LD_PRELOAD={run_env['LD_PRELOAD']}")
 
     qcad_bin = os.path.join(qcad_dir, "qcad-bin")
     dwg2bmp_js = os.path.join(qcad_dir, "scripts", "Pro", "Tools", "Dwg2Bmp", "Dwg2Bmp.js")
     use_direct = os.path.exists(qcad_bin) and os.path.exists(dwg2bmp_js)
 
-    def build_exec_cmd(cmd):
-        if use_direct:
-            return ["/usr/bin/env", *inline_env,
-                    qcad_bin, "-no-dock-icon", "-no-gui",
-                    "-allow-multiple-instances", "-autostart", dwg2bmp_js,
-                    cmd[0], *cmd[1:]]
+    def build_exec_cmd(cmd, direct: bool | None = None):
+        mode_direct = use_direct if direct is None else bool(direct)
+        if mode_direct and os.path.exists(qcad_bin) and os.path.exists(dwg2bmp_js):
+            return [
+                "/usr/bin/env",
+                *inline_env,
+                qcad_bin,
+                "-no-dock-icon",
+                "-no-gui",
+                "-allow-multiple-instances",
+                "-autostart",
+                dwg2bmp_js,
+                cmd[0],
+                *cmd[1:],
+            ]
         return ["/usr/bin/env", *inline_env, *cmd]
 
-    return run_env, qcad_dir, build_exec_cmd
+    return run_env, qcad_dir, build_exec_cmd, use_direct
 
 
 def render_master_cropped(
@@ -548,7 +571,48 @@ def render_master_cropped(
     if not os.path.exists(exe):
         raise RuntimeError(f"QCAD dwg2bmp not found: {exe}")
 
-    run_env, qcad_dir, build_exec_cmd = _qcad_env_and_launcher(exe)
+    run_env, qcad_dir, build_exec_cmd, use_direct = _qcad_env_and_launcher(exe)
+
+    def _run_qcad(cmd: list[str], expected_output: str, label: str):
+        proc = subprocess.run(
+            build_exec_cmd(cmd),
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=qcad_dir,
+            env=run_env,
+        )
+        if proc.returncode == 0 and os.path.exists(expected_output):
+            return proc
+
+        # Retry once by switching launcher mode (wrapper <-> direct qcad-bin).
+        proc2 = subprocess.run(
+            build_exec_cmd(cmd, direct=(not use_direct)),
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=qcad_dir,
+            env=run_env,
+        )
+        if proc2.returncode == 0 and os.path.exists(expected_output):
+            logger.warning(
+                "render_master_cropped %s primary_launcher_failed recovered_with_fallback primary_rc=%s",
+                label,
+                proc.returncode,
+            )
+            return proc2
+
+        raise RuntimeError(
+            f"QCAD failed for {label}. expected_output={expected_output}\n"
+            f"primary_cmd={build_exec_cmd(cmd)}\n"
+            f"primary_rc={proc.returncode}\n"
+            f"primary_stdout={proc.stdout}\n"
+            f"primary_stderr={proc.stderr}\n"
+            f"fallback_cmd={build_exec_cmd(cmd, direct=(not use_direct))}\n"
+            f"fallback_rc={proc2.returncode}\n"
+            f"fallback_stdout={proc2.stdout}\n"
+            f"fallback_stderr={proc2.stderr}"
+        )
 
     # Common args (without color flag and output path)
     base_args = [
@@ -567,11 +631,7 @@ def render_master_cropped(
         "render_master_cropped GRAY QCAD -window=%s out=%s %dx%d",
         window_str, out_gray_png, master_w_px, master_h_px,
     )
-    subprocess.run(build_exec_cmd(gray_cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   cwd=qcad_dir, env=run_env)
-
-    if not os.path.exists(out_gray_png):
-        raise RuntimeError(f"QCAD produced no grayscale output: {out_gray_png}")
+    _run_qcad(gray_cmd, out_gray_png, "grayscale")
 
     # 2) Render colored (without -k) for UI display
     color_cmd = [*base_args, "-color-correction", "-o", out_png, dxf_path]
@@ -579,11 +639,7 @@ def render_master_cropped(
         "render_master_cropped COLOR QCAD -window=%s out=%s %dx%d",
         window_str, out_png, master_w_px, master_h_px,
     )
-    subprocess.run(build_exec_cmd(color_cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   cwd=qcad_dir, env=run_env)
-
-    if not os.path.exists(out_png):
-        raise RuntimeError(f"QCAD produced no colored output: {out_png}")
+    _run_qcad(color_cmd, out_png, "color")
 
     # Read actual dimensions from the grayscale image (used for mapping/processing)
     Image.MAX_IMAGE_PIXELS = None
