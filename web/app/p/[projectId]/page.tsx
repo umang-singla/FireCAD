@@ -161,6 +161,21 @@ type PipesData = {
   sources: PipeSource[];
 };
 
+type ShapeKind = "rect" | "circle" | "cloud" | "text";
+
+type ShapeAnnotation = {
+  id: string;
+  kind: ShapeKind;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  text?: string;
+  fontSize?: number;
+};
+
+type ShapeResizeHandle = "nw" | "ne" | "sw" | "se";
+
 type NBCSettingsQuestion = {
   id: string;
   type: "select" | "number" | "boolean";
@@ -198,31 +213,45 @@ type Mapping = {
   };
 };
 
-function worldToPixel(m: Mapping, x: number, y: number) {
-  const { xmin, xmax, ymin, ymax } = m.world_bbox;
+function getMappingFit(m: Mapping) {
   const fit = m.pixel_fit;
   if (fit && Number.isFinite(fit.scale) && fit.scale > 0) {
     return {
-      px: fit.offset_x + (x - xmin) * fit.scale,
-      py: fit.offset_y + (ymax - y) * fit.scale,
+      scale: fit.scale,
+      offset_x: fit.offset_x,
+      offset_y: fit.offset_y,
     };
   }
-  const u = (x - xmin) / (xmax - xmin);
-  const v = (ymax - y) / (ymax - ymin);
-  return { px: u * m.width_px, py: v * m.height_px };
+  // Legacy mappings may not include pixel_fit; derive the same contain-fit transform
+  // used by renderer to avoid subtle stretch-based coordinate drift.
+  const { xmin, xmax, ymin, ymax } = m.world_bbox;
+  const spanX = Math.max(1e-9, xmax - xmin);
+  const spanY = Math.max(1e-9, ymax - ymin);
+  const scale = Math.min(m.width_px / spanX, m.height_px / spanY);
+  const drawW = spanX * scale;
+  const drawH = spanY * scale;
+  return {
+    scale,
+    offset_x: (m.width_px - drawW) * 0.5,
+    offset_y: (m.height_px - drawH) * 0.5,
+  };
+}
+
+function worldToPixel(m: Mapping, x: number, y: number) {
+  const { xmin, xmax, ymin, ymax } = m.world_bbox;
+  const fit = getMappingFit(m);
+  return {
+    px: fit.offset_x + (x - xmin) * fit.scale,
+    py: fit.offset_y + (ymax - y) * fit.scale,
+  };
 }
 function pixelToWorld(m: Mapping, px: number, py: number) {
   const { xmin, xmax, ymin, ymax } = m.world_bbox;
-  const fit = m.pixel_fit;
-  if (fit && Number.isFinite(fit.scale) && fit.scale > 0) {
-    return {
-      x: xmin + (px - fit.offset_x) / fit.scale,
-      y: ymax - (py - fit.offset_y) / fit.scale,
-    };
-  }
-  const u = px / m.width_px;
-  const v = py / m.height_px;
-  return { x: xmin + u*(xmax-xmin), y: ymax - v*(ymax-ymin) };
+  const fit = getMappingFit(m);
+  return {
+    x: xmin + (px - fit.offset_x) / fit.scale,
+    y: ymax - (py - fit.offset_y) / fit.scale,
+  };
 }
 
 function normalizeAngleDeg(angle: number) {
@@ -2549,7 +2578,7 @@ function RoomEditor({
 
   // ── Detector state ──
   const [detectors, setDetectors] = useState<Detector[]>([]);
-  const [editorMode, setEditorMode] = useState<"rooms" | "select" | "add" | "erase" | "pan" | "pipe_draw" | "pipe_select" | "measure">("select");
+  const [editorMode, setEditorMode] = useState<"rooms" | "select" | "add" | "erase" | "pan" | "pipe_draw" | "pipe_select" | "measure" | "shape_rect" | "shape_circle" | "shape_cloud" | "shape_select" | "text_add">("select");
   const [addType, setAddType] = useState<ObjectType>("smoke");
   const [selectedDetectorIds, setSelectedDetectorIds] = useState<string[]>([]);
   const [imgDims, setImgDims] = useState<{w:number; h:number} | null>(null);
@@ -2577,6 +2606,11 @@ function RoomEditor({
   const [measureStart, setMeasureStart] = useState<{px:number; py:number} | null>(null);
   const [measureEnd, setMeasureEnd] = useState<{px:number; py:number} | null>(null);
   const [measureLocked, setMeasureLocked] = useState(false);
+  const [shapes, setShapes] = useState<ShapeAnnotation[]>([]);
+  const [selectedShapeId, setSelectedShapeId] = useState<string | null>(null);
+  const [shapeDraft, setShapeDraft] = useState<{ kind: "rect" | "circle" | "cloud"; start: { px: number; py: number }; end: { px: number; py: number } } | null>(null);
+  const [shapeDrag, setShapeDrag] = useState<{ id: string; start: { px: number; py: number }; origin: ShapeAnnotation } | null>(null);
+  const [shapeResize, setShapeResize] = useState<{ id: string; handle: ShapeResizeHandle; start: { px: number; py: number }; origin: ShapeAnnotation } | null>(null);
 
   // ── Helpers ──
   function samePoint(a: {px:number; py:number}, b: {px:number; py:number}, tolerance = 0.5) {
@@ -2600,6 +2634,150 @@ function RoomEditor({
     const px = ((e.clientX - rect.left) / rect.width) * imgDims.w;
     const py = ((e.clientY - rect.top) / rect.height) * imgDims.h;
     return { px, py };
+  }
+
+  function normalizeShapeRect(a: { px: number; py: number }, b: { px: number; py: number }) {
+    return {
+      x: Math.min(a.px, b.px),
+      y: Math.min(a.py, b.py),
+      w: Math.abs(b.px - a.px),
+      h: Math.abs(b.py - a.py),
+    };
+  }
+
+  function circleRectFromPoints(a: { px: number; py: number }, b: { px: number; py: number }) {
+    const dx = b.px - a.px;
+    const dy = b.py - a.py;
+    const side = Math.max(Math.abs(dx), Math.abs(dy));
+    const end = { px: a.px + Math.sign(dx || 1) * side, py: a.py + Math.sign(dy || 1) * side };
+    return normalizeShapeRect(a, end);
+  }
+
+  function shapeRect(shape: ShapeAnnotation) {
+    return {
+      left: shape.x,
+      top: shape.y,
+      right: shape.x + shape.w,
+      bottom: shape.y + shape.h,
+    };
+  }
+
+  function findShapeAtPoint(point: { px: number; py: number }): string | null {
+    const pad = 6;
+    for (let i = shapes.length - 1; i >= 0; i--) {
+      const s = shapes[i];
+      const r = shapeRect(s);
+      if (s.kind === "circle") {
+        const cx = s.x + s.w * 0.5;
+        const cy = s.y + s.h * 0.5;
+        const rx = Math.max(1, s.w * 0.5);
+        const ry = Math.max(1, s.h * 0.5);
+        const nx = (point.px - cx) / rx;
+        const ny = (point.py - cy) / ry;
+        if (nx * nx + ny * ny <= 1.08) return s.id;
+      } else if (
+        point.px >= r.left - pad &&
+        point.px <= r.right + pad &&
+        point.py >= r.top - pad &&
+        point.py <= r.bottom + pad
+      ) {
+        return s.id;
+      }
+    }
+    return null;
+  }
+
+  function hitShapeResizeHandle(shape: ShapeAnnotation, point: { px: number; py: number }, radius = 8): ShapeResizeHandle | null {
+    const r = shapeRect(shape);
+    const handles: Array<[ShapeResizeHandle, { px: number; py: number }]> = [
+      ["nw", { px: r.left, py: r.top }],
+      ["ne", { px: r.right, py: r.top }],
+      ["sw", { px: r.left, py: r.bottom }],
+      ["se", { px: r.right, py: r.bottom }],
+    ];
+    for (const [name, h] of handles) {
+      if (Math.hypot(point.px - h.px, point.py - h.py) <= radius) return name;
+    }
+    return null;
+  }
+
+  function shapeDimensionLabel(shape: { kind: "rect" | "circle" | "cloud"; x: number; y: number; w: number; h: number }) {
+    const p0 = pixelToWorld(mapping, shape.x, shape.y);
+    const px = pixelToWorld(mapping, shape.x + shape.w, shape.y);
+    const py = pixelToWorld(mapping, shape.x, shape.y + shape.h);
+    const wMeters = Math.abs(px.x - p0.x) * worldToM;
+    const hMeters = Math.abs(py.y - p0.y) * worldToM;
+    if (shape.kind === "circle") {
+      const dMeters = Math.max(wMeters, hMeters);
+      return `D ${dMeters.toFixed(2)} m`;
+    }
+    return `${wMeters.toFixed(2)} m x ${hMeters.toFixed(2)} m`;
+  }
+
+  function editSelectedText() {
+    if (!selectedShapeId || !canEdit) return;
+    const current = shapes.find(s => s.id === selectedShapeId);
+    if (!current || current.kind !== "text") return;
+    const next = window.prompt("Edit text:", current.text || "")?.trim();
+    if (!next) return;
+    setShapes(prev => prev.map(s => {
+      if (s.id !== current.id) return s;
+      const font = s.fontSize || 16;
+      return { ...s, text: next, w: Math.max(44, next.length * Math.max(7, font * 0.58) + 10), h: Math.max(font + 8, s.h) };
+    }));
+  }
+
+  function changeSelectedTextSize(delta: number) {
+    if (!selectedShapeId || !canEdit) return;
+    setShapes(prev => prev.map(s => {
+      if (s.id !== selectedShapeId || s.kind !== "text") return s;
+      const nextFont = Math.max(10, Math.min(72, (s.fontSize || 16) + delta));
+      const textLen = (s.text || "Text").length;
+      return { ...s, fontSize: nextFont, h: nextFont + 8, w: Math.max(44, textLen * Math.max(7, nextFont * 0.58) + 10) };
+    }));
+  }
+
+  function cloudPathFromRect(x: number, y: number, w: number, h: number) {
+    const shortSide = Math.max(1, Math.min(w, h));
+    const bump = Math.max(5, Math.min(16, shortSide * 0.14));
+    const nx = Math.max(3, Math.round(w / Math.max(16, bump * 2.2)));
+    const ny = Math.max(3, Math.round(h / Math.max(16, bump * 2.2)));
+
+    let d = `M ${x} ${y}`;
+
+    // Top edge (outward -Y)
+    for (let i = 0; i < nx; i++) {
+      const x0 = x + (i / nx) * w;
+      const x1 = x + ((i + 1) / nx) * w;
+      const xm = (x0 + x1) * 0.5;
+      d += ` Q ${xm} ${y - bump} ${x1} ${y}`;
+    }
+
+    // Right edge (outward +X)
+    for (let i = 0; i < ny; i++) {
+      const y0 = y + (i / ny) * h;
+      const y1 = y + ((i + 1) / ny) * h;
+      const ym = (y0 + y1) * 0.5;
+      d += ` Q ${x + w + bump} ${ym} ${x + w} ${y1}`;
+    }
+
+    // Bottom edge (outward +Y)
+    for (let i = 0; i < nx; i++) {
+      const x0 = x + w - (i / nx) * w;
+      const x1 = x + w - ((i + 1) / nx) * w;
+      const xm = (x0 + x1) * 0.5;
+      d += ` Q ${xm} ${y + h + bump} ${x1} ${y + h}`;
+    }
+
+    // Left edge (outward -X)
+    for (let i = 0; i < ny; i++) {
+      const y0 = y + h - (i / ny) * h;
+      const y1 = y + h - ((i + 1) / ny) * h;
+      const ym = (y0 + y1) * 0.5;
+      d += ` Q ${x - bump} ${ym} ${x} ${y1}`;
+    }
+
+    return `${d} Z`;
   }
 
   function closestPointOnSegment(point: {px:number; py:number}, a: number[], b: number[]) {
@@ -2638,11 +2816,26 @@ function RoomEditor({
         const res = await authFetch(url);
         const data = await res.json();
         const raw: Room[] = data.rooms || data;
+        const rawShapes: any[] = Array.isArray(data?.shapes) ? data.shapes : [];
         setRooms(
           raw.map((r, i) => ({
             ...r,
             label: (r.label && r.label.trim()) || (r.label_text && r.label_text.trim()) || `Room ${i + 1}`,
           }))
+        );
+        setShapes(
+          rawShapes
+            .filter((s) => s && typeof s === "object")
+            .map((s) => ({
+              id: String(s.id || crypto.randomUUID()),
+              kind: (s.kind === "rect" || s.kind === "circle" || s.kind === "cloud" || s.kind === "text") ? s.kind : "rect",
+              x: Number(s.x) || 0,
+              y: Number(s.y) || 0,
+              w: Math.max(1, Number(s.w) || 1),
+              h: Math.max(1, Number(s.h) || 1),
+              text: typeof s.text === "string" ? s.text : undefined,
+              fontSize: Number.isFinite(Number(s.fontSize)) ? Number(s.fontSize) : undefined,
+            }))
         );
       } catch (e) { console.error("Failed to load rooms", e); }
       finally { setLoading(false); }
@@ -2668,12 +2861,19 @@ function RoomEditor({
       if (e.key === "Delete" || e.key === "Backspace") {
         if ((editorMode === "pipe_select" || editorMode === "pipe_draw") && selectedPipeIdx !== null) {
           deletePipe(selectedPipeIdx);
+        } else if (editorMode === "shape_select" && selectedShapeId && canEdit) {
+          setShapes(prev => prev.filter(s => s.id !== selectedShapeId));
+          setSelectedShapeId(null);
         } else if (selectedDetectorIds.length > 0 && canEdit) {
           deleteDetectorsMany(selectedDetectorIds);
         }
       }
       if (e.key === "Escape") {
         if (pipeDrawStart) { setPipeDrawStart(null); setPipeDrawEnd(null); setPipeJoinHover(null); }
+        if (shapeDraft) setShapeDraft(null);
+        if (shapeDrag) setShapeDrag(null);
+        if (shapeResize) setShapeResize(null);
+        if (selectedShapeId) setSelectedShapeId(null);
         if (selectedPipeIdx !== null) setSelectedPipeIdx(null);
         if (selectedDetectorIds.length > 0) setSelectedDetectorIds([]);
         if (measureStart || measureEnd) {
@@ -2685,7 +2885,20 @@ function RoomEditor({
     }
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  });
+  }, [
+    canEdit,
+    editorMode,
+    measureEnd,
+    measureLocked,
+    measureStart,
+    pipeDrawStart,
+    selectedDetectorIds,
+    selectedPipeIdx,
+    selectedShapeId,
+    shapeDraft,
+    shapeDrag,
+    shapeResize,
+  ]);
 
   // ── Room functions ──
   function roomCentroidPx(room: Room): { cx: number; cy: number } {
@@ -3039,6 +3252,22 @@ function RoomEditor({
     return best;
   }
 
+  function resolvePipeDrawEnd(
+    start: { px: number; py: number },
+    end: { px: number; py: number },
+    axisSnapThresholdPx = 6,
+  ): { end: { px: number; py: number }; axis: "horizontal" | "vertical" | null } {
+    const dx = end.px - start.px;
+    const dy = end.py - start.py;
+    if (Math.abs(dx) <= axisSnapThresholdPx) {
+      return { end: { px: start.px, py: end.py }, axis: "vertical" };
+    }
+    if (Math.abs(dy) <= axisSnapThresholdPx) {
+      return { end: { px: end.px, py: start.py }, axis: "horizontal" };
+    }
+    return { end, axis: null };
+  }
+
   function deletePipe(idx: number) {
     if (!pipesData) return;
     const newPipes = pipesData.pipes.filter((_, i) => i !== idx);
@@ -3105,6 +3334,7 @@ function RoomEditor({
   async function saveAllEdits() {
     const payload: any = {
       rooms,
+      shapes,
       detectors: detectors.map(d => ({
         id: d.id, x: d.x, y: d.y, z: d.z,
         rotation_deg: d.rotation_deg ?? 0,
@@ -3171,6 +3401,7 @@ function RoomEditor({
       // Save all user state (rooms + detectors + pipes) before finalizing
       const payload: any = {
         rooms,
+        shapes,
         detectors: detectors.map(d => ({
           id: d.id, x: d.x, y: d.y, z: d.z,
           rotation_deg: d.rotation_deg ?? 0,
@@ -3221,6 +3452,7 @@ function RoomEditor({
   }
 
   const selectedRoom = rooms.find(r => r.id === selectedId);
+  const selectedShape = selectedShapeId ? shapes.find(s => s.id === selectedShapeId) || null : null;
   const selectedPipeDiameter = selectedPipeIdx !== null && pipesData?.pipes?.[selectedPipeIdx]
     ? pipesData.pipes[selectedPipeIdx].diameter
     : null;
@@ -3232,6 +3464,8 @@ function RoomEditor({
     if (editorMode === "add") return "crosshair";
     if (editorMode === "erase") return "not-allowed";
     if (editorMode === "measure") return "crosshair";
+    if (editorMode === "shape_rect" || editorMode === "shape_circle" || editorMode === "shape_cloud" || editorMode === "text_add") return "crosshair";
+    if (editorMode === "shape_select") return shapeResize ? "nwse-resize" : "pointer";
     if (editorMode === "rooms" && splitMode) return "crosshair";
     if (editorMode === "pipe_draw") return "crosshair";
     if (editorMode === "pipe_select") return "pointer";
@@ -3313,6 +3547,16 @@ function RoomEditor({
                   <button onClick={() => { setEditorMode("measure"); setSplitMode(false); resetSplitState(); setSelectedDetectorIds([]); setMarquee(null); }} style={ceToolBtn(editorMode === "measure")}>
                     Measure
                   </button>
+                  {canEdit && (
+                    <>
+                      <div style={{ width: 1, height: 20, background: "#E8EAED" }} />
+                      <button onClick={() => { setEditorMode("shape_select"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "shape_select")}>Shape Select</button>
+                      <button onClick={() => { setEditorMode("shape_rect"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "shape_rect")}>Rectangle</button>
+                      <button onClick={() => { setEditorMode("shape_circle"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "shape_circle")}>Circle</button>
+                      <button onClick={() => { setEditorMode("shape_cloud"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "shape_cloud")}>Cloud</button>
+                      <button onClick={() => { setEditorMode("text_add"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "text_add")}>Text</button>
+                    </>
+                  )}
                   {canEdit && (
                   <>
                   <div style={{ width: 1, height: 20, background: "#E8EAED" }} />
@@ -3487,6 +3731,70 @@ function RoomEditor({
                         const point = toImagePoint(e);
                         if (!point) return;
                         const { px, py } = point;
+                        if (editorMode === "shape_rect" || editorMode === "shape_circle" || editorMode === "shape_cloud") {
+                          if (!canEdit) return;
+                          setSelectedShapeId(null);
+                          setShapeDrag(null);
+                          setShapeResize(null);
+                          setShapeDraft({
+                            kind: editorMode === "shape_rect" ? "rect" : editorMode === "shape_circle" ? "circle" : "cloud",
+                            start: point,
+                            end: point,
+                          });
+                          return;
+                        }
+                        if (editorMode === "text_add") {
+                          if (!canEdit) return;
+                          const text = window.prompt("Enter text:", "Text");
+                          if (!text || !text.trim()) return;
+                          const clean = text.trim();
+                          const fontSize = 16;
+                          const estW = Math.max(44, clean.length * 9 + 10);
+                          const estH = fontSize + 8;
+                          const shape: ShapeAnnotation = {
+                            id: crypto.randomUUID(),
+                            kind: "text",
+                            x: px,
+                            y: py - estH,
+                            w: estW,
+                            h: estH,
+                            text: clean,
+                            fontSize,
+                          };
+                          setShapes(prev => [...prev, shape]);
+                          setSelectedShapeId(shape.id);
+                          setEditorMode("shape_select");
+                          return;
+                        }
+                        if (editorMode === "shape_select") {
+                          const selected = selectedShapeId ? shapes.find(s => s.id === selectedShapeId) || null : null;
+                          if (selected) {
+                            const hitHandle = hitShapeResizeHandle(selected, point);
+                            if (hitHandle && canEdit) {
+                              setShapeResize({ id: selected.id, handle: hitHandle, start: point, origin: selected });
+                              return;
+                            }
+                          }
+                          const hitId = findShapeAtPoint(point);
+                          if (hitId) {
+                            setSelectedShapeId(hitId);
+                            const hitShape = shapes.find(s => s.id === hitId) || null;
+                            if (hitShape?.kind === "text" && e.detail >= 2 && canEdit) {
+                              const next = window.prompt("Edit text:", hitShape.text || "")?.trim();
+                              if (next) {
+                                const font = hitShape.fontSize || 16;
+                                setShapes(prev => prev.map(s => s.id === hitId ? { ...s, text: next, w: Math.max(44, next.length * Math.max(7, font * 0.58) + 10), h: Math.max(font + 8, s.h) } : s));
+                              }
+                              return;
+                            }
+                            if (canEdit) {
+                              if (hitShape) setShapeDrag({ id: hitId, start: point, origin: hitShape });
+                            }
+                          } else {
+                            setSelectedShapeId(null);
+                          }
+                          return;
+                        }
                         if (editorMode === "measure") {
                           if (!measureStart || measureLocked) {
                             setMeasureStart({ px, py });
@@ -3534,6 +3842,35 @@ function RoomEditor({
                       onMouseMove={(e) => {
                         const point = toImagePoint(e);
                         if (!point) return;
+                        if (shapeDraft) {
+                          setShapeDraft({ ...shapeDraft, end: point });
+                          return;
+                        }
+                        if (shapeResize) {
+                          const o = shapeResize.origin;
+                          const left = o.x;
+                          const top = o.y;
+                          const right = o.x + o.w;
+                          const bottom = o.y + o.h;
+                          const anchor = {
+                            px: shapeResize.handle.includes("w") ? right : left,
+                            py: shapeResize.handle.includes("n") ? bottom : top,
+                          };
+                          const raw = o.kind === "circle"
+                            ? circleRectFromPoints(anchor, point)
+                            : normalizeShapeRect(anchor, point);
+                          const minSize = o.kind === "text" ? 20 : 8;
+                          const next = { ...o, x: raw.x, y: raw.y, w: Math.max(minSize, raw.w), h: Math.max(minSize, raw.h) };
+                          setShapes(prev => prev.map(s => (s.id === o.id ? next : s)));
+                          return;
+                        }
+                        if (shapeDrag) {
+                          const dx = point.px - shapeDrag.start.px;
+                          const dy = point.py - shapeDrag.start.py;
+                          const o = shapeDrag.origin;
+                          setShapes(prev => prev.map(s => (s.id === o.id ? { ...s, x: o.x + dx, y: o.y + dy } : s)));
+                          return;
+                        }
                         if (editorMode === "rooms" && splitMode && selectedRoom) {
                           const snapped = snapPointToRoomBoundary(selectedRoom, point);
                           setSplitHover(snapped);
@@ -3572,6 +3909,27 @@ function RoomEditor({
                         setAlignmentGuides(computeAlignmentGuides(next, groupDrag.ids));
                       }}
                       onMouseUp={() => {
+                        if (shapeDraft) {
+                          const rect = shapeDraft.kind === "circle"
+                            ? circleRectFromPoints(shapeDraft.start, shapeDraft.end)
+                            : normalizeShapeRect(shapeDraft.start, shapeDraft.end);
+                          setShapeDraft(null);
+                          if (rect.w >= 8 && rect.h >= 8 && canEdit) {
+                            const id = crypto.randomUUID();
+                            setShapes(prev => [...prev, { id, kind: shapeDraft.kind, ...rect }]);
+                            setSelectedShapeId(id);
+                            setEditorMode("shape_select");
+                          }
+                          return;
+                        }
+                        if (shapeDrag) {
+                          setShapeDrag(null);
+                          return;
+                        }
+                        if (shapeResize) {
+                          setShapeResize(null);
+                          return;
+                        }
                         if (editorMode === "measure") return;
                         // Finalize pipe draw
                         if (editorMode === "pipe_draw" && pipeDrawStart && pipeDrawEnd) {
@@ -3580,14 +3938,7 @@ function RoomEditor({
                             const joinedEnd = closestPointOnPipe(pipeDrawEnd.px, pipeDrawEnd.py, 10);
                             const endPt = joinedEnd
                               ? { px: joinedEnd.px, py: joinedEnd.py }
-                              : (() => {
-                                  // Snap to orthogonal (horizontal or vertical)
-                                  const dx = Math.abs(pipeDrawEnd.px - pipeDrawStart.px);
-                                  const dy = Math.abs(pipeDrawEnd.py - pipeDrawStart.py);
-                                  return dx > dy
-                                    ? { px: pipeDrawEnd.px, py: pipeDrawStart.py }
-                                    : { px: pipeDrawStart.px, py: pipeDrawEnd.py };
-                                })();
+                              : resolvePipeDrawEnd(pipeDrawStart, pipeDrawEnd).end;
                             addPipe(pipeDrawStart, endPt);
                           }
                           setPipeDrawStart(null);
@@ -3621,6 +3972,8 @@ function RoomEditor({
                         if (marquee) setMarquee(null);
                         if (groupDrag) setGroupDrag(null);
                         if (groupPreview) setGroupPreview(null);
+                        if (shapeDrag) setShapeDrag(null);
+                        if (shapeResize) setShapeResize(null);
                         if (pipeDrawStart) { setPipeDrawStart(null); setPipeDrawEnd(null); }
                         setPipeJoinHover(null);
                         setAlignmentGuides({ vertical: [], horizontal: [] });
@@ -3664,14 +4017,18 @@ function RoomEditor({
                       {/* Pipe draw preview */}
                       {editorMode === "pipe_draw" && pipeDrawStart && pipeDrawEnd ? (() => {
                         const drawW = pipeStrokeWidthPx(drawPipeDiameter);
-                        const dx = Math.abs(pipeDrawEnd.px - pipeDrawStart.px);
-                        const dy = Math.abs(pipeDrawEnd.py - pipeDrawStart.py);
-                        const snappedEnd = dx > dy
-                          ? { px: pipeDrawEnd.px, py: pipeDrawStart.py }
-                          : { px: pipeDrawStart.px, py: pipeDrawEnd.py };
+                        const resolved = resolvePipeDrawEnd(pipeDrawStart, pipeDrawEnd);
+                        const snappedEnd = resolved.end;
+                        const highlightAxis = resolved.axis;
                         return (
-                          <line x1={pipeDrawStart.px} y1={pipeDrawStart.py} x2={snappedEnd.px} y2={snappedEnd.py}
-                            stroke="#DC2626" strokeWidth={drawW} strokeDasharray="8 4" opacity={0.8} />
+                          <>
+                            {highlightAxis ? (
+                              <line x1={pipeDrawStart.px} y1={pipeDrawStart.py} x2={snappedEnd.px} y2={snappedEnd.py}
+                                stroke="#22C55E" strokeWidth={drawW + 1.2} strokeDasharray="8 4" opacity={0.35} />
+                            ) : null}
+                            <line x1={pipeDrawStart.px} y1={pipeDrawStart.py} x2={snappedEnd.px} y2={snappedEnd.py}
+                              stroke={highlightAxis ? "#16A34A" : "#DC2626"} strokeWidth={drawW} strokeDasharray="8 4" opacity={0.9} />
+                          </>
                         );
                       })() : null}
                       {editorMode === "pipe_draw" && pipeJoinHover ? (
@@ -3718,6 +4075,138 @@ function RoomEditor({
                           </g>
                         );
                       })()}
+
+                      {/* Shape annotations */}
+                      {shapes.map((s) => {
+                        const isSelected = selectedShapeId === s.id;
+                        if (s.kind === "text") {
+                          return (
+                            <g key={s.id}>
+                              <text x={s.x + 2} y={s.y + (s.fontSize || 16)} fill="#1F2937" fontSize={s.fontSize || 16} fontWeight={600}>
+                                {s.text || "Text"}
+                              </text>
+                              {isSelected ? (
+                                <rect
+                                  x={s.x}
+                                  y={s.y}
+                                  width={s.w}
+                                  height={s.h}
+                                  fill="none"
+                                  stroke="#2563EB"
+                                  strokeWidth={1.4}
+                                  strokeDasharray="6 4"
+                                />
+                              ) : null}
+                            </g>
+                          );
+                        }
+                        if (s.kind === "circle") {
+                          return (
+                            <ellipse
+                              key={s.id}
+                              cx={s.x + s.w * 0.5}
+                              cy={s.y + s.h * 0.5}
+                              rx={Math.max(1, s.w * 0.5)}
+                              ry={Math.max(1, s.h * 0.5)}
+                              fill="rgba(59,130,246,0.08)"
+                              stroke={isSelected ? "#2563EB" : "#1F2937"}
+                              strokeWidth={isSelected ? 2.2 : 1.8}
+                              strokeDasharray={isSelected ? "6 4" : undefined}
+                            />
+                          );
+                        }
+                        if (s.kind === "cloud") {
+                          return (
+                            <path
+                              key={s.id}
+                              d={cloudPathFromRect(s.x, s.y, s.w, s.h)}
+                              fill="rgba(34,211,238,0.08)"
+                              stroke={isSelected ? "#06B6D4" : "#0891B2"}
+                              strokeWidth={isSelected ? 2.2 : 1.8}
+                              strokeDasharray={isSelected ? "6 4" : undefined}
+                            />
+                          );
+                        }
+                        return (
+                          <rect
+                            key={s.id}
+                            x={s.x}
+                            y={s.y}
+                            width={s.w}
+                            height={s.h}
+                            fill="rgba(16,185,129,0.08)"
+                            stroke={isSelected ? "#2563EB" : "#1F2937"}
+                            strokeWidth={isSelected ? 2.2 : 1.8}
+                            strokeDasharray={isSelected ? "6 4" : undefined}
+                          />
+                        );
+                      })}
+
+                      {/* Draft shape + live dimensions while drawing */}
+                      {shapeDraft ? (() => {
+                        const rect = shapeDraft.kind === "circle"
+                          ? circleRectFromPoints(shapeDraft.start, shapeDraft.end)
+                          : normalizeShapeRect(shapeDraft.start, shapeDraft.end);
+                        const label = shapeDimensionLabel({ kind: shapeDraft.kind, ...rect });
+                        return (
+                          <g style={{ pointerEvents: "none" }}>
+                            {shapeDraft.kind === "circle" ? (
+                              <ellipse
+                                cx={rect.x + rect.w * 0.5}
+                                cy={rect.y + rect.h * 0.5}
+                                rx={Math.max(1, rect.w * 0.5)}
+                                ry={Math.max(1, rect.h * 0.5)}
+                                fill="rgba(59,130,246,0.12)"
+                                stroke="#2563EB"
+                                strokeWidth={2}
+                                strokeDasharray="8 4"
+                              />
+                            ) : shapeDraft.kind === "cloud" ? (
+                              <path
+                                d={cloudPathFromRect(rect.x, rect.y, rect.w, rect.h)}
+                                fill="rgba(34,211,238,0.12)"
+                                stroke="#0891B2"
+                                strokeWidth={2}
+                                strokeDasharray="8 4"
+                              />
+                            ) : (
+                              <rect
+                                x={rect.x}
+                                y={rect.y}
+                                width={rect.w}
+                                height={rect.h}
+                                fill="rgba(59,130,246,0.12)"
+                                stroke="#2563EB"
+                                strokeWidth={2}
+                                strokeDasharray="8 4"
+                              />
+                            )}
+                            <rect x={rect.x} y={rect.y - 22} width={124} height={18} rx={7} fill="rgba(37,99,235,0.92)" />
+                            <text x={rect.x + 62} y={rect.y - 9} textAnchor="middle" fill="#ffffff" fontSize={11} fontWeight={700}>{label}</text>
+                          </g>
+                        );
+                      })() : null}
+
+                      {/* Resize handles for selected shape */}
+                      {selectedShape && editorMode === "shape_select" ? (() => {
+                        const left = selectedShape.x;
+                        const top = selectedShape.y;
+                        const right = selectedShape.x + selectedShape.w;
+                        const bottom = selectedShape.y + selectedShape.h;
+                        const handlePts = [
+                          { px: left, py: top },
+                          { px: right, py: top },
+                          { px: left, py: bottom },
+                          { px: right, py: bottom },
+                        ];
+                        return (
+                          <g>
+                            {handlePts.map((h, i) => (
+                              <rect key={`shape-handle-${i}`} x={h.px - 4} y={h.py - 4} width={8} height={8} rx={1} fill="#ffffff" stroke="#2563EB" strokeWidth={1.4} />
+                            ))}
+                          </g>
+                        );
+                      })() : null}
 
                       {/* Alignment guides while moving elements */}
                       {groupDrag ? (
@@ -3882,6 +4371,11 @@ function RoomEditor({
                     key: "yard_hydrant", dtype: "fire_hose",
                     label: "External Hydrant",
                     icon: <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden><rect x="2.5" y="10" width="7.5" height="4" fill="none" stroke="currentColor" strokeWidth="1.8"/><line x1="2.7" y1="12" x2="11.6" y2="12" stroke="currentColor" strokeWidth="1.2" opacity="0.9"/><rect x="8.6" y="7.6" width="3.6" height="8.8" fill="currentColor"/><circle cx="14.2" cy="12" r="3.9" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M10.3 12 C 12.1 10.3, 14.8 13.7, 17 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/><path d="M19.6 8.4 Q21 12 19.6 15.6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/><line x1="20.9" y1="8.8" x2="20.9" y2="15.2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>,
+                  },
+                  {
+                    key: "mcp_hooter", dtype: "mcp_hooter",
+                    label: "MCP + Hooter",
+                    icon: <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden><rect x="2.5" y="8" width="7" height="7" fill="none" stroke="currentColor" strokeWidth="1.6"/><circle cx="6" cy="11.5" r="1.4" fill="currentColor"/><path d="M14 15.8h7v2.2h-7z" fill="currentColor" opacity="0.35"/><path d="M15 14h5.5Q20.5 9.8 18 9q-2.5.8-3 5z" fill="currentColor"/><line x1="18" y1="6.6" x2="18" y2="4.8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/></svg>,
                   },
                 ];
 
@@ -4156,6 +4650,48 @@ function RoomEditor({
               >
                 Clear Measure
               </button>
+            ) : null}
+          </div>
+        ) : null}
+        {(editorMode === "shape_rect" || editorMode === "shape_circle" || editorMode === "shape_cloud" || editorMode === "shape_select" || editorMode === "text_add") ? (
+          <div style={{ padding: "0 14px 8px", fontSize: 12, color: "#6B7280", display: "flex", alignItems: "center", gap: 8 }}>
+            {editorMode === "shape_select"
+              ? "Drag shapes to move. Drag corner handles to resize."
+              : editorMode === "text_add"
+                ? "Click on drawing to place text."
+                : editorMode === "shape_cloud"
+                  ? "Click and drag to draw cloud outline stencil. Dimensions are shown while drawing."
+                  : "Click and drag to draw shape. Dimensions are shown while drawing."}
+            {(editorMode === "shape_select" && selectedShapeId) ? (
+              <button
+                onClick={() => { setShapes(prev => prev.filter(s => s.id !== selectedShapeId)); setSelectedShapeId(null); }}
+                style={{ ...ceRoomBtn, padding: "4px 8px", fontSize: 11 }}
+              >
+                Delete Shape
+              </button>
+            ) : null}
+            {(editorMode === "shape_select" && selectedShape?.kind === "text") ? (
+              <>
+                <button
+                  onClick={editSelectedText}
+                  style={{ ...ceRoomBtn, padding: "4px 8px", fontSize: 11 }}
+                >
+                  Edit Text
+                </button>
+                <button
+                  onClick={() => changeSelectedTextSize(-2)}
+                  style={{ ...ceRoomBtn, padding: "4px 8px", fontSize: 11 }}
+                >
+                  A-
+                </button>
+                <button
+                  onClick={() => changeSelectedTextSize(2)}
+                  style={{ ...ceRoomBtn, padding: "4px 8px", fontSize: 11 }}
+                >
+                  A+
+                </button>
+                <span style={{ fontSize: 11, color: "#4B5563" }}>{selectedShape.fontSize || 16}px</span>
+              </>
             ) : null}
           </div>
         ) : null}

@@ -221,12 +221,19 @@ def _padded_bbox_from_dxf(dxf_path: str, pad_frac: float):
     return _padded_bbox_from_msp(msp, pad_frac)
 
 
+def get_dxf_bbox(dxf_path: str, pad_frac: float = 0.0):
+    """Return DXF world extents with optional fractional padding."""
+    return _padded_bbox_from_dxf(dxf_path, pad_frac)
+
+
 def render_dwg_to_png_with_qcad(
     dwg_path: str,
     out_png: str,
     target_long_side_px: int | None = None,
     background: str = "white",
     window: str | None = None,
+    margin_px_override: int | None = None,
+    postprocess_bolden: bool = True,
 ):
     exe = os.getenv("QCAD_DWG2BMP", "/opt/qcad/dwg2bmp")
     if not os.path.exists(exe):
@@ -240,6 +247,8 @@ def render_dwg_to_png_with_qcad(
     fallback_height = os.getenv("QCAD_DEFAULT_HEIGHT_PX", "4000").strip()
     high_quality = os.getenv("QCAD_HIGH_QUALITY", "1").strip().lower() not in ("0", "false", "no")
     margin_px = os.getenv("QCAD_MARGIN_PX", "4").strip()
+    if margin_px_override is not None:
+        margin_px = str(int(margin_px_override))
     input_unit = os.getenv("QCAD_INPUT_UNIT", "").strip().lower()
     ltscale = os.getenv("QCAD_LTSCALE", "").strip()
     resolution = os.getenv("QCAD_RESOLUTION", "").strip()
@@ -428,7 +437,8 @@ def render_dwg_to_png_with_qcad(
             f"stdout={proc.stdout}\nstderr={proc.stderr}"
         )
     
-    process_and_bolden_floor_plan(out_png, out_png, thickness=2, kernel_size=3)
+    if postprocess_bolden:
+        process_and_bolden_floor_plan(out_png, out_png, thickness=2, kernel_size=3)
 
     Image.MAX_IMAGE_PIXELS = None
     with Image.open(out_png) as im:
@@ -448,8 +458,12 @@ def write_mapping_from_dxf_and_png(
     png_path: str,
     out_json: str,
     pad_frac: float = 0.01,
+    bbox_override: tuple[float, float, float, float] | None = None,
 ):
-    xmin_p, ymin_p, xmax_p, ymax_p = _padded_bbox_from_dxf(dxf_path, pad_frac)
+    if bbox_override is not None:
+        xmin_p, ymin_p, xmax_p, ymax_p = bbox_override
+    else:
+        xmin_p, ymin_p, xmax_p, ymax_p = _padded_bbox_from_dxf(dxf_path, pad_frac)
     Image.MAX_IMAGE_PIXELS = None
     with Image.open(png_path) as im:
         width_px, height_px = im.size

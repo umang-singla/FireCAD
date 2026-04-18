@@ -1394,20 +1394,35 @@ def write_sprinklers_to_dxf(
     doc = ezdxf.readfile(base_dxf)
     msp = doc.modelspace()
 
+    # Remove only sprinkler-layer entities from previous exports.
+    # This avoids duplicate/offset-looking pipe overlays while preserving other AI layers.
+    stale = []
+    for ent in msp:
+        try:
+            if str(getattr(ent.dxf, "layer", "")) in {DXF_LAYER_SPRINKLER, DXF_LAYER_PIPES, DXF_LAYER_SOURCE}:
+                stale.append(ent)
+        except Exception:
+            continue
+    for ent in stale:
+        try:
+            msp.delete_entity(ent)
+        except Exception:
+            continue
+
     for layer_name in [DXF_LAYER_SPRINKLER, DXF_LAYER_PIPES, DXF_LAYER_SOURCE]:
         if layer_name not in doc.layers:
             doc.layers.add(layer_name)
 
     # Increase readability for pipe size labels in output drawings.
     pipe_text_height = text_height_world * 1.10
-    # Keep pipe thickness proportional to symbol scale while enforcing a practical minimum.
-    pipe_const_width = max(symbol_radius_world * 0.18, 0.03 / world_to_m)
-
     # Pipes
     for (pt1, pt2), label in pipes:
-        msp.add_lwpolyline(
-            [pt1, pt2],
-            dxfattribs={"layer": DXF_LAYER_PIPES, "color": 1, "const_width": pipe_const_width},
+        # Export centerline geometry to keep visual alignment with editor.
+        # Wide LWPOLYLINE rendering can appear laterally biased in some CAD viewers.
+        msp.add_line(
+            pt1,
+            pt2,
+            dxfattribs={"layer": DXF_LAYER_PIPES, "color": 1},
         )
         dx = pt2[0] - pt1[0]
         dy = pt2[1] - pt1[1]

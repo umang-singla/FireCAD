@@ -20,6 +20,7 @@ DXF_LAYER_LEGEND = "AI_LEGEND"
 DXF_LAYER_SPRINKLER = "AI_FIRE_SPRINKLERS"
 DXF_LAYER_PIPES = "AI_FIRE_PIPES"
 DXF_LAYER_SOURCE = "AI_FIRE_SOURCE"
+DXF_LAYER_ANNOTATIONS = "AI_ANNOTATIONS"
 
 LAYER_BY_DTYPE = {
     "smoke": DXF_LAYER_SMOKE,
@@ -338,6 +339,105 @@ def _add_symbol_for_dtype(msp, dtype: str, x: float, y: float, radius: float):
         _add_filled_dot(msp, x, y, radius, layer)
 
 
+def _add_cloud_outline(msp, xmin: float, ymin: float, xmax: float, ymax: float, layer: str, color: int = 4):
+    w = max(1e-6, xmax - xmin)
+    h = max(1e-6, ymax - ymin)
+    short_side = max(1e-6, min(w, h))
+    bump = max(short_side * 0.12, short_side * 0.06)
+
+    nx = max(4, int(round(w / max(1e-6, bump * 1.8))))
+    ny = max(4, int(round(h / max(1e-6, bump * 1.8))))
+
+    # Use denser point sampling to make cloud curls clearly visible in CAD viewers.
+    pts: list[tuple[float, float]] = []
+
+    # Top edge (outward +Y)
+    for i in range(nx):
+        x0 = xmin + (i / nx) * w
+        x1 = xmin + ((i + 1) / nx) * w
+        steps = 6
+        for j in range(steps):
+            t = j / steps
+            x = x0 + (x1 - x0) * t
+            y = ymax + bump * math.sin(math.pi * t)
+            pts.append((x, y))
+    pts.append((xmax, ymax))
+
+    # Right edge (outward +X)
+    for i in range(ny):
+        y0 = ymax - (i / ny) * h
+        y1 = ymax - ((i + 1) / ny) * h
+        steps = 6
+        for j in range(steps):
+            t = j / steps
+            y = y0 + (y1 - y0) * t
+            x = xmax + bump * math.sin(math.pi * t)
+            pts.append((x, y))
+    pts.append((xmax, ymin))
+
+    # Bottom edge (outward -Y)
+    for i in range(nx):
+        x0 = xmax - (i / nx) * w
+        x1 = xmax - ((i + 1) / nx) * w
+        steps = 6
+        for j in range(steps):
+            t = j / steps
+            x = x0 + (x1 - x0) * t
+            y = ymin - bump * math.sin(math.pi * t)
+            pts.append((x, y))
+    pts.append((xmin, ymin))
+
+    # Left edge (outward -X)
+    for i in range(ny):
+        y0 = ymin + (i / ny) * h
+        y1 = ymin + ((i + 1) / ny) * h
+        steps = 6
+        for j in range(steps):
+            t = j / steps
+            y = y0 + (y1 - y0) * t
+            x = xmin - bump * math.sin(math.pi * t)
+            pts.append((x, y))
+
+    if len(pts) >= 3:
+        msp.add_lwpolyline(pts, close=True, dxfattribs={"layer": layer, "color": color})
+
+
+def _add_annotations_to_dxf(msp, annotations: list[dict], layer: str = DXF_LAYER_ANNOTATIONS):
+    for a in annotations or []:
+        try:
+            kind = str(a.get("kind", "rect")).lower()
+            xmin = float(a["xmin"])
+            ymin = float(a["ymin"])
+            xmax = float(a["xmax"])
+            ymax = float(a["ymax"])
+            if xmax <= xmin or ymax <= ymin:
+                continue
+
+            if kind == "circle":
+                cx = (xmin + xmax) * 0.5
+                cy = (ymin + ymax) * 0.5
+                rx = (xmax - xmin) * 0.5
+                ry = (ymax - ymin) * 0.5
+                msp.add_ellipse((cx, cy), major_axis=(rx, 0.0), ratio=max(1e-6, ry / max(rx, 1e-6)), dxfattribs={"layer": layer, "color": 5})
+            elif kind == "cloud":
+                _add_cloud_outline(msp, xmin, ymin, xmax, ymax, layer=layer, color=4)
+            elif kind == "text":
+                text = str(a.get("text") or "Text")
+                h = max(0.01, float(a.get("text_height") or ((ymax - ymin) * 0.8)))
+                x = float(a.get("text_x", xmin))
+                y = float(a.get("text_y", (ymin + ymax) * 0.5))
+                txt = msp.add_text(text, dxfattribs={"layer": layer, "color": 7, "height": h})
+                txt.set_placement((x, y), align=TextEntityAlignment.LEFT)
+            else:
+                msp.add_lwpolyline(
+                    [(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)],
+                    close=True,
+                    dxfattribs={"layer": layer, "color": 3},
+                )
+        except Exception:
+            continue
+
+
 def _legend_dtypes(detectors: list[dict]):
     # Keep mandatory fire-system rows visible even if no explicit detector of that type exists.
     order = ["smoke", "sprinkler", "sprinkler_pipe", "panel", "mcb", "hooter", "fire_hose", "internal_hydrant"]
@@ -474,6 +574,7 @@ def write_detectors_to_dxf(
     base_dxf: str,
     out_dxf: str,
     detectors: list[dict],
+    annotations: list[dict] | None = None,
     world_to_m: float = 0.001,
     world_bbox: dict | None = None,
     symbol_radius_world: float | None = None,
@@ -496,7 +597,7 @@ def write_detectors_to_dxf(
         if text_height_world is None:
             text_height_world = auto_t
 
-    for layer_name in [*LAYER_BY_DTYPE.values(), DXF_LAYER_LEGEND, DXF_LAYER_PIPES, DXF_LAYER_SOURCE]:
+    for layer_name in [*LAYER_BY_DTYPE.values(), DXF_LAYER_LEGEND, DXF_LAYER_PIPES, DXF_LAYER_SOURCE, DXF_LAYER_ANNOTATIONS]:
         if layer_name not in doc.layers:
             doc.layers.add(layer_name)
 
@@ -504,6 +605,8 @@ def write_detectors_to_dxf(
         x = float(d["x"]); y = float(d["y"])
         dtype = _normalize_dtype(d.get("dtype", "smoke"))
         _add_symbol_for_dtype(msp, dtype, x, y, symbol_radius_world)
+
+    _add_annotations_to_dxf(msp, annotations or [])
 
     _add_legend_table(
         msp,
@@ -547,7 +650,7 @@ _FIRE_LAYERS = [
     DXF_LAYER_INTERNAL_HYDRANT,
 ]
 _SPRINKLER_LAYERS = [DXF_LAYER_SPRINKLER, DXF_LAYER_PIPES, DXF_LAYER_SOURCE]
-_ALL_AI_LAYERS = _FIRE_LAYERS + _SPRINKLER_LAYERS + [DXF_LAYER_LEGEND]
+_ALL_AI_LAYERS = _FIRE_LAYERS + _SPRINKLER_LAYERS + [DXF_LAYER_LEGEND, DXF_LAYER_ANNOTATIONS]
 
 
 def _read_dxf_safe(path: str):
@@ -660,6 +763,7 @@ def write_combined_sheets_dxf(
     base_dxf: str,
     out_combined_dxf: str,
     detectors: list[dict],
+    annotations: list[dict] | None = None,
     sprinkler_pipes: list | None = None,
     sprinkler_sources: list | None = None,
     world_to_m: float = 0.001,
@@ -683,6 +787,17 @@ def write_combined_sheets_dxf(
     sprinkler_pipes = sprinkler_pipes or []
     sprinkler_sources = sprinkler_sources or []
 
+    def _next_layout_name(doc_obj, base_name: str) -> str:
+        existing = set(doc_obj.layout_names())
+        if base_name not in existing:
+            return base_name
+        i = 2
+        while True:
+            candidate = f"{base_name}_{i}"
+            if candidate not in existing:
+                return candidate
+            i += 1
+
     # ── Build a single DXF with everything in modelspace ──
     tmpdir = tempfile.mkdtemp(prefix="firecad_combined_")
     try:
@@ -693,6 +808,7 @@ def write_combined_sheets_dxf(
         sym_r, txt_h = compute_symbol_sizes(world_to_m, detectors, world_bbox)
         write_detectors_to_dxf(
             tmp_dxf, tmp_dxf, detectors,
+            annotations=annotations,
             world_to_m=world_to_m, world_bbox=world_bbox,
             symbol_radius_world=sym_r, text_height_world=txt_h,
         )
@@ -719,10 +835,14 @@ def write_combined_sheets_dxf(
             if lyr not in doc.layers:
                 doc.layers.new(lyr, dxfattribs={"color": 7})
 
-        # Create 3 layout tabs (Layout1 stays as-is)
-        psp_original = doc.layouts.new(_LAYOUT_ORIGINAL)
-        psp_fire = doc.layouts.new(_LAYOUT_FIRE)
-        psp_sprinkler = doc.layouts.new(_LAYOUT_SPRINKLER)
+        # Create 3 layout tabs (Layout1 stays as-is). If a name already exists,
+        # suffix with _2, _3, ... instead of failing the export.
+        layout_original_name = _next_layout_name(doc, _LAYOUT_ORIGINAL)
+        psp_original = doc.layouts.new(layout_original_name)
+        layout_fire_name = _next_layout_name(doc, _LAYOUT_FIRE)
+        psp_fire = doc.layouts.new(layout_fire_name)
+        layout_sprinkler_name = _next_layout_name(doc, _LAYOUT_SPRINKLER)
+        psp_sprinkler = doc.layouts.new(layout_sprinkler_name)
 
         # Page setup
         for psp in [psp_original, psp_fire, psp_sprinkler]:
@@ -749,11 +869,11 @@ def write_combined_sheets_dxf(
 
         # Make first layout active on open
         try:
-            doc.layouts.set_active_layout(_LAYOUT_ORIGINAL)
+            doc.layouts.set_active_layout(layout_original_name)
         except Exception:
             pass
         try:
-            doc.header["$CTAB"] = _LAYOUT_ORIGINAL
+            doc.header["$CTAB"] = layout_original_name
             doc.header["$TILEMODE"] = 0
         except Exception:
             pass
