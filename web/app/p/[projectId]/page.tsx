@@ -174,14 +174,15 @@ type Detector = {
   x: number;
   y: number;
   z: number;
+  rotation_deg?: number;
   dtype: string;
   locked: boolean;
   floor_plan_id?: string | null;
 };
 
-type ObjectType = "smoke" | "panel" | "hooter" | "mcb" | "sprinkler";
+type ObjectType = "smoke" | "panel" | "hooter" | "mcb" | "sprinkler" | "fire_hose" | "internal_hydrant" | "beam_detector" | "reflector";
 
-const OBJECT_TYPES: ObjectType[] = ["smoke", "panel", "hooter", "mcb", "sprinkler"];
+const OBJECT_TYPES: ObjectType[] = ["smoke", "panel", "hooter", "mcb", "sprinkler", "fire_hose", "internal_hydrant", "beam_detector", "reflector"];
 
 type Mapping = {
   width_px: number;
@@ -222,6 +223,38 @@ function pixelToWorld(m: Mapping, px: number, py: number) {
   const u = px / m.width_px;
   const v = py / m.height_px;
   return { x: xmin + u*(xmax-xmin), y: ymax - v*(ymax-ymin) };
+}
+
+function normalizeAngleDeg(angle: number) {
+  const a = angle % 360;
+  return a < 0 ? a + 360 : a;
+}
+
+const PIPE_DIAMETERS_MM = [20, 25, 32, 40, 50, 65, 80, 100, 125, 150, 200, 250, 300, 350, 400] as const;
+
+function normalizePipeDiameter(diameter?: string) {
+  const raw = (diameter || "25mm").toLowerCase().trim();
+  const mm = Number.parseInt(raw.replace("mm", ""), 10);
+  return PIPE_DIAMETERS_MM.includes(mm as (typeof PIPE_DIAMETERS_MM)[number]) ? mm : 25;
+}
+
+function pipeStrokeWidthPx(diameter?: string) {
+  const mm = normalizePipeDiameter(diameter);
+  if (mm <= 20) return 1.6;
+  if (mm <= 25) return 2;
+  if (mm <= 32) return 2.6;
+  if (mm <= 40) return 3.2;
+  if (mm <= 50) return 3.8;
+  if (mm <= 65) return 4.6;
+  if (mm <= 80) return 5.2;
+  if (mm <= 100) return 6;
+  if (mm <= 125) return 6.8;
+  if (mm <= 150) return 7.4;
+  if (mm <= 200) return 8.3;
+  if (mm <= 250) return 9;
+  if (mm <= 300) return 9.6;
+  if (mm <= 350) return 10.2;
+  return 10.8;
 }
 
 export default function ProjectPage({ params }: { params: Promise<{ projectId: string }> }) {
@@ -528,6 +561,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     setPipelineStage(null);
     await authFetch(`/api/projects/${projectId}/continue_floor_review`, { method:"POST" });
     await refresh();
+    setEditorOpen(false);
   }
 
   async function addFloorPlan(pixelBbox: number[]) {
@@ -560,6 +594,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     setPipelineStage(null);
     await authFetch(`/api/projects/${projectId}/continue`, { method:"POST" });
     await refresh();
+    setEditorOpen(false);
   }
 
   async function uploadAlignedMaskFile(e: any) {
@@ -599,6 +634,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     // (bulk_save was already called by handleContinue in RoomEditor)
     await authFetch(`/api/projects/${projectId}/save`, { method: "POST" });
     await refresh();
+    setEditorOpen(false);
   }
 
   async function saveRoomsOnly(rooms: any[]) {
@@ -693,10 +729,10 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
               {(project.nbc_evaluation.equipment || []).filter(eq => eq.required).map(eq => (
                 <span key={eq.key} style={{
                   fontSize: 10, fontWeight: 700, padding: "3px 10px", borderRadius: 8,
-                  background: eq.supported ? "#ECFDF5" : "#FEF3C7",
-                  color: eq.supported ? "#059669" : "#D97706",
-                  border: eq.supported ? "1px solid rgba(5,150,105,0.2)" : "1px solid rgba(217,119,6,0.2)",
-                }}>{eq.label}: {eq.supported ? "Supported" : "Coming Soon"}</span>
+                  background: "#ECFDF5",
+                  color: "#059669",
+                  border: "1px solid rgba(5,150,105,0.2)",
+                }}>{eq.label}</span>
               ))}
             </div>
           ) : null}
@@ -2513,7 +2549,7 @@ function RoomEditor({
 
   // ── Detector state ──
   const [detectors, setDetectors] = useState<Detector[]>([]);
-  const [editorMode, setEditorMode] = useState<"rooms" | "select" | "add" | "erase" | "pan" | "pipe_draw" | "pipe_select" | "measure">("rooms");
+  const [editorMode, setEditorMode] = useState<"rooms" | "select" | "add" | "erase" | "pan" | "pipe_draw" | "pipe_select" | "measure">("select");
   const [addType, setAddType] = useState<ObjectType>("smoke");
   const [selectedDetectorIds, setSelectedDetectorIds] = useState<string[]>([]);
   const [imgDims, setImgDims] = useState<{w:number; h:number} | null>(null);
@@ -2524,16 +2560,20 @@ function RoomEditor({
   const [selectedPipeIdx, setSelectedPipeIdx] = useState<number | null>(null);
   const [pipeDrawStart, setPipeDrawStart] = useState<{px:number; py:number} | null>(null);
   const [pipeDrawEnd, setPipeDrawEnd] = useState<{px:number; py:number} | null>(null);
+  const [pipeJoinHover, setPipeJoinHover] = useState<{px:number; py:number} | null>(null);
+  const [drawPipeDiameter, setDrawPipeDiameter] = useState<string>("25mm");
   const [groupDrag, setGroupDrag] = useState<{
     ids: string[];
     start: { px: number; py: number };
     origins: Record<string, { px: number; py: number }>;
   } | null>(null);
   const [groupPreview, setGroupPreview] = useState<Record<string, { px: number; py: number }> | null>(null);
+  const [alignmentGuides, setAlignmentGuides] = useState<{ vertical: number[]; horizontal: number[] }>({ vertical: [], horizontal: [] });
   const [isAutoPlacing, setIsAutoPlacing] = useState<string | null>(null);
-  const [sidebarTab, setSidebarTab] = useState<"rooms" | "equipment">("rooms");
+  const [sidebarTab, setSidebarTab] = useState<"rooms" | "equipment">("equipment");
   const [pipesData, setPipesData] = useState<PipesData | null>(null);
   const [isSavingChanges, setIsSavingChanges] = useState(false);
+  const [isExportingDxf, setIsExportingDxf] = useState(false);
   const [measureStart, setMeasureStart] = useState<{px:number; py:number} | null>(null);
   const [measureEnd, setMeasureEnd] = useState<{px:number; py:number} | null>(null);
   const [measureLocked, setMeasureLocked] = useState(false);
@@ -2633,7 +2673,7 @@ function RoomEditor({
         }
       }
       if (e.key === "Escape") {
-        if (pipeDrawStart) { setPipeDrawStart(null); setPipeDrawEnd(null); }
+        if (pipeDrawStart) { setPipeDrawStart(null); setPipeDrawEnd(null); setPipeJoinHover(null); }
         if (selectedPipeIdx !== null) setSelectedPipeIdx(null);
         if (selectedDetectorIds.length > 0) setSelectedDetectorIds([]);
         if (measureStart || measureEnd) {
@@ -2755,6 +2795,7 @@ function RoomEditor({
       id: crypto.randomUUID(),
       project_id: projectId,
       x: w.x, y: w.y, z: 0,
+      rotation_deg: 0,
       dtype: addType,
       locked: false,
       floor_plan_id: floorPlanId || null,
@@ -2781,6 +2822,15 @@ function RoomEditor({
       if (!pt) return d;
       const w = pixelToWorld(mapping, pt.px, pt.py);
       return { ...d, x: w.x, y: w.y };
+    }));
+  }
+
+  function rotateDetectorsMany(ids: string[], deltaDeg: number) {
+    if (!ids.length || !canEdit) return;
+    const idSet = new Set(ids);
+    setDetectors(prev => prev.map(d => {
+      if (!idSet.has(d.id)) return d;
+      return { ...d, rotation_deg: normalizeAngleDeg((d.rotation_deg ?? 0) + deltaDeg) };
     }));
   }
 
@@ -2813,6 +2863,44 @@ function RoomEditor({
     for (const d of detectors) { if (ids.includes(d.id)) origins[d.id] = worldToPixel(mapping, d.x, d.y); }
     setGroupDrag({ ids, start: at, origins });
     setGroupPreview(origins);
+    setAlignmentGuides({ vertical: [], horizontal: [] });
+  }
+
+  function computeAlignmentGuides(
+    moving: Record<string, { px: number; py: number }>,
+    movingIds: string[],
+    threshold = 6,
+  ): { vertical: number[]; horizontal: number[] } {
+    const movingEntries = Object.entries(moving);
+    if (!movingEntries.length) return { vertical: [], horizontal: [] };
+    const movingSet = new Set(movingIds);
+    const stationary = detectors
+      .filter(d => !movingSet.has(d.id))
+      .map(d => ({ id: d.id, ...worldToPixel(mapping, d.x, d.y) }));
+
+    const verticalRaw: number[] = [];
+    const horizontalRaw: number[] = [];
+
+    for (const [, mp] of movingEntries) {
+      for (const sp of stationary) {
+        if (Math.abs(mp.px - sp.px) <= threshold) verticalRaw.push(sp.px);
+        if (Math.abs(mp.py - sp.py) <= threshold) horizontalRaw.push(sp.py);
+      }
+    }
+
+    const dedupe = (vals: number[]) => {
+      const sorted = [...vals].sort((a, b) => a - b);
+      const out: number[] = [];
+      for (const v of sorted) {
+        if (out.length === 0 || Math.abs(v - out[out.length - 1]) > 2) out.push(v);
+      }
+      return out;
+    };
+
+    return {
+      vertical: dedupe(verticalRaw),
+      horizontal: dedupe(horizontalRaw),
+    };
   }
 
   // ── Load sprinkler pipes ──
@@ -2927,6 +3015,30 @@ function RoomEditor({
     return null;
   }
 
+  function closestPointOnPipe(px: number, py: number, threshold = 10): { px: number; py: number; idx: number } | null {
+    if (!pipesData?.pipes?.length) return null;
+    let best: { px: number; py: number; idx: number } | null = null;
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < pipesData.pipes.length; i++) {
+      const pipe = pipesData.pipes[i];
+      const p1 = worldToPixel(mapping, pipe.from[0], pipe.from[1]);
+      const p2 = worldToPixel(mapping, pipe.to[0], pipe.to[1]);
+      const dx = p2.px - p1.px;
+      const dy = p2.py - p1.py;
+      const len2 = dx * dx + dy * dy;
+      if (len2 < 1e-6) continue;
+      const t = Math.max(0, Math.min(1, ((px - p1.px) * dx + (py - p1.py) * dy) / len2));
+      const cx = p1.px + t * dx;
+      const cy = p1.py + t * dy;
+      const dist = Math.hypot(px - cx, py - cy);
+      if (dist <= threshold && dist < bestDist) {
+        bestDist = dist;
+        best = { px: cx, py: cy, idx: i };
+      }
+    }
+    return best;
+  }
+
   function deletePipe(idx: number) {
     if (!pipesData) return;
     const newPipes = pipesData.pipes.filter((_, i) => i !== idx);
@@ -2940,10 +3052,33 @@ function RoomEditor({
     const newSeg: PipeSegment = {
       from: [wFrom.x, wFrom.y],
       to: [wTo.x, wTo.y],
-      diameter: "25mm",
+      diameter: drawPipeDiameter,
     };
     const prev = pipesData || { pipes: [], sources: [] };
     setPipesData({ ...prev, pipes: [...prev.pipes, newSeg] });
+  }
+
+  function clearPipes() {
+    setPipesData(null);
+    setSelectedPipeIdx(null);
+    setPipeDrawStart(null);
+    setPipeDrawEnd(null);
+    setPipeJoinHover(null);
+  }
+
+  function setSelectedPipeDiameter(diameter: string) {
+    if (!pipesData || selectedPipeIdx === null) return;
+    setPipesData(prev => {
+      if (!prev || selectedPipeIdx === null) return prev;
+      const pipes = [...prev.pipes];
+      const current = pipes[selectedPipeIdx];
+      if (!current) return prev;
+      pipes[selectedPipeIdx] = {
+        ...current,
+        diameter,
+      };
+      return { ...prev, pipes };
+    });
   }
 
   async function savePipesData() {
@@ -2967,29 +3102,66 @@ function RoomEditor({
     }
   }
 
+  async function saveAllEdits() {
+    const payload: any = {
+      rooms,
+      detectors: detectors.map(d => ({
+        id: d.id, x: d.x, y: d.y, z: d.z,
+        rotation_deg: d.rotation_deg ?? 0,
+        dtype: d.dtype, locked: d.locked,
+        floor_plan_id: d.floor_plan_id,
+      })),
+      pipes: pipesData || undefined,
+      floor_plan_id: floorPlanId || undefined,
+    };
+    const res = await authFetch(`/api/projects/${projectId}/bulk_save`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.detectors) setDetectors(data.detectors);
+    }
+  }
+
   async function handleSaveChanges() {
     setIsSavingChanges(true);
     try {
-      const payload: any = {
-        rooms,
-        detectors: detectors.map(d => ({
-          id: d.id, x: d.x, y: d.y, z: d.z,
-          dtype: d.dtype, locked: d.locked,
-          floor_plan_id: d.floor_plan_id,
-        })),
-        pipes: pipesData || undefined,
-        floor_plan_id: floorPlanId || undefined,
-      };
-      const res = await authFetch(`/api/projects/${projectId}/bulk_save`, {
-        method: "PUT",
-        body: JSON.stringify(payload),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.detectors) setDetectors(data.detectors);
-      }
+      await saveAllEdits();
     } catch (e) { console.error("Save changes failed", e); }
     finally { setIsSavingChanges(false); }
+  }
+
+  async function downloadFresh(url: string, filename: string) {
+    const targetUrl = /^https?:\/\//i.test(url) ? url : apiUrl(url);
+    const sep = url.includes("?") ? "&" : "?";
+    const res = await fetch(`${targetUrl}${sep}ts=${Date.now()}`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`Download failed (${res.status})`);
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objectUrl;
+    a.download = `project_${projectId}_${Date.now()}.dxf`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(objectUrl);
+  }
+
+  async function handleExportDxf() {
+    setIsExportingDxf(true);
+    try {
+      await saveAllEdits();
+      const saveResp = await authFetch(`/api/projects/${projectId}/save`, { method: "POST" });
+      const saved = await saveResp.json();
+      const outPath = saved?.files?.output_dxf;
+      if (!outPath) return;
+      await downloadFresh(outPath, `project_${projectId}_${Date.now()}.dxf`);
+    } catch (e) {
+      console.error("Export DXF failed", e);
+    } finally {
+      setIsExportingDxf(false);
+    }
   }
 
   // ── Save & Continue ──
@@ -3001,6 +3173,7 @@ function RoomEditor({
         rooms,
         detectors: detectors.map(d => ({
           id: d.id, x: d.x, y: d.y, z: d.z,
+          rotation_deg: d.rotation_deg ?? 0,
           dtype: d.dtype, locked: d.locked,
           floor_plan_id: d.floor_plan_id,
         })),
@@ -3048,6 +3221,9 @@ function RoomEditor({
   }
 
   const selectedRoom = rooms.find(r => r.id === selectedId);
+  const selectedPipeDiameter = selectedPipeIdx !== null && pipesData?.pipes?.[selectedPipeIdx]
+    ? pipesData.pipes[selectedPipeIdx].diameter
+    : null;
   const splitPreviewEnd = splitEnd || splitHover;
   const isPanning = editorMode === "pan";
 
@@ -3088,20 +3264,48 @@ function RoomEditor({
             <>
               {/* ── Toolbar ── */}
               <div style={{
-                position: "absolute", top: 14, left: 14, zIndex: 3,
+                position: "absolute", top: 10, left: 10, right: 10, zIndex: 3,
                 display: "flex", flexDirection: "column", gap: 6,
+                pointerEvents: "none",
               }}>
                 <div style={{
                   display: "flex", alignItems: "center", gap: 6,
                   padding: "6px 10px", borderRadius: 12,
-                  background: "#FFFFFF", border: "1px solid #E8EAED",
+                  background: "#F3F4F6", border: "1px solid #D1D5DB",
                   boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+                  pointerEvents: "auto",
                 }}>
-                  <button onClick={() => { setEditorMode("rooms"); setSelectedDetectorIds([]); }} style={ceToolBtn(editorMode === "rooms")}>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="12" y1="3" x2="12" y2="21"/></svg>
-                    Rooms
-                  </button>
-                  <div style={{ width: 1, height: 20, background: "#E8EAED" }} />
+                  {canEdit && (
+                    <>
+                      <button
+                        onClick={handleSaveChanges}
+                        disabled={isSavingChanges || isExportingDxf}
+                        style={cePaintActionBtn}
+                        title="Save changes"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+                          <polyline points="17 21 17 13 7 13 7 21"/>
+                          <polyline points="7 3 7 8 15 8"/>
+                        </svg>
+                        {isSavingChanges ? "Saving..." : "Save"}
+                      </button>
+                      <button
+                        onClick={handleExportDxf}
+                        disabled={isSavingChanges || isExportingDxf}
+                        style={{ ...cePaintActionBtn, background: "#2D6A4F", color: "#fff", borderColor: "#2D6A4F" }}
+                        title="Export DXF"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                          <polyline points="7 10 12 15 17 10"/>
+                          <line x1="12" y1="15" x2="12" y2="3"/>
+                        </svg>
+                        {isExportingDxf ? "Exporting..." : "Export DXF"}
+                      </button>
+                      <div style={{ width: 1, height: 20, background: "#D1D5DB" }} />
+                    </>
+                  )}
                   <button onClick={() => { setEditorMode("select"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "select")}>Select</button>
                   {canEdit && <button onClick={() => { setEditorMode("add"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "add")}>Add</button>}
                   {canEdit && <button onClick={() => { setEditorMode("erase"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "erase")}>Erase</button>}
@@ -3112,7 +3316,7 @@ function RoomEditor({
                   {canEdit && (
                   <>
                   <div style={{ width: 1, height: 20, background: "#E8EAED" }} />
-                  <button onClick={() => { setEditorMode("pipe_draw"); setSplitMode(false); resetSplitState(); setSelectedPipeIdx(null); setPipeDrawStart(null); setPipeDrawEnd(null); }} style={ceToolBtn(editorMode === "pipe_draw" || editorMode === "pipe_select")}>
+                  <button onClick={() => { setEditorMode("pipe_draw"); setSplitMode(false); resetSplitState(); setSelectedPipeIdx(null); setPipeDrawStart(null); setPipeDrawEnd(null); setPipeJoinHover(null); }} style={ceToolBtn(editorMode === "pipe_draw" || editorMode === "pipe_select")}>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
                     Pipes
                   </button>
@@ -3121,17 +3325,20 @@ function RoomEditor({
                   {selectedDetectorIds.length > 0 ? (
                     <>
                       <span style={{ fontSize: 12, color: "#6B7280", marginLeft: 4 }}>Selected: {selectedDetectorIds.length}</span>
+                      {canEdit && <button onClick={() => rotateDetectorsMany(selectedDetectorIds, -15)} style={ceToolBtn(false)}>Rotate -15°</button>}
+                      {canEdit && <button onClick={() => rotateDetectorsMany(selectedDetectorIds, 15)} style={ceToolBtn(false)}>Rotate +15°</button>}
                       {canEdit && <button onClick={() => deleteDetectorsMany(selectedDetectorIds)} style={{ ...ceToolBtn(false), color: "#DC2626", borderColor: "#FECACA" }}>Delete Selected</button>}
                       <button onClick={() => setSelectedDetectorIds([])} style={ceToolBtn(false)}>Clear</button>
                     </>
                   ) : null}
                 </div>
-                {editorMode === "add" ? (
+                {canEdit ? (
                   <div style={{
                     display: "flex", alignItems: "center", gap: 6,
                     padding: "6px 10px", borderRadius: 12,
-                    background: "#FFFFFF", border: "1px solid #E8EAED",
+                    background: "#F3F4F6", border: "1px solid #D1D5DB",
                     boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+                    pointerEvents: "auto",
                   }}>
                     {OBJECT_TYPES.map((otype) => (
                       <button
@@ -3150,19 +3357,65 @@ function RoomEditor({
                   <div style={{
                     display: "flex", alignItems: "center", gap: 6,
                     padding: "6px 10px", borderRadius: 12,
-                    background: "#FFFFFF", border: "1px solid #E8EAED",
+                    background: "#F3F4F6", border: "1px solid #D1D5DB",
                     boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+                    pointerEvents: "auto",
                   }}>
-                    <button onClick={() => { setEditorMode("pipe_draw"); setSelectedPipeIdx(null); }} style={ceToolBtn(editorMode === "pipe_draw")}>
+                    <button onClick={() => { setEditorMode("pipe_draw"); setSelectedPipeIdx(null); setPipeJoinHover(null); }} style={ceToolBtn(editorMode === "pipe_draw")}>
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
                       Draw
                     </button>
-                    <button onClick={() => { setEditorMode("pipe_select"); setPipeDrawStart(null); setPipeDrawEnd(null); }} style={ceToolBtn(editorMode === "pipe_select")}>
+                    <button onClick={() => { setEditorMode("pipe_select"); setPipeDrawStart(null); setPipeDrawEnd(null); setPipeJoinHover(null); }} style={ceToolBtn(editorMode === "pipe_select")}>
                       Select
                     </button>
+                    {editorMode === "pipe_draw" ? (
+                      <select
+                        value={drawPipeDiameter}
+                        onChange={(e) => setDrawPipeDiameter(e.target.value)}
+                        style={{
+                          ...ceToolBtn(false),
+                          height: 30,
+                          minWidth: 112,
+                          padding: "0 8px",
+                          borderColor: "rgba(220,38,38,0.3)",
+                          color: "#DC2626",
+                          background: "#fff",
+                        }}
+                        title="Thickness for new pipes"
+                      >
+                        {PIPE_DIAMETERS_MM.map(mm => (
+                          <option key={mm} value={`${mm}mm`}>{`Draw ${mm} mm`}</option>
+                        ))}
+                      </select>
+                    ) : null}
                     {selectedPipeIdx !== null ? (
                       <button onClick={() => deletePipe(selectedPipeIdx)} style={{ ...ceToolBtn(false), borderColor: "rgba(220,38,38,0.3)", color: "#DC2626" }}>
                         Delete
+                      </button>
+                    ) : null}
+                    {selectedPipeIdx !== null ? (
+                      <select
+                        value={selectedPipeDiameter || "25mm"}
+                        onChange={(e) => setSelectedPipeDiameter(e.target.value)}
+                        style={{
+                          ...ceToolBtn(false),
+                          height: 30,
+                          minWidth: 98,
+                          padding: "0 8px",
+                          borderColor: "rgba(220,38,38,0.3)",
+                          color: "#DC2626",
+                          background: "#fff",
+                        }}
+                        title="Pipe thickness"
+                      >
+                        {PIPE_DIAMETERS_MM.map(mm => (
+                          <option key={mm} value={`${mm}mm`}>{`${mm} mm`}</option>
+                        ))}
+                      </select>
+                    ) : null}
+                    {(pipesData?.pipes?.length || 0) > 0 ? (
+                      <button onClick={clearPipes} style={{ ...ceToolBtn(false), borderColor: "rgba(220,38,38,0.3)", color: "#DC2626" }}>
+                        Clear Pipes
                       </button>
                     ) : null}
                     <span style={{ fontSize: 11, color: "#6B7280" }}>
@@ -3249,8 +3502,11 @@ function RoomEditor({
                         // Pipe draw mode
                         if (editorMode === "pipe_draw") {
                           if (!pipeDrawStart) {
-                            setPipeDrawStart({ px, py });
-                            setPipeDrawEnd({ px, py });
+                            const join = closestPointOnPipe(px, py, 10);
+                            const startPt = join ? { px: join.px, py: join.py } : { px, py };
+                            setPipeDrawStart(startPt);
+                            setPipeDrawEnd(startPt);
+                            setPipeJoinHover(join ? startPt : null);
                           }
                           return;
                         }
@@ -3288,13 +3544,22 @@ function RoomEditor({
                           return;
                         }
                         setHoverPoint(point);
-                        // Pipe draw preview
-                        if (editorMode === "pipe_draw" && pipeDrawStart) {
-                          setPipeDrawEnd(point);
+                        // In pipe draw mode, show join hover point on nearby lines even before first click.
+                        if (editorMode === "pipe_draw") {
+                          const join = closestPointOnPipe(point.px, point.py, 10);
+                          setPipeJoinHover(join ? { px: join.px, py: join.py } : null);
+                          if (pipeDrawStart) {
+                            if (join) setPipeDrawEnd({ px: join.px, py: join.py });
+                            else setPipeDrawEnd(point);
+                          }
                           return;
                         }
                         if (editorMode !== "select" && editorMode !== "erase") return;
-                        if (marquee) { setMarquee({ ...marquee, ex: point.px, ey: point.py }); return; }
+                        if (marquee) {
+                          setMarquee({ ...marquee, ex: point.px, ey: point.py });
+                          setAlignmentGuides({ vertical: [], horizontal: [] });
+                          return;
+                        }
                         if (!groupDrag) return;
                         const dx = point.px - groupDrag.start.px;
                         const dy = point.py - groupDrag.start.py;
@@ -3304,6 +3569,7 @@ function RoomEditor({
                           if (base) next[detId] = { px: base.px + dx, py: base.py + dy };
                         }
                         setGroupPreview(next);
+                        setAlignmentGuides(computeAlignmentGuides(next, groupDrag.ids));
                       }}
                       onMouseUp={() => {
                         if (editorMode === "measure") return;
@@ -3311,16 +3577,22 @@ function RoomEditor({
                         if (editorMode === "pipe_draw" && pipeDrawStart && pipeDrawEnd) {
                           const dist = Math.hypot(pipeDrawEnd.px - pipeDrawStart.px, pipeDrawEnd.py - pipeDrawStart.py);
                           if (dist > 5) {
-                            // Snap to orthogonal (horizontal or vertical)
-                            const dx = Math.abs(pipeDrawEnd.px - pipeDrawStart.px);
-                            const dy = Math.abs(pipeDrawEnd.py - pipeDrawStart.py);
-                            const snappedEnd = dx > dy
-                              ? { px: pipeDrawEnd.px, py: pipeDrawStart.py }
-                              : { px: pipeDrawStart.px, py: pipeDrawEnd.py };
-                            addPipe(pipeDrawStart, snappedEnd);
+                            const joinedEnd = closestPointOnPipe(pipeDrawEnd.px, pipeDrawEnd.py, 10);
+                            const endPt = joinedEnd
+                              ? { px: joinedEnd.px, py: joinedEnd.py }
+                              : (() => {
+                                  // Snap to orthogonal (horizontal or vertical)
+                                  const dx = Math.abs(pipeDrawEnd.px - pipeDrawStart.px);
+                                  const dy = Math.abs(pipeDrawEnd.py - pipeDrawStart.py);
+                                  return dx > dy
+                                    ? { px: pipeDrawEnd.px, py: pipeDrawStart.py }
+                                    : { px: pipeDrawStart.px, py: pipeDrawEnd.py };
+                                })();
+                            addPipe(pipeDrawStart, endPt);
                           }
                           setPipeDrawStart(null);
                           setPipeDrawEnd(null);
+                          setPipeJoinHover(null);
                           return;
                         }
                         if (editorMode !== "select" && editorMode !== "erase") return;
@@ -3333,12 +3605,14 @@ function RoomEditor({
                             setSelectedDetectorIds(idsInRect(rect));
                           }
                           setMarquee(null);
+                          setAlignmentGuides({ vertical: [], horizontal: [] });
                           return;
                         }
                         if (groupDrag && groupPreview) {
                           moveDetectorsToMany(groupPreview);
                           setGroupDrag(null);
                           setGroupPreview(null);
+                          setAlignmentGuides({ vertical: [], horizontal: [] });
                         }
                       }}
                       onMouseLeave={() => {
@@ -3348,6 +3622,8 @@ function RoomEditor({
                         if (groupDrag) setGroupDrag(null);
                         if (groupPreview) setGroupPreview(null);
                         if (pipeDrawStart) { setPipeDrawStart(null); setPipeDrawEnd(null); }
+                        setPipeJoinHover(null);
+                        setAlignmentGuides({ vertical: [], horizontal: [] });
                       }}
                       onContextMenu={(e) => {
                         e.preventDefault();
@@ -3359,39 +3635,12 @@ function RoomEditor({
                         if (detId) deleteDetector(detId);
                       }}
                     >
-                      {/* Room polygons */}
-                      {rooms.map(room => {
-                        const pts = room.polygon_px.map(p => `${p[0]},${p[1]}`).join(" ");
-                        const { cx, cy } = roomCentroidPx(room);
-                        const isSelected = room.id === selectedId;
-                        return (
-                          <g key={room.id} onClick={() => { if (editorMode === "rooms" && !splitMode) setSelectedId(isSelected ? null : room.id); }}>
-                            <polygon
-                              points={pts}
-                              fill={isSelected ? "rgba(45,106,79,0.25)" : "rgba(45,106,79,0.10)"}
-                              stroke={isSelected ? "#2D6A4F" : "rgba(45,106,79,0.4)"}
-                              strokeWidth={isSelected ? 2.5 : 1.5}
-                              style={{ cursor: editorMode === "rooms" ? "pointer" : "inherit", transition: "fill 0.15s" }}
-                            />
-                            <text
-                              x={cx} y={cy}
-                              textAnchor="middle" dominantBaseline="central"
-                              fill="#1A1A2E"
-                              fontSize={Math.max(12, (imgDims?.w || mapping.width_px) / 80)}
-                              fontWeight={600}
-                              style={{ pointerEvents: "none", textShadow: "0 1px 3px rgba(255,255,255,0.8)" }}
-                            >
-                              {room.label || room.id}
-                            </text>
-                          </g>
-                        );
-                      })}
-
                       {/* Sprinkler pipes */}
                       {pipesData?.pipes?.map((pipe, i) => {
                         const p1 = worldToPixel(mapping, pipe.from[0], pipe.from[1]);
                         const p2 = worldToPixel(mapping, pipe.to[0], pipe.to[1]);
                         const isSel = selectedPipeIdx === i;
+                        const baseW = pipeStrokeWidthPx(pipe.diameter);
                         return (
                           <g key={`pipe-${i}`}
                             onClick={(e) => {
@@ -3401,10 +3650,10 @@ function RoomEditor({
                           >
                             {isSel ? (
                               <line x1={p1.px} y1={p1.py} x2={p2.px} y2={p2.py}
-                                stroke="#ffe58f" strokeWidth={6} opacity={0.5} />
+                                stroke="#ffe58f" strokeWidth={baseW + 3} opacity={0.5} />
                             ) : null}
                             <line x1={p1.px} y1={p1.py} x2={p2.px} y2={p2.py}
-                              stroke={isSel ? "#f59e0b" : "#DC2626"} strokeWidth={isSel ? 3 : 2} opacity={isSel ? 1 : 0.7} />
+                              stroke={isSel ? "#f59e0b" : "#DC2626"} strokeWidth={isSel ? Math.max(3, baseW + 0.8) : baseW} opacity={isSel ? 1 : 0.7} />
                             {(editorMode === "pipe_select" || editorMode === "pipe_draw") ? (
                               <line x1={p1.px} y1={p1.py} x2={p2.px} y2={p2.py}
                                 stroke="transparent" strokeWidth={12} />
@@ -3414,6 +3663,7 @@ function RoomEditor({
                       })}
                       {/* Pipe draw preview */}
                       {editorMode === "pipe_draw" && pipeDrawStart && pipeDrawEnd ? (() => {
+                        const drawW = pipeStrokeWidthPx(drawPipeDiameter);
                         const dx = Math.abs(pipeDrawEnd.px - pipeDrawStart.px);
                         const dy = Math.abs(pipeDrawEnd.py - pipeDrawStart.py);
                         const snappedEnd = dx > dy
@@ -3421,9 +3671,12 @@ function RoomEditor({
                           : { px: pipeDrawStart.px, py: pipeDrawEnd.py };
                         return (
                           <line x1={pipeDrawStart.px} y1={pipeDrawStart.py} x2={snappedEnd.px} y2={snappedEnd.py}
-                            stroke="#DC2626" strokeWidth={2} strokeDasharray="8 4" opacity={0.8} />
+                            stroke="#DC2626" strokeWidth={drawW} strokeDasharray="8 4" opacity={0.8} />
                         );
                       })() : null}
+                      {editorMode === "pipe_draw" && pipeJoinHover ? (
+                        <circle cx={pipeJoinHover.px} cy={pipeJoinHover.py} r={4.5} fill="#FFFFFF" stroke="#DC2626" strokeWidth={2} />
+                      ) : null}
                       {pipesData?.sources?.map((src, i) => {
                         const p = worldToPixel(mapping, src.x, src.y);
                         return (
@@ -3466,10 +3719,44 @@ function RoomEditor({
                         );
                       })()}
 
+                      {/* Alignment guides while moving elements */}
+                      {groupDrag ? (
+                        <g style={{ pointerEvents: "none" }}>
+                          {alignmentGuides.vertical.map((x, i) => (
+                            <line
+                              key={`guide-v-${i}-${Math.round(x)}`}
+                              x1={x}
+                              y1={0}
+                              x2={x}
+                              y2={imgDims?.h || 0}
+                              stroke="#2D6A4F"
+                              strokeWidth={1.5}
+                              strokeDasharray="6 4"
+                              opacity={0.75}
+                            />
+                          ))}
+                          {alignmentGuides.horizontal.map((y, i) => (
+                            <line
+                              key={`guide-h-${i}-${Math.round(y)}`}
+                              x1={0}
+                              y1={y}
+                              x2={imgDims?.w || 0}
+                              y2={y}
+                              stroke="#2D6A4F"
+                              strokeWidth={1.5}
+                              strokeDasharray="6 4"
+                              opacity={0.75}
+                            />
+                          ))}
+                        </g>
+                      ) : null}
+
                       {/* Detectors */}
                       {detectors.map(d => {
                         const p = groupPreview?.[d.id] || worldToPixel(mapping, d.x, d.y);
                         const isSel = selectedDetectorIds.includes(d.id);
+                        const isSprinkler = (d.dtype || "").toLowerCase() === "sprinkler";
+                        const rotationDeg = d.rotation_deg ?? 0;
                         return (
                           <g key={d.id}>
                             {isSel ? (
@@ -3478,32 +3765,14 @@ function RoomEditor({
                                 <circle cx={p.px} cy={p.py} r={15} fill="none" stroke="#ffe58f" strokeWidth={3} strokeDasharray="6 4" />
                               </>
                             ) : null}
-                            {renderPlacedObject(d.dtype, p.px, p.py)}
-                            <circle cx={p.px} cy={p.py} r={11} fill="none" stroke={isSel ? "#ffe58f" : "#ffffff"} strokeWidth={isSel ? 3 : 2} />
+                            <g transform={`rotate(${rotationDeg} ${p.px} ${p.py})`}>
+                              {renderPlacedObject(d.dtype, p.px, p.py, mapping, worldToM)}
+                            </g>
+                            {!isSprinkler ? <circle cx={p.px} cy={p.py} r={11} fill="none" stroke={isSel ? "#ffe58f" : "#ffffff"} strokeWidth={isSel ? 3 : 2} /> : null}
                             {isSel ? <circle cx={p.px} cy={p.py} r={3} fill="#fff7d1" /> : null}
                           </g>
                         );
                       })}
-
-                      {/* Split line preview */}
-                      {editorMode === "rooms" && splitMode && splitStart && splitPreviewEnd ? (
-                        <line x1={splitStart.px} y1={splitStart.py} x2={splitPreviewEnd.px} y2={splitPreviewEnd.py}
-                          stroke="#DC2626" strokeWidth={3} strokeDasharray="8 4" />
-                      ) : null}
-                      {editorMode === "rooms" && splitMode && splitHover ? (
-                        <circle cx={splitHover.px} cy={splitHover.py} r={5} fill="#FEE2E2" stroke="#DC2626" strokeWidth={2} style={{ pointerEvents: "none" }} />
-                      ) : null}
-                      {editorMode === "rooms" && splitMode && selectedRoom ? selectedRoom.polygon_px.map((p, idx) => {
-                        const dot = { px: p[0], py: p[1] };
-                        const isStart = !!splitStart && samePoint(splitStart, dot);
-                        return (
-                          <circle key={`split-dot-${idx}`} cx={dot.px} cy={dot.py} r={isStart ? 8 : 6}
-                            fill={isStart ? "#DC2626" : "#FFFFFF"} stroke={isStart ? "#FCA5A5" : "#2D6A4F"} strokeWidth={2}
-                            style={{ cursor: "pointer" }}
-                            onClick={(e) => { e.stopPropagation(); handleSplitDotClick(dot); }}
-                          />
-                        );
-                      }) : null}
 
                       {/* Marquee selection */}
                       {marquee ? (() => {
@@ -3573,82 +3842,18 @@ function RoomEditor({
         {/* Tab bar */}
         <div style={{ display: "flex", borderBottom: "1px solid #E8EAED", flexShrink: 0 }}>
           <button
-            onClick={() => setSidebarTab("rooms")}
-            style={{
-              flex: 1, padding: "12px 0", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600,
-              background: sidebarTab === "rooms" ? "#FFFFFF" : "#FAFBFC",
-              color: sidebarTab === "rooms" ? "#2D6A4F" : "#6B7280",
-              borderBottom: sidebarTab === "rooms" ? "2px solid #2D6A4F" : "2px solid transparent",
-            }}
-          >
-            Rooms ({rooms.length})
-          </button>
-          <button
             onClick={() => setSidebarTab("equipment")}
             style={{
               flex: 1, padding: "12px 0", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600,
-              background: sidebarTab === "equipment" ? "#FFFFFF" : "#FAFBFC",
-              color: sidebarTab === "equipment" ? "#2D6A4F" : "#6B7280",
-              borderBottom: sidebarTab === "equipment" ? "2px solid #2D6A4F" : "2px solid transparent",
+              background: "#FFFFFF",
+              color: "#2D6A4F",
+              borderBottom: "2px solid #2D6A4F",
             }}
           >
             Equipment ({detectors.length})
           </button>
         </div>
 
-        {sidebarTab === "rooms" ? (
-          <>
-            <div style={{ padding: "10px 14px 6px" }}>
-              <p style={{ margin: 0, fontSize: 12, color: "#6B7280", lineHeight: 1.4 }}>
-                Click a room to select, then rename, delete, or split. Switch to Add/Select mode to place equipment.
-              </p>
-            </div>
-            <div style={{ flex: 1, overflow: "auto", padding: "6px 14px" }}>
-              {rooms.map((room) => {
-                const isSelected = room.id === selectedId;
-                return (
-                  <div
-                    key={room.id}
-                    onClick={() => { setSelectedId(isSelected ? null : room.id); setEditorMode("rooms"); }}
-                    style={{
-                      padding: "10px 12px", marginBottom: 6, borderRadius: 10,
-                      border: isSelected ? "1px solid #2D6A4F" : "1px solid #E8EAED",
-                      background: isSelected ? "rgba(45,106,79,0.06)" : "#FAFBFC",
-                      cursor: "pointer", transition: "all 0.15s",
-                    }}
-                  >
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      {editingLabelId === room.id ? (
-                        <input
-                          autoFocus
-                          value={labelDraft}
-                          onChange={e => setLabelDraft(e.target.value)}
-                          onBlur={() => handleRenameCommit(room.id)}
-                          onKeyDown={e => { if (e.key === "Enter") handleRenameCommit(room.id); if (e.key === "Escape") setEditingLabelId(null); }}
-                          onClick={e => e.stopPropagation()}
-                          style={{
-                            background: "#FFFFFF", border: "1px solid #2D6A4F", borderRadius: 6,
-                            color: "#1A1A2E", padding: "4px 8px", fontSize: 13, width: "60%", outline: "none",
-                          }}
-                        />
-                      ) : (
-                        <span style={{ fontSize: 13, fontWeight: 600, color: "#1A1A2E" }}>{room.label || room.id}</span>
-                      )}
-                      <span style={{ fontSize: 11, color: "#9CA3AF" }}>{room.polygon_px.length} pts</span>
-                    </div>
-                    {isSelected && canEdit ? (
-                      <div style={{ marginTop: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
-                        <button onClick={(e) => { e.stopPropagation(); handleRenameStart(room); }} style={ceRoomBtn}>Rename</button>
-                        <button onClick={(e) => { e.stopPropagation(); resetSplitState(); setSplitMode(true); setEditorMode("rooms"); }} style={ceRoomBtn}>Split</button>
-                        <button onClick={(e) => { e.stopPropagation(); handleDeleteRoom(room.id); }} style={{ ...ceRoomBtn, borderColor: "rgba(220,38,38,0.3)", color: "#DC2626" }}>Delete</button>
-                      </div>
-                    ) : null}
-                  </div>
-                );
-              })}
-            </div>
-          </>
-        ) : (
           <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
             <div style={{ padding: "10px 14px 6px" }}>
               <p style={{ margin: 0, fontSize: 12, color: "#6B7280", lineHeight: 1.4 }}>
@@ -3658,24 +3863,6 @@ function RoomEditor({
               </p>
             </div>
 
-            {canEdit && (
-            <div style={{ padding: "0 14px 6px" }}>
-              <button
-                onClick={() => autoPlaceEquipment(addType === "mcb" || addType === "hooter" ? "mcp_hooter" : addType)}
-                disabled={!!isAutoPlacing || rooms.length === 0}
-                style={{
-                  width: "100%", padding: "8px 10px", borderRadius: 8,
-                  border: "none", background: "#2D6A4F", color: "#fff",
-                  fontWeight: 700, fontSize: 12,
-                  cursor: (!!isAutoPlacing || rooms.length === 0) ? "wait" : "pointer",
-                  display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
-                }}
-              >
-                {!!isAutoPlacing ? "Auto-placing..." : `Auto-place Selected (${addType === "mcb" || addType === "hooter" ? "MCP & Hooter" : addType})`}
-              </button>
-            </div>
-            )}
-
             {/* Per-equipment auto-place buttons */}
             {canEdit && (
             <div style={{ padding: "6px 14px", display: "flex", flexDirection: "column", gap: 6 }}>
@@ -3683,7 +3870,7 @@ function RoomEditor({
                 const EQUIPMENT_BUTTONS: { key: string; dtype: string; label: string; icon: React.ReactNode }[] = [
                   {
                     key: "auto_detection_alarm", dtype: "smoke",
-                    label: "Detectors & Alarms",
+                    label: "Smoke Detectors",
                     icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><text x="12" y="16" textAnchor="middle" fontSize="12" fontWeight="700" fill="currentColor" stroke="none">S</text></svg>,
                   },
                   {
@@ -3692,19 +3879,9 @@ function RoomEditor({
                     icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2v6"/><path d="M5 10l7 4 7-4"/><path d="M5 14l2 6"/><path d="M19 14l-2 6"/><path d="M12 14v8"/></svg>,
                   },
                   {
-                    key: "hose_reel", dtype: "fire_hose",
-                    label: "Fire Hose Reels",
-                    icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/></svg>,
-                  },
-                  {
-                    key: "fire_extinguisher", dtype: "panel",
-                    label: "Fire Extinguishers",
-                    icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="6" y="4" width="12" height="16" rx="2"/><line x1="10" y1="2" x2="14" y2="2"/><line x1="12" y1="8" x2="12" y2="14"/></svg>,
-                  },
-                  {
-                    key: "manual_fire_alarm", dtype: "mcp_hooter",
-                    label: "MCP & Hooter",
-                    icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>,
+                    key: "yard_hydrant", dtype: "fire_hose",
+                    label: "External Hydrant",
+                    icon: <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden><rect x="2.5" y="10" width="7.5" height="4" fill="none" stroke="currentColor" strokeWidth="1.8"/><line x1="2.7" y1="12" x2="11.6" y2="12" stroke="currentColor" strokeWidth="1.2" opacity="0.9"/><rect x="8.6" y="7.6" width="3.6" height="8.8" fill="currentColor"/><circle cx="14.2" cy="12" r="3.9" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M10.3 12 C 12.1 10.3, 14.8 13.7, 17 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/><path d="M19.6 8.4 Q21 12 19.6 15.6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/><line x1="20.9" y1="8.8" x2="20.9" y2="15.2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>,
                   },
                 ];
 
@@ -3937,6 +4114,17 @@ function RoomEditor({
                         >
                           Select / Delete
                         </button>
+                        <button
+                          onClick={clearPipes}
+                          style={{
+                            padding: "6px 10px", borderRadius: 8,
+                            border: "1px solid rgba(220,38,38,0.25)",
+                            background: "#FFFFFF",
+                            color: "#DC2626", fontWeight: 700, fontSize: 11, cursor: "pointer",
+                          }}
+                        >
+                          Clear Pipes
+                        </button>
                       </div>
                     ) : null}
                   </div>
@@ -3957,14 +4145,7 @@ function RoomEditor({
               )}
             </div>
           </div>
-        )}
 
-        {/* Split mode hint */}
-        {editorMode === "rooms" && splitMode && selectedRoom ? (
-          <div style={{ padding: "0 14px 8px", fontSize: 12, color: "#6B7280" }}>
-            Click two points on the selected room boundary to split.
-          </div>
-        ) : null}
         {editorMode === "measure" ? (
           <div style={{ padding: "0 14px 8px", fontSize: 12, color: "#6B7280", display: "flex", alignItems: "center", gap: 8 }}>
             Click first point, click second to lock. Click again to start a new measurement.
@@ -3979,49 +4160,6 @@ function RoomEditor({
           </div>
         ) : null}
 
-        {/* Bottom action bar */}
-        {canEdit && (
-        <div style={{ padding: "12px 14px", borderTop: "1px solid #E8EAED", display: "flex", gap: 8, flexShrink: 0 }}>
-          {splitMode ? (
-            <button onClick={() => { setSplitMode(false); resetSplitState(); }} style={{ ...ceRoomBtn, flex: 1, background: "rgba(220,38,38,0.06)" }}>
-              Cancel Split
-            </button>
-          ) : null}
-          <button
-            onClick={handleSaveChanges}
-            disabled={isSavingChanges || isContinuing}
-            style={{
-              flex: 1, padding: "10px 16px", borderRadius: 10,
-              border: "1px solid #2D6A4F",
-              background: isSavingChanges ? "rgba(45,106,79,0.08)" : "#FFFFFF",
-              color: "#2D6A4F",
-              fontWeight: 600, fontSize: 13,
-              cursor: (isSavingChanges || isContinuing) ? "wait" : "pointer",
-              opacity: (isSavingChanges || isContinuing) ? 0.5 : 1,
-              display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
-            }}
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
-              <polyline points="17 21 17 13 7 13 7 21"/>
-              <polyline points="7 3 7 8 15 8"/>
-            </svg>
-            {isSavingChanges ? "Saving..." : "Save Changes"}
-          </button>
-          <button
-            onClick={handleContinue}
-            disabled={isSavingRooms || isContinuing || rooms.length === 0}
-            style={{
-              flex: 1, padding: "10px 16px", borderRadius: 10, border: "none",
-              background: "linear-gradient(135deg, #2D6A4F, #40916C)", color: "#fff",
-              fontWeight: 600, fontSize: 13, cursor: (isSavingRooms || isContinuing) ? "wait" : "pointer",
-              opacity: (isSavingRooms || isContinuing) ? 0.5 : 1,
-            }}
-          >
-            {isContinuing ? "Finalizing..." : "Finalize & Export"}
-          </button>
-        </div>
-        )}
       </div>
     </div>
   );
@@ -4035,6 +4173,22 @@ const ceToolBtn = (active: boolean): CSSProperties => ({
   cursor: "pointer", fontSize: 12, fontWeight: 600,
   display: "inline-flex", alignItems: "center", gap: 5,
 });
+
+const cePaintActionBtn: CSSProperties = {
+  borderRadius: 8,
+  border: "1px solid #D1D5DB",
+  background: "#FFFFFF",
+  color: "#1A1A2E",
+  height: 30,
+  minWidth: 70,
+  padding: "0 10px",
+  cursor: "pointer",
+  fontSize: 12,
+  fontWeight: 700,
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 5,
+};
 
 const ceObjectBtn = (active: boolean): CSSProperties => ({
   borderRadius: 8, border: active ? "1px solid #2D6A4F" : "1px solid #E8EAED",
@@ -4335,6 +4489,7 @@ function Editor({
       id: crypto.randomUUID(),
       project_id: projectId,
       x: w.x, y: w.y, z: 0,
+      rotation_deg: 0,
       dtype: addType,
       locked: false,
       floor_plan_id: floorPlanId || null,
@@ -4346,6 +4501,7 @@ function Editor({
       const payload: any = {
         detectors: detectors.map(d => ({
           id: d.id, x: d.x, y: d.y, z: d.z,
+          rotation_deg: d.rotation_deg ?? 0,
           dtype: d.dtype, locked: d.locked,
           floor_plan_id: d.floor_plan_id,
         })),
@@ -4421,11 +4577,11 @@ function Editor({
     // Draw sprinkler pipes
     if (pipesData?.pipes) {
       ctx.strokeStyle = "#DC2626";
-      ctx.lineWidth = 2;
       ctx.globalAlpha = 0.7;
       for (const pipe of pipesData.pipes) {
         const p1 = worldToPixel(mapping, pipe.from[0], pipe.from[1]);
         const p2 = worldToPixel(mapping, pipe.to[0], pipe.to[1]);
+        ctx.lineWidth = pipeStrokeWidthPx(pipe.diameter);
         ctx.beginPath();
         ctx.moveTo(p1.px, p1.py);
         ctx.lineTo(p2.px, p2.py);
@@ -4453,12 +4609,19 @@ function Editor({
 
     for (const d of detectors) {
       const p = worldToPixel(mapping, d.x, d.y);
-      drawPlacedObjectOnCanvas(ctx, d.dtype, p.px, p.py);
-      ctx.beginPath();
-      ctx.arc(p.px, p.py, 11, 0, Math.PI * 2);
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 2;
-      ctx.stroke();
+      const rotationRad = ((d.rotation_deg ?? 0) * Math.PI) / 180;
+      ctx.save();
+      ctx.translate(p.px, p.py);
+      ctx.rotate(rotationRad);
+      drawPlacedObjectOnCanvas(ctx, d.dtype, 0, 0, mapping, worldToM);
+      ctx.restore();
+      if ((d.dtype || "").toLowerCase() !== "sprinkler") {
+        ctx.beginPath();
+        ctx.arc(p.px, p.py, 11, 0, Math.PI * 2);
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
     }
 
     const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
@@ -4488,6 +4651,15 @@ function Editor({
       if (!pt) return d;
       const w = pixelToWorld(mapping, pt.px, pt.py);
       return { ...d, x: w.x, y: w.y };
+    }));
+  }
+
+  function rotateDetectorsMany(ids: string[], deltaDeg: number) {
+    if (!ids.length || !canEdit) return;
+    const idSet = new Set(ids);
+    setDetectors(prev => prev.map(d => {
+      if (!idSet.has(d.id)) return d;
+      return { ...d, rotation_deg: normalizeAngleDeg((d.rotation_deg ?? 0) + deltaDeg) };
     }));
   }
 
@@ -4634,6 +4806,8 @@ function Editor({
                 </span>
                 {selectedIds.length > 0 ? (
                   <>
+                    {canEdit && <button onClick={() => rotateDetectorsMany(selectedIds, -15)} style={toolBtn(false)}>Rotate -15°</button>}
+                    {canEdit && <button onClick={() => rotateDetectorsMany(selectedIds, 15)} style={toolBtn(false)}>Rotate +15°</button>}
                     {canEdit && <button onClick={() => deleteDetectorsMany(selectedIds)} style={{ ...toolBtn(false), color: "#FF6B6B" }}>Delete Selected</button>}
                     <button onClick={() => setSelectedIds([])} style={toolBtn(false)}>Clear</button>
                   </>
@@ -4820,7 +4994,7 @@ function Editor({
                       const p2 = worldToPixel(mapping, pipe.to[0], pipe.to[1]);
                       return (
                         <line key={`pipe-${i}`} x1={p1.px} y1={p1.py} x2={p2.px} y2={p2.py}
-                          stroke="#DC2626" strokeWidth={2} opacity={0.7} />
+                          stroke="#DC2626" strokeWidth={pipeStrokeWidthPx(pipe.diameter)} opacity={0.7} />
                       );
                     })}
                     {pipesData?.sources?.map((src, i) => {
@@ -4836,6 +5010,8 @@ function Editor({
                     {detectors.map((d)=> {
                       const p = groupPreview?.[d.id] || worldToPixel(mapping, d.x, d.y);
                       const isSelected = selectedIds.includes(d.id);
+                      const isSprinkler = (d.dtype || "").toLowerCase() === "sprinkler";
+                      const rotationDeg = d.rotation_deg ?? 0;
                       return (
                         <g key={d.id}>
                           {isSelected ? (
@@ -4844,8 +5020,10 @@ function Editor({
                               <circle cx={p.px} cy={p.py} r={15} fill="none" stroke="#ffe58f" strokeWidth={3} strokeDasharray="6 4" />
                             </>
                           ) : null}
-                          {renderPlacedObject(d.dtype, p.px, p.py)}
-                          <circle cx={p.px} cy={p.py} r={11} fill="none" stroke={isSelected ? "#ffe58f" : "#ffffff"} strokeWidth={isSelected ? 3 : 2} />
+                          <g transform={`rotate(${rotationDeg} ${p.px} ${p.py})`}>
+                            {renderPlacedObject(d.dtype, p.px, p.py, mapping, worldToM)}
+                          </g>
+                          {!isSprinkler ? <circle cx={p.px} cy={p.py} r={11} fill="none" stroke={isSelected ? "#ffe58f" : "#ffffff"} strokeWidth={isSelected ? 3 : 2} /> : null}
                           {isSelected ? (
                             <circle cx={p.px} cy={p.py} r={3} fill="#fff7d1" />
                           ) : null}
@@ -4948,10 +5126,26 @@ function objectFill(dtype: string): string {
   if (key === "hooter") return "#c77dff";
   if (key === "mcb") return "#4ecdc4";
   if (key === "sprinkler") return "#DC2626";
+  if (key === "fire_hose") return "#DC2626";
+  if (key === "internal_hydrant") return "#D946EF";
+  if (key === "beam_detector") return "#FF00CC";
+  if (key === "reflector") return "#2563EB";
   return "#ff5a7e";
 }
 
-function renderPlacedObject(dtype: string, cx: number, cy: number) {
+function scaledDeviceRadiusPx(mapping: Mapping, worldToM: number, cx: number, cy: number, fallbackPx: number, radiusMeters = 0.02) {
+  if (!Number.isFinite(worldToM) || worldToM <= 0) return fallbackPx;
+  const radiusWorld = radiusMeters / worldToM;
+  if (!Number.isFinite(radiusWorld) || radiusWorld <= 0) return fallbackPx;
+
+  const centerWorld = pixelToWorld(mapping, cx, cy);
+  const edgePx = worldToPixel(mapping, centerWorld.x + radiusWorld, centerWorld.y);
+  const radiusPx = Math.hypot(edgePx.px - cx, edgePx.py - cy);
+  if (!Number.isFinite(radiusPx) || radiusPx <= 0) return fallbackPx;
+  return radiusPx;
+}
+
+function renderPlacedObject(dtype: string, cx: number, cy: number, mapping: Mapping, worldToM: number) {
   const key = (dtype || "").toLowerCase();
 
   if (key === "panel") {
@@ -4991,11 +5185,77 @@ function renderPlacedObject(dtype: string, cx: number, cy: number) {
   }
 
   if (key === "sprinkler") {
+    const radiusPx = Math.max(4, scaledDeviceRadiusPx(mapping, worldToM, cx, cy, 9, 0.01));
+    const arm = Math.max(2.8, radiusPx * 0.67);
+    const strokeW = Math.max(1.2, Math.min(2.2, radiusPx * 0.4));
+    const haloW = strokeW + 1.4;
     return (
       <>
-        <circle cx={cx} cy={cy} r={9} fill="none" stroke="#DC2626" strokeWidth={2.2} />
-        <line x1={cx - 6} y1={cy} x2={cx + 6} y2={cy} stroke="#DC2626" strokeWidth={2.2} />
-        <line x1={cx} y1={cy - 6} x2={cx} y2={cy + 6} stroke="#DC2626" strokeWidth={2.2} />
+        <line x1={cx - arm} y1={cy} x2={cx + arm} y2={cy} stroke="#FFFFFF" strokeOpacity={0.96} strokeWidth={haloW} strokeLinecap="round" />
+        <line x1={cx} y1={cy - arm} x2={cx} y2={cy + arm} stroke="#FFFFFF" strokeOpacity={0.96} strokeWidth={haloW} strokeLinecap="round" />
+        <circle cx={cx} cy={cy} r={radiusPx} fill="none" stroke="#DC2626" strokeWidth={strokeW} />
+        <line x1={cx - arm} y1={cy} x2={cx + arm} y2={cy} stroke="#DC2626" strokeWidth={strokeW} strokeLinecap="round" />
+        <line x1={cx} y1={cy - arm} x2={cx} y2={cy + arm} stroke="#DC2626" strokeWidth={strokeW} strokeLinecap="round" />
+      </>
+    );
+  }
+
+  if (key === "fire_hose") {
+    return (
+      <>
+        <rect x={cx - 16} y={cy - 3.4} width={9} height={6.8} fill="none" stroke="#DC2626" strokeWidth={2.1} />
+        <line x1={cx - 15.8} y1={cy} x2={cx - 3.8} y2={cy} stroke="#FFFFFF" strokeWidth={1.4} strokeOpacity={0.92} />
+        <rect x={cx - 9.5} y={cy - 8.4} width={4.8} height={16.8} fill="#DC2626" />
+        <circle cx={cx - 1.8} cy={cy} r={6.2} fill="none" stroke="#DC2626" strokeWidth={2.1} />
+        <path d={`M ${cx - 8} ${cy} C ${cx - 4.6} ${cy - 2.8}, ${cx + 1.6} ${cy + 2.8}, ${cx + 6.8} ${cy}`} fill="none" stroke="#DC2626" strokeWidth={1.8} strokeLinecap="round" />
+        <path d={`M ${cx + 7.6} ${cy - 4.8} Q ${cx + 9.4} ${cy} ${cx + 7.6} ${cy + 4.8}`} fill="none" stroke="#DC2626" strokeWidth={2.1} strokeLinecap="round" />
+        <line x1={cx + 9.6} y1={cy - 4.2} x2={cx + 9.6} y2={cy + 4.2} stroke="#DC2626" strokeWidth={2.1} strokeLinecap="round" />
+      </>
+    );
+  }
+
+  if (key === "internal_hydrant") {
+    return (
+      <>
+        <rect x={cx - 14} y={cy - 9} width={28} height={18} fill="none" stroke="#D946EF" strokeWidth={2.1} />
+        <polygon points={`${cx - 13.2},${cy + 8.2} ${cx - 13.2},${cy - 7.8} ${cx + 9.8},${cy + 8.2}`} fill="#E879F9" fillOpacity={0.95} />
+        <polyline points={`${cx - 7.8},${cy - 4.2} ${cx - 3.9},${cy - 1.8} ${cx + 0.1},${cy + 0.6} ${cx + 4.1},${cy + 3} ${cx + 8.1},${cy + 5.4}`} fill="none" stroke="#B91CFF" strokeWidth={1.4} strokeLinecap="square" strokeLinejoin="miter" />
+      </>
+    );
+  }
+
+  if (key === "beam_detector") {
+    return (
+      <>
+        <rect x={cx - 18} y={cy - 10} width={36} height={20} fill="none" stroke="#FF00CC" strokeWidth={1.8} />
+        <path d={`M ${cx - 15} ${cy + 10} L ${cx} ${cy + 2} L ${cx + 15} ${cy + 10}`} fill="none" stroke="#FF00CC" strokeWidth={1.4} />
+        <line x1={cx - 12} y1={cy + 10} x2={cx - 5} y2={cy + 6} stroke="#FF00CC" strokeWidth={1} />
+        <line x1={cx - 8} y1={cy + 10} x2={cx - 1} y2={cy + 6} stroke="#FF00CC" strokeWidth={1} />
+        <line x1={cx - 4} y1={cy + 10} x2={cx + 3} y2={cy + 6} stroke="#FF00CC" strokeWidth={1} />
+        <line x1={cx} y1={cy + 10} x2={cx + 7} y2={cy + 6} stroke="#FF00CC" strokeWidth={1} />
+        <line x1={cx + 4} y1={cy + 10} x2={cx + 11} y2={cy + 6} stroke="#FF00CC" strokeWidth={1} />
+        <text x={cx} y={cy - 1} textAnchor="middle" fontSize={11} fontWeight={700} fill="#FF00CC">B</text>
+      </>
+    );
+  }
+
+  if (key === "reflector") {
+    return (
+      <>
+        <rect x={cx - 16} y={cy - 8} width={32} height={16} fill="none" stroke="#2563EB" strokeWidth={1.8} />
+        <path d={`M ${cx - 14} ${cy + 8} L ${cx} ${cy + 2} L ${cx + 14} ${cy + 8}`} fill="none" stroke="#2563EB" strokeWidth={1.4} />
+        <line x1={cx} y1={cy + 2} x2={cx} y2={cy + 8} stroke="#2563EB" strokeWidth={1.2} />
+        <text x={cx} y={cy - 1} textAnchor="middle" fontSize={11} fontWeight={700} fill="#2563EB">R</text>
+      </>
+    );
+  }
+
+  if (key === "smoke" || key === "heat") {
+    const radiusPx = scaledDeviceRadiusPx(mapping, worldToM, cx, cy, 9);
+    return (
+      <>
+        <circle cx={cx} cy={cy} r={radiusPx} fill="none" stroke="#ff5a7e" strokeWidth={2.2} />
+        <text x={cx} y={cy + 3} textAnchor="middle" fontSize={10} fontWeight={700} fill="#ff5a7e">S</text>
       </>
     );
   }
@@ -5008,7 +5268,7 @@ function renderPlacedObject(dtype: string, cx: number, cy: number) {
   );
 }
 
-function drawPlacedObjectOnCanvas(ctx: CanvasRenderingContext2D, dtype: string, cx: number, cy: number) {
+function drawPlacedObjectOnCanvas(ctx: CanvasRenderingContext2D, dtype: string, cx: number, cy: number, mapping: Mapping, worldToM: number) {
   const key = (dtype || "").toLowerCase();
 
   if (key === "panel") {
@@ -5072,19 +5332,187 @@ function drawPlacedObjectOnCanvas(ctx: CanvasRenderingContext2D, dtype: string, 
   }
 
   if (key === "sprinkler") {
+    const radiusPx = Math.max(4, scaledDeviceRadiusPx(mapping, worldToM, cx, cy, 9, 0.01));
+    const arm = Math.max(2.8, radiusPx * 0.67);
+    const strokeW = Math.max(1.2, Math.min(2.2, radiusPx * 0.4));
+    const haloW = strokeW + 1.4;
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
     ctx.beginPath();
-    ctx.arc(cx, cy, 9, 0, Math.PI * 2);
-    ctx.strokeStyle = "#DC2626";
-    ctx.lineWidth = 2.2;
+    ctx.moveTo(cx - arm, cy);
+    ctx.lineTo(cx + arm, cy);
+    ctx.moveTo(cx, cy - arm);
+    ctx.lineTo(cx, cy + arm);
+    ctx.strokeStyle = "rgba(255,255,255,0.96)";
+    ctx.lineWidth = haloW;
     ctx.stroke();
     ctx.beginPath();
-    ctx.moveTo(cx - 6, cy);
-    ctx.lineTo(cx + 6, cy);
-    ctx.moveTo(cx, cy - 6);
-    ctx.lineTo(cx, cy + 6);
+    ctx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
     ctx.strokeStyle = "#DC2626";
+    ctx.lineWidth = strokeW;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx - arm, cy);
+    ctx.lineTo(cx + arm, cy);
+    ctx.moveTo(cx, cy - arm);
+    ctx.lineTo(cx, cy + arm);
+    ctx.strokeStyle = "#DC2626";
+    ctx.lineWidth = strokeW;
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
+  if (key === "fire_hose") {
+    ctx.save();
+    ctx.strokeStyle = "#DC2626";
+    ctx.lineWidth = 2.1;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+
+    ctx.strokeRect(cx - 16, cy - 3.4, 9, 6.8);
+    ctx.beginPath();
+    ctx.moveTo(cx - 15.8, cy);
+    ctx.lineTo(cx - 3.8, cy);
+    ctx.strokeStyle = "rgba(255,255,255,0.92)";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+
+    ctx.fillStyle = "#DC2626";
+    ctx.fillRect(cx - 9.5, cy - 8.4, 4.8, 16.8);
+
+    ctx.strokeStyle = "#DC2626";
+    ctx.lineWidth = 2.1;
+    ctx.beginPath();
+    ctx.arc(cx - 1.8, cy, 6.2, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(cx - 8, cy);
+    ctx.bezierCurveTo(cx - 4.6, cy - 2.8, cx + 1.6, cy + 2.8, cx + 6.8, cy);
+    ctx.lineWidth = 1.8;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(cx + 7.6, cy - 4.8);
+    ctx.lineWidth = 2.1;
+    ctx.quadraticCurveTo(cx + 9.4, cy, cx + 7.6, cy + 4.8);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(cx + 9.6, cy - 4.2);
+    ctx.lineTo(cx + 9.6, cy + 4.2);
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
+  if (key === "internal_hydrant") {
+    ctx.save();
+    ctx.strokeStyle = "#D946EF";
+    ctx.lineWidth = 2.1;
+    ctx.strokeRect(cx - 14, cy - 9, 28, 18);
+
+    ctx.fillStyle = "rgba(232,121,249,0.95)";
+    ctx.beginPath();
+    ctx.moveTo(cx - 13.2, cy + 8.2);
+    ctx.lineTo(cx - 13.2, cy - 7.8);
+    ctx.lineTo(cx + 9.8, cy + 8.2);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = "#B91CFF";
+    ctx.lineWidth = 1.4;
+    ctx.lineCap = "square";
+    ctx.lineJoin = "miter";
+    ctx.beginPath();
+    ctx.moveTo(cx - 7.8, cy - 4.2);
+    ctx.lineTo(cx - 3.9, cy - 1.8);
+    ctx.lineTo(cx + 0.1, cy + 0.6);
+    ctx.lineTo(cx + 4.1, cy + 3);
+    ctx.lineTo(cx + 8.1, cy + 5.4);
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
+  if (key === "beam_detector") {
+    ctx.strokeStyle = "#FF00CC";
+    ctx.lineWidth = 1.8;
+    ctx.strokeRect(cx - 18, cy - 10, 36, 20);
+
+    ctx.beginPath();
+    ctx.moveTo(cx - 15, cy + 10);
+    ctx.lineTo(cx, cy + 2);
+    ctx.lineTo(cx + 15, cy + 10);
+    ctx.strokeStyle = "#FF00CC";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+
+    const hatch: [number, number, number, number][] = [
+      [cx - 12, cy + 10, cx - 5, cy + 6],
+      [cx - 8, cy + 10, cx - 1, cy + 6],
+      [cx - 4, cy + 10, cx + 3, cy + 6],
+      [cx, cy + 10, cx + 7, cy + 6],
+      [cx + 4, cy + 10, cx + 11, cy + 6],
+    ];
+    ctx.strokeStyle = "#FF00CC";
+    ctx.lineWidth = 1;
+    for (const [x1, y1, x2, y2] of hatch) {
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = "#FF00CC";
+    ctx.font = "700 11px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("B", cx, cy - 1);
+    return;
+  }
+
+  if (key === "reflector") {
+    ctx.strokeStyle = "#2563EB";
+    ctx.lineWidth = 1.8;
+    ctx.strokeRect(cx - 16, cy - 8, 32, 16);
+
+    ctx.beginPath();
+    ctx.moveTo(cx - 14, cy + 8);
+    ctx.lineTo(cx, cy + 2);
+    ctx.lineTo(cx + 14, cy + 8);
+    ctx.strokeStyle = "#2563EB";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + 2);
+    ctx.lineTo(cx, cy + 8);
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+
+    ctx.fillStyle = "#2563EB";
+    ctx.font = "700 11px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("R", cx, cy - 1);
+    return;
+  }
+
+  if (key === "smoke" || key === "heat") {
+    const radiusPx = scaledDeviceRadiusPx(mapping, worldToM, cx, cy, 9);
+    ctx.beginPath();
+    ctx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
+    ctx.strokeStyle = "#ff5a7e";
     ctx.lineWidth = 2.2;
     ctx.stroke();
+    ctx.fillStyle = "#ff5a7e";
+    ctx.font = "700 11px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("S", cx, cy + 0.5);
     return;
   }
 
@@ -5104,6 +5532,10 @@ function objectLabel(dtype: ObjectType): string {
   if (dtype === "mcb") return "MCP";
   if (dtype === "panel") return "FACP";
   if (dtype === "sprinkler") return "Sprinkler";
+  if (dtype === "fire_hose") return "External Hydrant";
+  if (dtype === "internal_hydrant") return "Internal Hydrant";
+  if (dtype === "beam_detector") return "Beam Det.";
+  if (dtype === "reflector") return "Reflector";
   return dtype.charAt(0).toUpperCase() + dtype.slice(1);
 }
 
@@ -5160,6 +5592,51 @@ function renderObjectIcon(dtype: ObjectType) {
         <circle cx="7" cy="7" r="4.2" fill="none" stroke="#DC2626" strokeWidth="1.2" />
         <line x1="4.2" y1="7" x2="9.8" y2="7" stroke="#DC2626" strokeWidth="1.2" />
         <line x1="7" y1="4.2" x2="7" y2="9.8" stroke="#DC2626" strokeWidth="1.2" />
+      </svg>
+    );
+  }
+
+  if (dtype === "fire_hose") {
+    return (
+      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
+        <rect x="0.8" y="6.1" width="4.8" height="3.8" fill="none" stroke="#EF4444" strokeWidth="1.4" />
+        <line x1="1" y1="8" x2="6.8" y2="8" stroke="#FFFFFF" strokeWidth="1" opacity="0.9" />
+        <rect x="4.6" y="3.6" width="2.4" height="8.8" fill="#EF4444" />
+        <circle cx="8.5" cy="8" r="3.2" fill="none" stroke="#EF4444" strokeWidth="1.4" />
+        <path d="M5.3 8 C 6.8 6.8, 9.3 9.2, 11.1 8" fill="none" stroke="#EF4444" strokeWidth="1.2" strokeLinecap="round" />
+        <path d="M12.9 5.8 Q14 8 12.9 10.2" fill="none" stroke="#EF4444" strokeWidth="1.4" strokeLinecap="round" />
+        <line x1="14.3" y1="6.2" x2="14.3" y2="9.8" stroke="#EF4444" strokeWidth="1.4" strokeLinecap="round" />
+      </svg>
+    );
+  }
+
+  if (dtype === "internal_hydrant") {
+    return (
+      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
+        <rect x="1.1" y="2" width="13.8" height="12" fill="none" stroke="#E879F9" strokeWidth="1.4" />
+        <polygon points="1.8,13.2 1.8,3.2 12.9,13.2" fill="#D946EF" />
+        <polyline points="4.5,5.5 6.3,6.6 8.2,7.7 10.1,8.8 12,9.9" fill="none" stroke="#A21CAF" strokeWidth="0.9" strokeLinecap="square" strokeLinejoin="miter" />
+      </svg>
+    );
+  }
+
+  if (dtype === "beam_detector") {
+    return (
+      <svg width="18" height="14" viewBox="0 0 18 14" aria-hidden>
+        <rect x="1.2" y="1" width="15.6" height="12" fill="none" stroke="#FF00CC" strokeWidth="1.2" />
+        <path d="M2.3 13 L9 8.8 L15.7 13" fill="none" stroke="#FF00CC" strokeWidth="1" />
+        <text x="9" y="7.2" textAnchor="middle" fontSize="5" fontWeight="700" fill="#FF00CC">B</text>
+      </svg>
+    );
+  }
+
+  if (dtype === "reflector") {
+    return (
+      <svg width="18" height="14" viewBox="0 0 18 14" aria-hidden>
+        <rect x="1.2" y="1.6" width="15.6" height="10.8" fill="none" stroke="#2563EB" strokeWidth="1.2" />
+        <path d="M2.5 12.2 L9 8.8 L15.5 12.2" fill="none" stroke="#2563EB" strokeWidth="1" />
+        <line x1="9" y1="8.8" x2="9" y2="12.2" stroke="#2563EB" strokeWidth="1" />
+        <text x="9" y="7" textAnchor="middle" fontSize="5" fontWeight="700" fill="#2563EB">R</text>
       </svg>
     );
   }

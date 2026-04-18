@@ -617,16 +617,16 @@ def auto_place_detectors(project_id: str, payload: dict = None, user=Depends(get
             con.execute("DELETE FROM detectors WHERE project_id=? AND dtype=?", (project_id, equipment_type))
         for d in new_dets:
             con.execute(
-                """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,created_at,updated_at)
-                     VALUES (?,?,?,?,?,?,?,?,?)""",
+                 """INSERT INTO detectors (id,project_id,x,y,z,rotation_deg,dtype,locked,created_at,updated_at)
+                     VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (d["id"], project_id, float(d["x"]), float(d["y"]), float(d.get("z", 0.0)),
-                 d.get("dtype", "smoke"), int(d.get("locked", 0)), now(), now()),
+                  float(d.get("rotation_deg", 0.0)), d.get("dtype", "smoke"), int(d.get("locked", 0)), now(), now()),
             )
 
     # Return placed detectors
     with db() as con:
         rows = con.execute(
-            "SELECT id, project_id, x, y, z, dtype, locked FROM detectors WHERE project_id=? ORDER BY created_at ASC",
+            "SELECT id, project_id, x, y, z, rotation_deg, dtype, locked FROM detectors WHERE project_id=? ORDER BY created_at ASC",
             (project_id,),
         ).fetchall()
     return [dict(r) for r in rows]
@@ -709,11 +709,11 @@ def bulk_save(project_id: str, payload: dict, user=Depends(get_current_user)):
             t = now()
             for d in det_list:
                 con.execute(
-                    """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,floor_plan_id,created_at,updated_at)
-                         VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO detectors (id,project_id,x,y,z,rotation_deg,dtype,locked,floor_plan_id,created_at,updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                     (d.get("id", str(__import__('uuid').uuid4())), project_id,
                      float(d["x"]), float(d["y"]), float(d.get("z", 0)),
-                     d.get("dtype", "smoke"), int(d.get("locked", False)),
+                     float(d.get("rotation_deg", 0.0)), d.get("dtype", "smoke"), int(d.get("locked", False)),
                      d.get("floor_plan_id") or floor_plan_id, t, t),
                 )
 
@@ -749,6 +749,7 @@ def bulk_save(project_id: str, payload: dict, user=Depends(get_current_user)):
         "detectors": [
             {"id": row["id"], "project_id": row["project_id"],
              "x": float(row["x"]), "y": float(row["y"]), "z": float(row["z"]),
+             "rotation_deg": float(row["rotation_deg"]) if "rotation_deg" in row.keys() and row["rotation_deg"] is not None else 0.0,
              "dtype": row["dtype"], "locked": bool(row["locked"]),
              "floor_plan_id": row["floor_plan_id"]}
             for row in rows
@@ -766,7 +767,7 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
             raise HTTPException(400, "base DXF not available")
 
         det_rows = con.execute(
-            "SELECT id, x, y, z, dtype, locked FROM detectors WHERE project_id=? ORDER BY created_at ASC",
+            "SELECT id, x, y, z, rotation_deg, dtype, locked FROM detectors WHERE project_id=? ORDER BY created_at ASC",
             (project_id,),
         ).fetchall()
 
@@ -776,6 +777,7 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
                 "x": float(row["x"]),
                 "y": float(row["y"]),
                 "z": float(row["z"]),
+                "rotation_deg": float(row["rotation_deg"]) if "rotation_deg" in row.keys() and row["rotation_deg"] is not None else 0.0,
                 "dtype": row["dtype"],
                 "locked": bool(row["locked"]),
             }
@@ -903,8 +905,8 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
         )
 
         con.execute(
-            "UPDATE projects SET output_dxf_path=?, output_preview_png_path=?, status=?, error=NULL, updated_at=? WHERE id=?",
-            (out_combined, out_png, "ready", now(), project_id),
+            "UPDATE projects SET output_dxf_path=?, output_preview_png_path=?, error=NULL, updated_at=? WHERE id=?",
+            (out_combined, out_png, now(), project_id),
         )
         log_activity(con, user, "saved_project", "project", project_id, r["name"])
         r2 = _authorize_project(con, project_id, user)
@@ -1236,16 +1238,16 @@ def auto_place_floor_plan(project_id: str, fp_id: str, payload: dict = None, use
                         (project_id, equipment_type, fp_id))
         for d in new_dets:
             con.execute(
-                """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,floor_plan_id,created_at,updated_at)
-                     VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                 """INSERT INTO detectors (id,project_id,x,y,z,rotation_deg,dtype,locked,floor_plan_id,created_at,updated_at)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (d["id"], project_id, float(d["x"]), float(d["y"]), float(d.get("z", 0.0)),
-                 d.get("dtype", "smoke"), int(d.get("locked", 0)), fp_id, now(), now()),
+                  float(d.get("rotation_deg", 0.0)), d.get("dtype", "smoke"), int(d.get("locked", 0)), fp_id, now(), now()),
             )
 
     # Return detectors for this floor plan
     with db() as con:
         rows = con.execute(
-            "SELECT id, project_id, x, y, z, dtype, locked, floor_plan_id FROM detectors WHERE project_id=? AND floor_plan_id=? ORDER BY created_at ASC",
+            "SELECT id, project_id, x, y, z, rotation_deg, dtype, locked, floor_plan_id FROM detectors WHERE project_id=? AND floor_plan_id=? ORDER BY created_at ASC",
             (project_id, fp_id),
         ).fetchall()
     return [dict(r) for r in rows]

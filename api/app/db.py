@@ -48,6 +48,7 @@ def init_db():
         x REAL NOT NULL,
         y REAL NOT NULL,
         z REAL NOT NULL DEFAULT 0.0,
+        rotation_deg REAL NOT NULL DEFAULT 0.0,
         dtype TEXT NOT NULL DEFAULT 'smoke',
         locked INTEGER NOT NULL DEFAULT 0,
         floor_plan_id TEXT,
@@ -61,6 +62,8 @@ def init_db():
     det_cols = {row[1] for row in cur.execute("PRAGMA table_info(detectors)").fetchall()}
     if "floor_plan_id" not in det_cols:
         cur.execute("ALTER TABLE detectors ADD COLUMN floor_plan_id TEXT")
+    if "rotation_deg" not in det_cols:
+        cur.execute("ALTER TABLE detectors ADD COLUMN rotation_deg REAL NOT NULL DEFAULT 0.0")
 
     # ✅ auth tables
     cur.execute("""
