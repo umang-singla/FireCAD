@@ -16,7 +16,7 @@ from app.pipeline.run_pipeline import (
 from app.pipeline.gemini_mask import generate_mask_image, DEFAULT_PROMPT
 from app.pipeline.mask_align import align_perfect_tight_box
 from app.pipeline.dxf_export import write_detectors_to_dxf, write_combined_sheets_dxf
-from app.pipeline.render import render_dwg_to_png_with_qcad, write_mapping_from_dxf_and_png
+from app.pipeline.render import render_dwg_to_png_with_qcad, write_mapping_from_dxf_and_png, get_dxf_bbox
 from app.pipeline.nbc_rules import (
     get_questions as nbc_get_questions,
     evaluate_building,
@@ -523,6 +523,8 @@ def update_rooms(project_id: str, payload: dict, user=Depends(get_current_user))
                     payload["doors"] = existing["doors"]
                 if "staircases" in existing and "staircases" not in payload:
                     payload["staircases"] = existing["staircases"]
+                if "shapes" in existing and "shapes" not in payload:
+                    payload["shapes"] = existing["shapes"]
         except Exception:
             pass
     with open(rooms_path, "w", encoding="utf-8") as f:
@@ -617,16 +619,16 @@ def auto_place_detectors(project_id: str, payload: dict = None, user=Depends(get
             con.execute("DELETE FROM detectors WHERE project_id=? AND dtype=?", (project_id, equipment_type))
         for d in new_dets:
             con.execute(
-                """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,created_at,updated_at)
-                     VALUES (?,?,?,?,?,?,?,?,?)""",
+                 """INSERT INTO detectors (id,project_id,x,y,z,rotation_deg,dtype,locked,created_at,updated_at)
+                     VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (d["id"], project_id, float(d["x"]), float(d["y"]), float(d.get("z", 0.0)),
-                 d.get("dtype", "smoke"), int(d.get("locked", 0)), now(), now()),
+                  float(d.get("rotation_deg", 0.0)), d.get("dtype", "smoke"), int(d.get("locked", 0)), now(), now()),
             )
 
     # Return placed detectors
     with db() as con:
         rows = con.execute(
-            "SELECT id, project_id, x, y, z, dtype, locked FROM detectors WHERE project_id=? ORDER BY created_at ASC",
+            "SELECT id, project_id, x, y, z, rotation_deg, dtype, locked FROM detectors WHERE project_id=? ORDER BY created_at ASC",
             (project_id,),
         ).fetchall()
     return [dict(r) for r in rows]
@@ -677,8 +679,9 @@ def bulk_save(project_id: str, payload: dict, user=Depends(get_current_user)):
         pdir = project_dir(project_id)
         floor_plan_id = payload.get("floor_plan_id")
 
-        # ── 1. Save rooms ──────────────────────────────────────────────
+        # ── 1. Save rooms / annotations ────────────────────────────────
         rooms = payload.get("rooms")
+        shapes = payload.get("shapes")
         if rooms is not None:
             if floor_plan_id:
                 fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (floor_plan_id, project_id)).fetchone()
@@ -697,6 +700,31 @@ def bulk_save(project_id: str, payload: dict, user=Depends(get_current_user)):
                 with open(rooms_path, "w", encoding="utf-8") as f:
                     json.dump(rooms_data, f, indent=2)
 
+        # Save shapes/text annotations in rooms JSON alongside rooms.
+        if shapes is not None:
+            if floor_plan_id:
+                fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (floor_plan_id, project_id)).fetchone()
+                if not fp:
+                    raise HTTPException(404, "floor plan not found")
+                rooms_path = fp["rooms_json_path"]
+            else:
+                rooms_path = r["rooms_json_path"]
+            if rooms_path:
+                base: dict = {}
+                if os.path.exists(rooms_path):
+                    try:
+                        with open(rooms_path, "r", encoding="utf-8") as f:
+                            existing = json.load(f)
+                        if isinstance(existing, dict):
+                            base = existing
+                        elif isinstance(existing, list):
+                            base = {"rooms": existing}
+                    except Exception:
+                        base = {}
+                base["shapes"] = shapes
+                with open(rooms_path, "w", encoding="utf-8") as f:
+                    json.dump(base, f, indent=2)
+
         # ── 2. Sync detectors ──────────────────────────────────────────
         det_list = payload.get("detectors")
         if det_list is not None:
@@ -709,11 +737,11 @@ def bulk_save(project_id: str, payload: dict, user=Depends(get_current_user)):
             t = now()
             for d in det_list:
                 con.execute(
-                    """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,floor_plan_id,created_at,updated_at)
-                         VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO detectors (id,project_id,x,y,z,rotation_deg,dtype,locked,floor_plan_id,created_at,updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                     (d.get("id", str(__import__('uuid').uuid4())), project_id,
                      float(d["x"]), float(d["y"]), float(d.get("z", 0)),
-                     d.get("dtype", "smoke"), int(d.get("locked", False)),
+                     float(d.get("rotation_deg", 0.0)), d.get("dtype", "smoke"), int(d.get("locked", False)),
                      d.get("floor_plan_id") or floor_plan_id, t, t),
                 )
 
@@ -749,6 +777,7 @@ def bulk_save(project_id: str, payload: dict, user=Depends(get_current_user)):
         "detectors": [
             {"id": row["id"], "project_id": row["project_id"],
              "x": float(row["x"]), "y": float(row["y"]), "z": float(row["z"]),
+             "rotation_deg": float(row["rotation_deg"]) if "rotation_deg" in row.keys() and row["rotation_deg"] is not None else 0.0,
              "dtype": row["dtype"], "locked": bool(row["locked"]),
              "floor_plan_id": row["floor_plan_id"]}
             for row in rows
@@ -766,7 +795,7 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
             raise HTTPException(400, "base DXF not available")
 
         det_rows = con.execute(
-            "SELECT id, x, y, z, dtype, locked FROM detectors WHERE project_id=? ORDER BY created_at ASC",
+            "SELECT id, x, y, z, rotation_deg, dtype, locked FROM detectors WHERE project_id=? ORDER BY created_at ASC",
             (project_id,),
         ).fetchall()
 
@@ -776,6 +805,7 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
                 "x": float(row["x"]),
                 "y": float(row["y"]),
                 "z": float(row["z"]),
+                "rotation_deg": float(row["rotation_deg"]) if "rotation_deg" in row.keys() and row["rotation_deg"] is not None else 0.0,
                 "dtype": row["dtype"],
                 "locked": bool(row["locked"]),
             }
@@ -784,6 +814,119 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
 
         settings = json.loads(r["settings_json"] or "{}")
         opts = PipelineOptions.from_env().merge_settings(settings)
+
+        def _mapping_scale(mapping_path: str | None) -> float | None:
+            if not mapping_path or not os.path.exists(mapping_path):
+                return None
+            try:
+                with open(mapping_path, "r", encoding="utf-8") as mf:
+                    m = json.load(mf)
+            except Exception:
+                return None
+            fit = m.get("pixel_fit") or {}
+            s = fit.get("scale")
+            if isinstance(s, (int, float)) and float(s) > 0:
+                return float(s)
+            wb = m.get("world_bbox") or {}
+            xmin = float(wb.get("xmin", 0.0))
+            xmax = float(wb.get("xmax", 0.0))
+            ymin = float(wb.get("ymin", 0.0))
+            ymax = float(wb.get("ymax", 0.0))
+            wpx = float(m.get("width_px", 0.0) or 0.0)
+            hpx = float(m.get("height_px", 0.0) or 0.0)
+            span_x = max(1e-9, xmax - xmin)
+            span_y = max(1e-9, ymax - ymin)
+            if wpx <= 0 or hpx <= 0:
+                return None
+            return min(wpx / span_x, hpx / span_y)
+
+        project_scale = _mapping_scale(r["mapping_json_path"]) if "mapping_json_path" in r.keys() else None
+
+        def _pixel_to_world(mapping: dict, px: float, py: float) -> tuple[float, float]:
+            wb = mapping.get("world_bbox") or {}
+            xmin = float(wb.get("xmin", 0.0))
+            xmax = float(wb.get("xmax", 1.0))
+            ymin = float(wb.get("ymin", 0.0))
+            ymax = float(wb.get("ymax", 1.0))
+            fit = mapping.get("pixel_fit") or {}
+            scale = fit.get("scale")
+            if isinstance(scale, (int, float)) and float(scale) > 0:
+                sx = float(scale)
+                ox = float(fit.get("offset_x", 0.0))
+                oy = float(fit.get("offset_y", 0.0))
+                xw = xmin + (float(px) - ox) / sx
+                yw = ymax - (float(py) - oy) / sx
+                return xw, yw
+            # Legacy mappings may omit pixel_fit; derive contain-fit transform
+            # to match renderer behavior and avoid subtle coordinate drift.
+            wpx = float(mapping.get("width_px", 1.0) or 1.0)
+            hpx = float(mapping.get("height_px", 1.0) or 1.0)
+            span_x = max(1e-9, xmax - xmin)
+            span_y = max(1e-9, ymax - ymin)
+            sx = min(wpx / span_x, hpx / span_y)
+            draw_w = span_x * sx
+            draw_h = span_y * sx
+            ox = (wpx - draw_w) * 0.5
+            oy = (hpx - draw_h) * 0.5
+            xw = xmin + (float(px) - ox) / sx
+            yw = ymax - (float(py) - oy) / sx
+            return xw, yw
+
+        def _collect_annotations_from_rooms(rooms_path: str | None, mapping_path: str | None) -> list[dict]:
+            if not rooms_path or not mapping_path:
+                return []
+            if not os.path.exists(rooms_path) or not os.path.exists(mapping_path):
+                return []
+            try:
+                with open(rooms_path, "r", encoding="utf-8") as rf:
+                    rooms_data = json.load(rf)
+                with open(mapping_path, "r", encoding="utf-8") as mf:
+                    mapping_data = json.load(mf)
+            except Exception:
+                return []
+
+            if not isinstance(rooms_data, dict):
+                return []
+            raw_shapes = rooms_data.get("shapes")
+            if not isinstance(raw_shapes, list):
+                return []
+
+            anns: list[dict] = []
+            for s in raw_shapes:
+                if not isinstance(s, dict):
+                    continue
+                kind = str(s.get("kind", "rect")).lower()
+                x = float(s.get("x", 0.0))
+                y = float(s.get("y", 0.0))
+                w = float(s.get("w", 0.0))
+                h = float(s.get("h", 0.0))
+                if w <= 0 or h <= 0:
+                    continue
+                wx1, wy1 = _pixel_to_world(mapping_data, x, y)
+                wx2, wy2 = _pixel_to_world(mapping_data, x + w, y + h)
+                ann = {
+                    "kind": kind,
+                    "xmin": min(wx1, wx2),
+                    "ymin": min(wy1, wy2),
+                    "xmax": max(wx1, wx2),
+                    "ymax": max(wy1, wy2),
+                }
+                if kind == "text":
+                    ann["text"] = str(s.get("text") or "Text")
+                    fs = float(s.get("fontSize", 16.0))
+                    tx, ty = _pixel_to_world(mapping_data, x + 2.0, y + fs)
+                    _, wy_fs = _pixel_to_world(mapping_data, x, y + fs)
+                    _, wy_base = _pixel_to_world(mapping_data, x, y)
+                    ann["text_x"] = tx
+                    ann["text_y"] = ty
+                    ann["text_height"] = max(1e-6, abs(wy_fs - wy_base))
+                anns.append(ann)
+            return anns
+
+        fp_rows = con.execute(
+            "SELECT block_index, mapping_json_path, rooms_json_path FROM floor_plans WHERE project_id=? ORDER BY block_index ASC",
+            (project_id,),
+        ).fetchall()
 
         # Build world_bbox from floor-plan blocks or mapping.json
         world_bbox = None
@@ -807,12 +950,76 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
                 with open(mapping_path, "r", encoding="utf-8") as mf:
                     world_bbox = json.load(mf).get("world_bbox")
 
+        # Global export nudge (applied to all exported entities in world units).
+        # Preferred settings are drawing-relative fractions:
+        #   export_nudge_frac_x, export_nudge_frac_y
+        # where value 0.001 means 0.1% of drawing span along that axis.
+        dx_world = 0.0
+        dy_world = 0.0
+        if world_bbox:
+            span_x = max(1e-9, float(world_bbox["xmax"]) - float(world_bbox["xmin"]))
+            span_y = max(1e-9, float(world_bbox["ymax"]) - float(world_bbox["ymin"]))
+            frac_x = float(settings.get("export_nudge_frac_x", 0.0) or 0.0)
+            frac_y = float(settings.get("export_nudge_frac_y", 0.0) or 0.0)
+            if abs(frac_x) > 1e-12 or abs(frac_y) > 1e-12:
+                dx_world = frac_x * span_x
+                dy_world = frac_y * span_y
+            else:
+                # Backward compatibility: pixel-based nudges converted via mapping scale.
+                # Y in pixels is screen-space (down positive), so invert for world-space Y.
+                px_x = float(settings.get("export_nudge_px_x", settings.get("pipe_export_nudge_px_x", 0.0)) or 0.0)
+                px_y = float(settings.get("export_nudge_px_y", settings.get("pipe_export_nudge_px_y", 0.0)) or 0.0)
+                if abs(px_x) > 1e-9 or abs(px_y) > 1e-9:
+                    scale_for_nudge = project_scale
+                    if (not scale_for_nudge or scale_for_nudge <= 0) and fp_rows:
+                        scale_for_nudge = _mapping_scale(fp_rows[0]["mapping_json_path"]) if "mapping_json_path" in fp_rows[0].keys() else None
+                    if scale_for_nudge and scale_for_nudge > 0:
+                        dx_world = px_x / float(scale_for_nudge)
+                        dy_world = -px_y / float(scale_for_nudge)
+
+        def _shift_xy(x: float, y: float) -> tuple[float, float]:
+            return float(x) + dx_world, float(y) + dy_world
+
+        dets_export = [
+            {
+                **d,
+                "x": _shift_xy(float(d["x"]), float(d["y"]))[0],
+                "y": _shift_xy(float(d["x"]), float(d["y"]))[1],
+            }
+            for d in dets
+        ]
+
+        all_annotations = _collect_annotations_from_rooms(r["rooms_json_path"], r["mapping_json_path"])
+
+        for fp_row in fp_rows:
+            all_annotations.extend(
+                _collect_annotations_from_rooms(fp_row["rooms_json_path"], fp_row["mapping_json_path"])
+            )
+
+        anns_export = []
+        for a in all_annotations:
+            try:
+                na = dict(a)
+                na["xmin"] = float(na["xmin"]) + dx_world
+                na["xmax"] = float(na["xmax"]) + dx_world
+                na["ymin"] = float(na["ymin"]) + dy_world
+                na["ymax"] = float(na["ymax"]) + dy_world
+                if "text_x" in na:
+                    na["text_x"] = float(na["text_x"]) + dx_world
+                if "text_y" in na:
+                    na["text_y"] = float(na["text_y"]) + dy_world
+                anns_export.append(na)
+            except Exception:
+                anns_export.append(a)
+
         out_dxf = os.path.join(project_dir(project_id), "detectors_overlay.dxf")
-        write_detectors_to_dxf(dxf_path, out_dxf, dets,
+        write_detectors_to_dxf(dxf_path, out_dxf, dets_export,
+                               annotations=anns_export,
                                world_to_m=opts.world_to_m, world_bbox=world_bbox)
 
-        # Write sprinkler pipes into the DXF if they exist
-        # Collect pipes from project-level and per-floor-plan files
+        # Write sprinkler pipes into the DXF if they exist.
+        # Important: do not mix project-level and per-floor-plan pipe files,
+        # otherwise stale/global segments can appear offset in exports.
         from app.pipeline.sprinkler_routing import write_sprinklers_to_dxf
         all_pipe_segments = []
         all_pipe_sources = []
@@ -826,6 +1033,8 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
             return (round(float(pt[0]), 4), round(float(pt[1]), 4))
 
         def _add_segment(p_from, p_to, diameter):
+            p_from = _shift_xy(float(p_from[0]), float(p_from[1]))
+            p_to = _shift_xy(float(p_to[0]), float(p_to[1]))
             a = _norm_pt(p_from)
             b = _norm_pt(p_to)
             key_endpoints = tuple(sorted([a, b]))
@@ -836,37 +1045,36 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
             all_pipe_segments.append(((a, b), str(diameter)))
 
         def _add_source(src):
-            s = _norm_pt(src)
+            sx, sy = _shift_xy(float(src[0]), float(src[1]))
+            s = _norm_pt((sx, sy))
             if s in src_seen:
                 return
             src_seen.add(s)
             all_pipe_sources.append(s)
 
-        pipes_json_path = os.path.join(project_dir(project_id), "sprinkler_pipes.json")
-        if os.path.exists(pipes_json_path):
-            with open(pipes_json_path, "r", encoding="utf-8") as pf:
-                pipes_data = json.load(pf)
-            for p in pipes_data.get("pipes", []):
-                _add_segment(p["from"], p["to"], p.get("diameter", "32mm"))
-            for s in pipes_data.get("sources", []):
-                _add_source((s["x"], s["y"]))
-
-        # Per-floor-plan pipes
-        fp_rows = con.execute(
-            "SELECT block_index FROM floor_plans WHERE project_id=? ORDER BY block_index ASC",
-            (project_id,),
-        ).fetchall()
-        for fp_row in fp_rows:
-            fp_pipes_path = os.path.join(project_dir(project_id), f"sprinkler_pipes_{fp_row['block_index']}.json")
-            if os.path.exists(fp_pipes_path):
-                with open(fp_pipes_path, "r", encoding="utf-8") as pf:
-                    fp_pipes = json.load(pf)
-                for p in fp_pipes.get("pipes", []):
+        if fp_rows:
+            # Per-floor-plan pipes are authoritative once floor blocks exist.
+            for fp_row in fp_rows:
+                fp_pipes_path = os.path.join(project_dir(project_id), f"sprinkler_pipes_{fp_row['block_index']}.json")
+                if os.path.exists(fp_pipes_path):
+                    with open(fp_pipes_path, "r", encoding="utf-8") as pf:
+                        fp_pipes = json.load(pf)
+                    for p in fp_pipes.get("pipes", []):
+                        _add_segment(p["from"], p["to"], p.get("diameter", "32mm"))
+                    for s in fp_pipes.get("sources", []):
+                        _add_source((s["x"], s["y"]))
+        else:
+            # Single-plan mode: use project-level pipes.
+            pipes_json_path = os.path.join(project_dir(project_id), "sprinkler_pipes.json")
+            if os.path.exists(pipes_json_path):
+                with open(pipes_json_path, "r", encoding="utf-8") as pf:
+                    pipes_data = json.load(pf)
+                for p in pipes_data.get("pipes", []):
                     _add_segment(p["from"], p["to"], p.get("diameter", "32mm"))
-                for s in fp_pipes.get("sources", []):
+                for s in pipes_data.get("sources", []):
                     _add_source((s["x"], s["y"]))
 
-        sprinkler_dets = [(float(d["x"]), float(d["y"])) for d in dets if d["dtype"] == "sprinkler"]
+        sprinkler_dets = [(float(d["x"]), float(d["y"])) for d in dets_export if d["dtype"] == "sprinkler"]
         if sprinkler_dets or all_pipe_segments:
             write_sprinklers_to_dxf(
                 out_dxf, out_dxf,
@@ -879,7 +1087,8 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
         write_combined_sheets_dxf(
             base_dxf=dxf_path,
             out_combined_dxf=out_combined,
-            detectors=dets,
+            detectors=dets_export,
+            annotations=anns_export,
             sprinkler_pipes=all_pipe_segments,
             sprinkler_sources=list(all_pipe_sources),
             world_to_m=opts.world_to_m,
@@ -889,22 +1098,30 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
         out_png = os.path.join(project_dir(project_id), "detectors_preview.png")
         out_map = os.path.join(project_dir(project_id), "detectors_preview_mapping.json")
 
+        # Strict WYSIWYG preview: render and mapping must use the exact same world window.
+        wxmin, wymin, wxmax, wymax = get_dxf_bbox(out_dxf, pad_frac=0.0)
+        render_window = f"{wxmin},{wymin},{(wxmax - wxmin)},{(wymax - wymin)}"
+
         render_dwg_to_png_with_qcad(
             dwg_path=out_dxf,
             out_png=out_png,
             target_long_side_px=min(opts.target_long_side_px, 8000),
             background="white",
+            window=render_window,
+            margin_px_override=0,
+            postprocess_bolden=False,
         )
         write_mapping_from_dxf_and_png(
             dxf_path=out_dxf,
             png_path=out_png,
             out_json=out_map,
-            pad_frac=opts.pad_frac,
+            pad_frac=0.0,
+            bbox_override=(wxmin, wymin, wxmax, wymax),
         )
 
         con.execute(
-            "UPDATE projects SET output_dxf_path=?, output_preview_png_path=?, status=?, error=NULL, updated_at=? WHERE id=?",
-            (out_combined, out_png, "ready", now(), project_id),
+            "UPDATE projects SET output_dxf_path=?, output_preview_png_path=?, error=NULL, updated_at=? WHERE id=?",
+            (out_combined, out_png, now(), project_id),
         )
         log_activity(con, user, "saved_project", "project", project_id, r["name"])
         r2 = _authorize_project(con, project_id, user)
@@ -1137,6 +1354,8 @@ def update_floor_plan_rooms(project_id: str, fp_id: str, payload: dict, user=Dep
                     payload["doors"] = existing["doors"]
                 if "staircases" in existing and "staircases" not in payload:
                     payload["staircases"] = existing["staircases"]
+                if "shapes" in existing and "shapes" not in payload:
+                    payload["shapes"] = existing["shapes"]
         except Exception:
             pass
     with open(rooms_path, "w", encoding="utf-8") as f:
@@ -1236,16 +1455,16 @@ def auto_place_floor_plan(project_id: str, fp_id: str, payload: dict = None, use
                         (project_id, equipment_type, fp_id))
         for d in new_dets:
             con.execute(
-                """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,floor_plan_id,created_at,updated_at)
-                     VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                 """INSERT INTO detectors (id,project_id,x,y,z,rotation_deg,dtype,locked,floor_plan_id,created_at,updated_at)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (d["id"], project_id, float(d["x"]), float(d["y"]), float(d.get("z", 0.0)),
-                 d.get("dtype", "smoke"), int(d.get("locked", 0)), fp_id, now(), now()),
+                  float(d.get("rotation_deg", 0.0)), d.get("dtype", "smoke"), int(d.get("locked", 0)), fp_id, now(), now()),
             )
 
     # Return detectors for this floor plan
     with db() as con:
         rows = con.execute(
-            "SELECT id, project_id, x, y, z, dtype, locked, floor_plan_id FROM detectors WHERE project_id=? AND floor_plan_id=? ORDER BY created_at ASC",
+            "SELECT id, project_id, x, y, z, rotation_deg, dtype, locked, floor_plan_id FROM detectors WHERE project_id=? AND floor_plan_id=? ORDER BY created_at ASC",
             (project_id, fp_id),
         ).fetchall()
     return [dict(r) for r in rows]

@@ -13,6 +13,7 @@ from app.pipeline.render import (
     render_dwg_to_png_with_qcad,
     write_mapping_from_dxf_and_png,
     render_master_cropped,
+    get_dxf_bbox,
 )
 from app.pipeline.gemini_mask import generate_mask_image
 from app.pipeline.mask_align import align_perfect_tight_box
@@ -553,17 +554,26 @@ def _run_post_room_review_steps(
     stage_start("render_output_preview")
     out_png = os.path.join(pdir, "detectors_preview.png")
     out_map = os.path.join(pdir, "detectors_preview_mapping.json")
+
+    # Strict WYSIWYG preview: keep render window and mapping bbox identical.
+    wxmin, wymin, wxmax, wymax = get_dxf_bbox(out_dxf, pad_frac=0.0)
+    render_window = f"{wxmin},{wymin},{(wxmax - wxmin)},{(wymax - wymin)}"
+
     render_dwg_to_png_with_qcad(
         dwg_path=out_dxf,
         out_png=out_png,
         target_long_side_px=min(opts.target_long_side_px, 8000),
         background="white",
+        window=render_window,
+        margin_px_override=0,
+        postprocess_bolden=False,
     )
     write_mapping_from_dxf_and_png(
         dxf_path=out_dxf,
         png_path=out_png,
         out_json=out_map,
-        pad_frac=opts.pad_frac,
+        pad_frac=0.0,
+        bbox_override=(wxmin, wymin, wxmax, wymax),
     )
 
     stage_done("render_output_preview", stage_ts, out_png=out_png, renderer="qcad")

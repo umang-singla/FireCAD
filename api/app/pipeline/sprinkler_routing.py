@@ -65,8 +65,8 @@ HAZARD_HH = "HH"
 HAZARD_WASHROOM = "WASHROOM"
 HAZARD_NONE = "NONE"
 
-# Deterministic room classification patterns – rule-ID based with priorities.
-DETERMINISTIC_RULES = {
+# Room taxonomy catalog used for Gemini rule-ID mapping.
+ROOM_RULES = {
     "GENERIC_NORMAL_ROOM": {"interpreted_room": "Generic Room", "phrases": ["OFFICE", "CABIN", "MEETING ROOM", "CONFERENCE ROOM", "RECEPTION", "HALL", "BEDROOM", "STORE", "ROOM"], "keywords": ["OFFICE", "CABIN", "MEETING", "CONFERENCE", "ROOM"], "priority": 5},
     "PLANT_AREA": {"interpreted_room": "Plant Area", "phrases": ["PLANT ROOM", "MECHANICAL PLANT", "MACHINE ROOM"], "keywords": ["PLANT", "MECHANICAL", "MACHINE"], "priority": 25},
     "GARAGE_REPAIR": {"interpreted_room": "Garage/Repair", "phrases": ["GARAGE", "REPAIR SHOP", "WORKSHOP"], "keywords": ["GARAGE", "WORKSHOP"], "priority": 40},
@@ -77,20 +77,6 @@ DETERMINISTIC_RULES = {
     "BOILER_GENERATOR_TURBINE_FURNACE": {"interpreted_room": "Heavy Mech/Generator", "phrases": ["BOILER ROOM", "DG ROOM", "GENERATOR", "OVEN"], "keywords": ["BOILER", "DG", "GENERATOR", "OVEN", "TURBINE", "FURNACE", "KILN"], "priority": 54},
     "KITCHEN_PANTRY": {"interpreted_room": "Kitchen/Pantry", "phrases": ["KITCHEN", "PANTRY", "FOOD PREP"], "keywords": ["KITCHEN", "PANTRY"], "priority": 55},
     "DEDICATED_ELECTRICAL_ROOM": {"interpreted_room": "Electrical Room", "phrases": ["ELECTRICAL ROOM", "PANEL ROOM", "SWITCH ROOM", "TRANSFORMER ROOM"], "keywords": ["ELECTRICAL", "PANEL", "SWITCHGEAR", "TRANSFORMER", "ELEC", "ELECT", "UPS", "BATTERY"], "priority": 999},
-}
-
-DIRECT_ALIASES = {
-    "KITCHEN": "KITCHEN_PANTRY", "PANTRY": "KITCHEN_PANTRY",
-    "TOILET": "WASHROOM_TOILET_WC", "WC": "WASHROOM_TOILET_WC",
-    "WASHROOM": "WASHROOM_TOILET_WC", "RESTROOM": "WASHROOM_TOILET_WC",
-    "ELECTRICAL ROOM": "DEDICATED_ELECTRICAL_ROOM",
-    "PANEL ROOM": "DEDICATED_ELECTRICAL_ROOM",
-}
-
-GENERIC_EXCLUSION_HINTS = {
-    "KITCHEN", "PANTRY", "TOILET", "WC", "WASHROOM", "RESTROOM",
-    "ELECTRICAL", "PANEL", "PLANT", "MECHANICAL", "GENERATOR",
-    "DG", "BOILER", "BATTERY", "UPS",
 }
 
 # Mapping from rule-ID to hazard type.
@@ -115,10 +101,10 @@ _HAZARD_PARAMS = {
     HAZARD_LH: {"max_area": 21.0, "max_spacing": 4.5, "min_spacing": 1.8, "max_wall": 2.25},
 }
 
-_VALID_RULE_IDS = list(DETERMINISTIC_RULES.keys()) + ["MANUAL_REVIEW"]
+_VALID_RULE_IDS = list(ROOM_RULES.keys()) + ["MANUAL_REVIEW"]
 _RULE_CATALOG_FOR_LLM = [
     {"rule_id": k, "interpreted_room": v["interpreted_room"], "sample_labels": v["phrases"][:3]}
-    for k, v in DETERMINISTIC_RULES.items()
+    for k, v in ROOM_RULES.items()
 ]
 _GEMINI_LABEL_CACHE: Dict[str, str] = {}
 
@@ -191,56 +177,6 @@ def _merge_room_label_text(room: Dict) -> str:
         candidates.extend(label_texts)
 
     return " ".join(_normalize_label_for_match(c) for c in candidates if c).strip()
-
-
-def _deterministic_classify_rule_id(raw_label: str) -> str | None:
-    """Classify a room label to a rule ID using deterministic rules with priorities.
-
-    Scans ALL rules and picks the highest-priority match so that specific
-    categories (e.g. BOILER_GENERATOR at priority 54) always win over
-    GENERIC_NORMAL_ROOM (priority 5).
-
-    Returns the rule ID (e.g. 'KITCHEN_PANTRY'), 'MANUAL_REVIEW' for
-    dimension-like text, or ``None`` if genuinely unknown.
-    """
-    norm = _normalize_label_for_match(raw_label)
-    if not norm:
-        return None
-
-    # Pure numeric / dimension text → manual review
-    if re.fullmatch(r"^[\d\s\.\-Xx]+$", norm):
-        return "MANUAL_REVIEW"
-
-    # Direct alias match
-    if norm in DIRECT_ALIASES:
-        return DIRECT_ALIASES[norm]
-
-    # Scan ALL rules, collect every match, pick highest priority.
-    words = set(norm.split())
-    best_rule: str | None = None
-    best_priority = -1
-
-    for r_id, r_data in DETERMINISTIC_RULES.items():
-        matched = False
-        if norm in r_data["phrases"] or norm in r_data["keywords"]:
-            matched = True
-        else:
-            for kw in r_data["keywords"]:
-                if kw in words:
-                    matched = True
-                    break
-        if matched and r_data["priority"] > best_priority:
-            best_priority = r_data["priority"]
-            best_rule = r_id
-
-    if best_rule is not None:
-        return best_rule
-
-    # Fallback: if it contains "ROOM" and no exclusion hints, treat as generic
-    if "ROOM" in words and not (words & GENERIC_EXCLUSION_HINTS):
-        return "GENERIC_NORMAL_ROOM"
-
-    return None
 
 
 def _rule_id_to_hazard(rule_id: str) -> str:
@@ -419,14 +355,12 @@ def _classify_room_hazards_with_dxf_text(
     rooms: List[Dict],
     dxf_path: str | None = None,
 ) -> List[str]:
-    """Classify rooms using DXF text extraction + spatial assignment + priority rules.
+    """Classify rooms using DXF text extraction and Gemini rule-ID mapping.
 
     1. Extract all text from DXF (MTEXT exploded → TEXT → bbox centres).
     2. Spatially assign text clusters to room polygons (containment then proximity).
-    3. For each room, classify ALL assigned text clusters via deterministic rules.
-    4. Pick the *highest-priority* rule-ID across all clusters for that room.
-    5. Gemini fallback for genuinely unknown labels only.
-    6. Map final rule-ID → hazard type.
+    3. Build one normalized label string per room from room labels + assigned text.
+    4. Classify with Gemini (with cache), then map final rule-ID → hazard type.
     """
     n = len(rooms)
     hazards: List[str] = [HAZARD_LH] * n
@@ -442,6 +376,7 @@ def _classify_room_hazards_with_dxf_text(
 
         unknown_labels: List[str] = []
         unknown_indices: List[int] = []
+        combined_labels_by_index: Dict[int, str] = {}
 
         for i in range(n):
             # Combine room's own labels AND DXF text assigned to it.
@@ -456,51 +391,22 @@ def _classify_room_hazards_with_dxf_text(
                 hazards[i] = HAZARD_LH
                 continue
 
-            # Step 3-4: Classify each label, pick highest priority.
-            best_rule_id: str | None = None
-            best_priority = -1
-            has_unknown = False
+            combined = " ".join(all_labels)
+            combined_labels_by_index[i] = combined
 
-            for label in all_labels:
-                rule_id = _deterministic_classify_rule_id(label)
-                if rule_id is not None:
-                    priority = DETERMINISTIC_RULES.get(rule_id, {}).get("priority", 10)
-                    if priority > best_priority:
-                        best_priority = priority
-                        best_rule_id = rule_id
-                else:
-                    # Check cache
-                    cached = _GEMINI_LABEL_CACHE.get(label)
-                    if cached:
-                        # cached is a hazard, convert back to check priority
-                        hazards[i] = cached
-                    else:
-                        has_unknown = True
-
-            if best_rule_id is not None:
-                hazards[i] = _rule_id_to_hazard(best_rule_id)
-                logger.debug(
-                    "Room %d classified as %s (rule=%s) from labels: %s",
-                    i, hazards[i], best_rule_id,
-                    "; ".join(all_labels[:3]),
-                )
-            elif has_unknown:
-                # Collect for Gemini batch
-                combined = " ".join(all_labels)
+            # Check cache first; if not present, batch for Gemini.
+            cached = _GEMINI_LABEL_CACHE.get(combined)
+            if cached:
+                hazards[i] = cached
+            else:
                 unknown_labels.append(combined)
                 unknown_indices.append(i)
 
-        # Step 5: Gemini fallback
+        # Step 4: Gemini classification
         if unknown_labels:
             gemini_map = _classify_unknown_labels_with_gemini(sorted(set(unknown_labels)))
             for idx in unknown_indices:
-                merged_own = _merge_room_label_text(rooms[idx])
-                all_labels = [merged_own] if merged_own else []
-                for cluster in room_text[idx]:
-                    norm = _normalize_label_for_match(cluster["label"])
-                    if norm:
-                        all_labels.append(norm)
-                combined = " ".join(all_labels)
+                combined = combined_labels_by_index.get(idx, "")
                 gem_rule = gemini_map.get(combined)
                 if gem_rule:
                     hazard = _rule_id_to_hazard(gem_rule)
@@ -584,7 +490,7 @@ def _classify_unknown_labels_with_gemini(labels: List[str]) -> Dict[str, str]:
 
 
 def _classify_room_hazards(rooms: List[Dict]) -> List[str]:
-    """Deterministic rule-ID classification first, optional Gemini fallback."""
+    """Classify room hazards from labels using cache + Gemini rule-ID mapping."""
     hazards: List[str] = [HAZARD_LH] * len(rooms)
     unknown_labels: List[str] = []
     unknown_indices: List[int] = []
@@ -593,11 +499,6 @@ def _classify_room_hazards(rooms: List[Dict]) -> List[str]:
         merged = _merge_room_label_text(room)
         if not merged:
             hazards[i] = HAZARD_LH
-            continue
-
-        rule_id = _deterministic_classify_rule_id(merged)
-        if rule_id is not None:
-            hazards[i] = _rule_id_to_hazard(rule_id)
             continue
 
         cached = _GEMINI_LABEL_CACHE.get(merged)
@@ -1493,20 +1394,35 @@ def write_sprinklers_to_dxf(
     doc = ezdxf.readfile(base_dxf)
     msp = doc.modelspace()
 
+    # Remove only sprinkler-layer entities from previous exports.
+    # This avoids duplicate/offset-looking pipe overlays while preserving other AI layers.
+    stale = []
+    for ent in msp:
+        try:
+            if str(getattr(ent.dxf, "layer", "")) in {DXF_LAYER_SPRINKLER, DXF_LAYER_PIPES, DXF_LAYER_SOURCE}:
+                stale.append(ent)
+        except Exception:
+            continue
+    for ent in stale:
+        try:
+            msp.delete_entity(ent)
+        except Exception:
+            continue
+
     for layer_name in [DXF_LAYER_SPRINKLER, DXF_LAYER_PIPES, DXF_LAYER_SOURCE]:
         if layer_name not in doc.layers:
             doc.layers.add(layer_name)
 
     # Increase readability for pipe size labels in output drawings.
     pipe_text_height = text_height_world * 1.10
-    # Keep pipe thickness proportional to symbol scale while enforcing a practical minimum.
-    pipe_const_width = max(symbol_radius_world * 0.18, 0.03 / world_to_m)
-
     # Pipes
     for (pt1, pt2), label in pipes:
-        msp.add_lwpolyline(
-            [pt1, pt2],
-            dxfattribs={"layer": DXF_LAYER_PIPES, "color": 1, "const_width": pipe_const_width},
+        # Export centerline geometry to keep visual alignment with editor.
+        # Wide LWPOLYLINE rendering can appear laterally biased in some CAD viewers.
+        msp.add_line(
+            pt1,
+            pt2,
+            dxfattribs={"layer": DXF_LAYER_PIPES, "color": 1},
         )
         dx = pt2[0] - pt1[0]
         dy = pt2[1] - pt1[1]

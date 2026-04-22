@@ -15,6 +15,7 @@ def _row_to_out(r) -> DetectorOut:
         x=float(r["x"]),
         y=float(r["y"]),
         z=float(r["z"]),
+        rotation_deg=float(r["rotation_deg"]) if "rotation_deg" in r.keys() and r["rotation_deg"] is not None else 0.0,
         dtype=r["dtype"],
         locked=bool(r["locked"]),
         floor_plan_id=r["floor_plan_id"] if "floor_plan_id" in r.keys() else None,
@@ -63,10 +64,10 @@ def create_detector(project_id: str, payload: DetectorCreate, user=Depends(get_c
     with db() as con:
         _authorize_project_write(con, project_id, user)
         con.execute(
-            """INSERT INTO detectors (id,project_id,x,y,z,dtype,locked,floor_plan_id,created_at,updated_at)
-                 VALUES (?,?,?,?,?,?,?,?,?,?)""",
+              """INSERT INTO detectors (id,project_id,x,y,z,rotation_deg,dtype,locked,floor_plan_id,created_at,updated_at)
+                  VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (did, project_id, float(payload.x), float(payload.y), float(payload.z),
-             payload.dtype, 0, payload.floor_plan_id, now(), now())
+               float(payload.rotation_deg), payload.dtype, 0, payload.floor_plan_id, now(), now())
         )
         r = con.execute("SELECT * FROM detectors WHERE id=?", (did,)).fetchone()
     return _row_to_out(r)
@@ -91,10 +92,11 @@ def update_detector(detector_id: str, payload: DetectorUpdate, user=Depends(get_
 
         dtype = payload.dtype if payload.dtype is not None else r["dtype"]
         locked = int(payload.locked) if payload.locked is not None else int(r["locked"])
+        rotation_deg = float(payload.rotation_deg) if payload.rotation_deg is not None else float(r["rotation_deg"]) if "rotation_deg" in r.keys() and r["rotation_deg"] is not None else 0.0
 
         con.execute(
-            "UPDATE detectors SET x=?, y=?, z=?, dtype=?, locked=?, updated_at=? WHERE id=?",
-            (float(payload.x), float(payload.y), float(payload.z), dtype, locked, now(), detector_id)
+            "UPDATE detectors SET x=?, y=?, z=?, rotation_deg=?, dtype=?, locked=?, updated_at=? WHERE id=?",
+            (float(payload.x), float(payload.y), float(payload.z), rotation_deg, dtype, locked, now(), detector_id)
         )
         r2 = con.execute("SELECT * FROM detectors WHERE id=?", (detector_id,)).fetchone()
     return _row_to_out(r2)

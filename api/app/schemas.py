@@ -25,6 +25,7 @@ class DetectorOut(BaseModel):
     x: float
     y: float
     z: float = 0.0
+    rotation_deg: float = 0.0
     dtype: str = "smoke"
     locked: bool = False
     floor_plan_id: Optional[str] = None
@@ -33,6 +34,7 @@ class DetectorCreate(BaseModel):
     x: float
     y: float
     z: float = 0.0
+    rotation_deg: float = 0.0
     dtype: str = "smoke"
     floor_plan_id: Optional[str] = None
 
@@ -40,5 +42,6 @@ class DetectorUpdate(BaseModel):
     x: float
     y: float
     z: float = 0.0
+    rotation_deg: Optional[float] = None
     dtype: Optional[str] = None
     locked: Optional[bool] = None

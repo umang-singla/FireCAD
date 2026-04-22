@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import { use, useEffect, useRef, useState } from "react";
+import { use, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
 import { getToken, getTenantRole } from "../../lib/auth";
@@ -161,6 +161,21 @@ type PipesData = {
   sources: PipeSource[];
 };
 
+type ShapeKind = "rect" | "circle" | "cloud" | "text";
+
+type ShapeAnnotation = {
+  id: string;
+  kind: ShapeKind;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  text?: string;
+  fontSize?: number;
+};
+
+type ShapeResizeHandle = "nw" | "ne" | "sw" | "se";
+
 type NBCSettingsQuestion = {
   id: string;
   type: "select" | "number" | "boolean";
@@ -168,20 +183,25 @@ type NBCSettingsQuestion = {
   options?: string[];
 };
 
+function isBlankNbcAnswer(value: any) {
+  return value === null || value === undefined || value === "";
+}
+
 type Detector = {
   id: string;
   project_id: string;
   x: number;
   y: number;
   z: number;
+  rotation_deg?: number;
   dtype: string;
   locked: boolean;
   floor_plan_id?: string | null;
 };
 
-type ObjectType = "smoke" | "panel" | "hooter" | "mcb" | "sprinkler";
+type ObjectType = "smoke" | "panel" | "hooter" | "mcb" | "sprinkler" | "fire_hose" | "internal_hydrant" | "beam_detector" | "reflector";
 
-const OBJECT_TYPES: ObjectType[] = ["smoke", "panel", "hooter", "mcb", "sprinkler"];
+const OBJECT_TYPES: ObjectType[] = ["smoke", "panel", "hooter", "mcb", "sprinkler", "fire_hose", "internal_hydrant", "beam_detector", "reflector"];
 
 type Mapping = {
   width_px: number;
@@ -197,31 +217,103 @@ type Mapping = {
   };
 };
 
-function worldToPixel(m: Mapping, x: number, y: number) {
-  const { xmin, xmax, ymin, ymax } = m.world_bbox;
+function getMappingFit(m: Mapping) {
   const fit = m.pixel_fit;
   if (fit && Number.isFinite(fit.scale) && fit.scale > 0) {
     return {
-      px: fit.offset_x + (x - xmin) * fit.scale,
-      py: fit.offset_y + (ymax - y) * fit.scale,
+      scale: fit.scale,
+      offset_x: fit.offset_x,
+      offset_y: fit.offset_y,
     };
   }
-  const u = (x - xmin) / (xmax - xmin);
-  const v = (ymax - y) / (ymax - ymin);
-  return { px: u * m.width_px, py: v * m.height_px };
+  // Legacy mappings may not include pixel_fit; derive the same contain-fit transform
+  // used by renderer to avoid subtle stretch-based coordinate drift.
+  const { xmin, xmax, ymin, ymax } = m.world_bbox;
+  const spanX = Math.max(1e-9, xmax - xmin);
+  const spanY = Math.max(1e-9, ymax - ymin);
+  const scale = Math.min(m.width_px / spanX, m.height_px / spanY);
+  const drawW = spanX * scale;
+  const drawH = spanY * scale;
+  return {
+    scale,
+    offset_x: (m.width_px - drawW) * 0.5,
+    offset_y: (m.height_px - drawH) * 0.5,
+  };
+}
+
+function worldToPixel(m: Mapping, x: number, y: number) {
+  const { xmin, xmax, ymin, ymax } = m.world_bbox;
+  const fit = getMappingFit(m);
+  return {
+    px: fit.offset_x + (x - xmin) * fit.scale,
+    py: fit.offset_y + (ymax - y) * fit.scale,
+  };
 }
 function pixelToWorld(m: Mapping, px: number, py: number) {
   const { xmin, xmax, ymin, ymax } = m.world_bbox;
-  const fit = m.pixel_fit;
-  if (fit && Number.isFinite(fit.scale) && fit.scale > 0) {
-    return {
-      x: xmin + (px - fit.offset_x) / fit.scale,
-      y: ymax - (py - fit.offset_y) / fit.scale,
-    };
-  }
-  const u = px / m.width_px;
-  const v = py / m.height_px;
-  return { x: xmin + u*(xmax-xmin), y: ymax - v*(ymax-ymin) };
+  const fit = getMappingFit(m);
+  return {
+    x: xmin + (px - fit.offset_x) / fit.scale,
+    y: ymax - (py - fit.offset_y) / fit.scale,
+  };
+}
+
+function normalizeAngleDeg(angle: number) {
+  const a = angle % 360;
+  return a < 0 ? a + 360 : a;
+}
+
+const PIPE_DIAMETERS_MM = [20, 25, 32, 40, 50, 65, 80, 100, 125, 150, 200, 250, 300, 350, 400] as const;
+
+function normalizePipeDiameter(diameter?: string) {
+  const raw = (diameter || "25mm").toLowerCase().trim();
+  const mm = Number.parseInt(raw.replace("mm", ""), 10);
+  return PIPE_DIAMETERS_MM.includes(mm as (typeof PIPE_DIAMETERS_MM)[number]) ? mm : 25;
+}
+
+function pipeStrokeWidthPx(diameter?: string) {
+  const mm = normalizePipeDiameter(diameter);
+  if (mm <= 20) return 1.6;
+  if (mm <= 25) return 2;
+  if (mm <= 32) return 2.6;
+  if (mm <= 40) return 3.2;
+  if (mm <= 50) return 3.8;
+  if (mm <= 65) return 4.6;
+  if (mm <= 80) return 5.2;
+  if (mm <= 100) return 6;
+  if (mm <= 125) return 6.8;
+  if (mm <= 150) return 7.4;
+  if (mm <= 200) return 8.3;
+  if (mm <= 250) return 9;
+  if (mm <= 300) return 9.6;
+  if (mm <= 350) return 10.2;
+  return 10.8;
+}
+
+function formatLitersWithKl(value: any) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return String(value ?? "-");
+  const liters = Math.round(n);
+  const kl = n / 1000;
+  const klText = Number.isInteger(kl) ? `${kl}` : kl.toFixed(2);
+  return `${liters.toLocaleString()} L (${klText} KL)`;
+}
+
+function humanizeWaterPumpKey(key: string) {
+  const labelMap: Record<string, string> = {
+    underground_static_tank_l: "Underground Static Water Tank",
+    terrace_tank_l: "Terrace Water Tank",
+    pump_near_underground_tank: "Pump Near Underground Tank",
+    pump_at_terrace_lpm: "Pump at Terrace",
+  };
+  return labelMap[key] || key.replace(/_/g, " ");
+}
+
+function renderWaterPumpValue(key: string, value: any) {
+  if (value === "NR") return "Not Required";
+  if (key.endsWith("_l") && Number.isFinite(Number(value))) return formatLitersWithKl(value);
+  if (key.endsWith("_lpm") && Number.isFinite(Number(value))) return `${Number(value).toLocaleString()} LPM`;
+  return String(value ?? "-");
 }
 
 export default function ProjectPage({ params }: { params: Promise<{ projectId: string }> }) {
@@ -240,6 +332,14 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   const [nbcSettingsAnswers, setNbcSettingsAnswers] = useState<Record<string, any>>({});
   const [nbcSettingsLabels, setNbcSettingsLabels] = useState<Record<string, string>>({});
   const [nbcSettingsSaving, setNbcSettingsSaving] = useState(false);
+  const [showTankCapacityModal, setShowTankCapacityModal] = useState(false);
+  const [tankQuestions, setTankQuestions] = useState<NBCSettingsQuestion[]>([]);
+  const [tankFollowups, setTankFollowups] = useState<NBCSettingsQuestion[]>([]);
+  const [tankAnswers, setTankAnswers] = useState<Record<string, any>>({});
+  const [tankLabels, setTankLabels] = useState<Record<string, string>>({});
+  const [tankCapacitySaving, setTankCapacitySaving] = useState(false);
+  const [tankCapacityError, setTankCapacityError] = useState<string | null>(null);
+  const [tankCapacityEval, setTankCapacityEval] = useState<any | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
   const [mediaVersion, setMediaVersion] = useState<number>(Date.now());
 
@@ -446,6 +546,82 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     }
   }
 
+  async function openTankCapacityModal() {
+    setShowTankCapacityModal(true);
+    setTankCapacityError(null);
+    setTankCapacityEval(project?.nbc_evaluation || settings?.nbc_evaluation || null);
+    const existingAnswers = project?.nbc_answers || settings?.nbc_answers || {};
+    setTankAnswers(existingAnswers);
+    try {
+      const [qs, labels] = await Promise.all([
+        (await authFetch("/api/nbc/questions")).json(),
+        (await authFetch("/api/nbc/occupancy_types")).json(),
+      ]);
+      setTankQuestions(qs);
+      setTankLabels(labels);
+
+      const occ = existingAnswers?.occupancy_subtype;
+      if (occ) {
+        const followups: NBCSettingsQuestion[] = await (await authFetch(`/api/nbc/followup_fields?occupancy_subtype=${encodeURIComponent(occ)}`)).json();
+        setTankFollowups(followups);
+      } else {
+        setTankFollowups([]);
+      }
+    } catch {
+      setTankCapacityError("Could not load questionnaire. Please try again.");
+    }
+  }
+
+  async function tankSelectOccupancy(subtype: string) {
+    setTankAnswers((prev: Record<string, any>) => ({ ...prev, occupancy_subtype: subtype }));
+    try {
+      const followups: NBCSettingsQuestion[] = await (await authFetch(`/api/nbc/followup_fields?occupancy_subtype=${encodeURIComponent(subtype)}`)).json();
+      setTankFollowups(followups);
+    } catch {
+      setTankFollowups([]);
+    }
+  }
+
+  function setTankAnswer(id: string, value: any) {
+    setTankAnswers((prev: Record<string, any>) => ({ ...prev, [id]: value }));
+  }
+
+  const tankMissingQuestions = useMemo(() => {
+    const visible = [...tankQuestions, ...tankFollowups];
+    return visible.filter((q) => isBlankNbcAnswer(tankAnswers[q.id]));
+  }, [tankQuestions, tankFollowups, tankAnswers]);
+
+  async function calculateTankCapacity() {
+    setTankCapacitySaving(true);
+    setTankCapacityError(null);
+    try {
+      const evalResult = await (await authFetch("/api/nbc/evaluate", {
+        method: "POST",
+        body: JSON.stringify({ answers: tankAnswers }),
+      })).json();
+
+      const normalizedSettings = {
+        ...settings,
+        world_to_m: deriveWorldToMFromUnits(String(settings.units || "mm")),
+        nbc_answers: tankAnswers,
+        nbc_evaluation: evalResult,
+      };
+
+      await authFetch(`/api/projects/${projectId}/settings`, {
+        method: "POST",
+        body: JSON.stringify({ settings: normalizedSettings }),
+      });
+
+      setSettings(normalizedSettings);
+      setTankCapacityEval(evalResult);
+      await refresh();
+    } catch (e: any) {
+      setTankCapacityError(e?.message || "Tank capacity calculation failed.");
+    } finally {
+      setTankCapacitySaving(false);
+    }
+  }
+
   async function saveSettings() {
     const normalizedSettings = {
       ...settings,
@@ -528,6 +704,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     setPipelineStage(null);
     await authFetch(`/api/projects/${projectId}/continue_floor_review`, { method:"POST" });
     await refresh();
+    setEditorOpen(false);
   }
 
   async function addFloorPlan(pixelBbox: number[]) {
@@ -560,6 +737,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     setPipelineStage(null);
     await authFetch(`/api/projects/${projectId}/continue`, { method:"POST" });
     await refresh();
+    setEditorOpen(false);
   }
 
   async function uploadAlignedMaskFile(e: any) {
@@ -599,6 +777,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     // (bulk_save was already called by handleContinue in RoomEditor)
     await authFetch(`/api/projects/${projectId}/save`, { method: "POST" });
     await refresh();
+    setEditorOpen(false);
   }
 
   async function saveRoomsOnly(rooms: any[]) {
@@ -657,6 +836,17 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                 }}>View Only</span>
               )}
               {canEdit && (
+                <button onClick={openTankCapacityModal} style={{
+                  padding: "8px 14px", borderRadius: 10,
+                  border: "1px solid #E8EAED", background: "#FFFFFF",
+                  color: "#1A1A2E", cursor: "pointer", fontSize: 12, fontWeight: 600,
+                  display: "flex", alignItems: "center", gap: 6,
+                }}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6B7280" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg>
+                  Tank Capacity
+                </button>
+              )}
+              {canEdit && (
                 <button onClick={openSettingsModal} style={{
                   padding: "8px 14px", borderRadius: 10,
                   border: "1px solid #E8EAED", background: "#FFFFFF",
@@ -693,11 +883,30 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
               {(project.nbc_evaluation.equipment || []).filter(eq => eq.required).map(eq => (
                 <span key={eq.key} style={{
                   fontSize: 10, fontWeight: 700, padding: "3px 10px", borderRadius: 8,
-                  background: eq.supported ? "#ECFDF5" : "#FEF3C7",
-                  color: eq.supported ? "#059669" : "#D97706",
-                  border: eq.supported ? "1px solid rgba(5,150,105,0.2)" : "1px solid rgba(217,119,6,0.2)",
-                }}>{eq.label}: {eq.supported ? "Supported" : "Coming Soon"}</span>
+                  background: "#ECFDF5",
+                  color: "#059669",
+                  border: "1px solid rgba(5,150,105,0.2)",
+                }}>{eq.label}</span>
               ))}
+              {project.nbc_evaluation.water_pump_requirements ? (
+                <div style={{ width: "100%", marginTop: 6, fontSize: 12, color: "#064E3B" }}>
+                  <strong>Water Pump Requirements:</strong>
+                  <div style={{ marginTop: 4, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    {Object.entries(project.nbc_evaluation.water_pump_requirements).map(([key, value]) => (
+                      <span key={key} style={{
+                        fontSize: 11,
+                        padding: "2px 8px",
+                        borderRadius: 8,
+                        background: "#D1FAE5",
+                        border: "1px solid rgba(5,150,105,0.2)",
+                        color: "#065F46",
+                      }}>
+                        {key.replace(/_/g, " ")}: {String(value)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
             </div>
           ) : null}
 
@@ -999,6 +1208,167 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
               </div>
             </div>
           ) : null}
+
+          {/* ── Tank Capacity Calculator modal ── */}
+          {showTankCapacityModal ? (
+            <div style={{
+              position: "fixed", inset: 0, zIndex: 50,
+              background: "rgba(0,0,0,0.35)", backdropFilter: "blur(4px)",
+              display: "grid", placeItems: "center",
+            }} onClick={() => setShowTankCapacityModal(false)}>
+              <div onClick={e => e.stopPropagation()} style={{
+                width: "min(680px, calc(100% - 32px))", borderRadius: 20,
+                background: "#FFFFFF",
+                border: "1px solid #E8EAED", boxShadow: "0 20px 60px rgba(0,0,0,0.15)",
+                padding: 0, maxHeight: "90vh", overflow: "hidden",
+                display: "flex", flexDirection: "column",
+              }}>
+                <div style={{
+                  display: "flex", justifyContent: "space-between", alignItems: "center",
+                  padding: "18px 24px", borderBottom: "1px solid #E8EAED",
+                }}>
+                  <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: "#1A1A2E" }}>Calculate Water Tank Capacity</h3>
+                  <button onClick={() => setShowTankCapacityModal(false)} style={{
+                    background: "none", border: "none", fontSize: 22, color: "#9CA3AF",
+                    cursor: "pointer", padding: "4px 8px", lineHeight: 1,
+                  }}>&times;</button>
+                </div>
+
+                <div style={{ padding: "0 24px 24px", overflowY: "auto", flex: 1 }}>
+                  <div style={{
+                    marginTop: 16,
+                    padding: "10px 14px",
+                    borderRadius: 10,
+                    background: "#F8FAFC",
+                    border: "1px solid #E2E8F0",
+                    fontSize: 12,
+                    color: "#334155",
+                  }}>
+                    This asks only missing NBC inputs. Answers already captured during project creation are reused.
+                  </div>
+
+                  {tankMissingQuestions.length > 0 ? (
+                    <>
+                      {tankMissingQuestions.map((q) => (
+                        <div key={q.id} style={{ marginTop: 16 }}>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: "#6B7280", marginBottom: 6 }}>{q.label}</div>
+                          {q.type === "select" && q.options && (
+                            <select
+                              value={tankAnswers[q.id] ?? ""}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setTankAnswer(q.id, val);
+                                if (q.id === "occupancy_subtype") tankSelectOccupancy(val);
+                              }}
+                              style={{ width: "100%", borderRadius: 10, border: "1px solid #E8EAED", padding: "10px 14px", fontSize: 13, color: "#1A1A2E", background: "#fff", outline: "none", cursor: "pointer" }}
+                            >
+                              <option value="">- Select -</option>
+                              {q.options.map((opt) => (
+                                <option key={opt} value={opt}>
+                                  {tankLabels[opt] || opt.replace(/_/g, " ")}
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                          {q.type === "number" && (
+                            <input
+                              type="number"
+                              value={tankAnswers[q.id] ?? ""}
+                              onChange={(e) => setTankAnswer(q.id, e.target.value === "" ? "" : Number(e.target.value))}
+                              style={{ width: "100%", borderRadius: 10, border: "1px solid #E8EAED", padding: "10px 14px", fontSize: 13, color: "#1A1A2E", background: "#fff", outline: "none" }}
+                              placeholder="0"
+                            />
+                          )}
+                          {q.type === "boolean" && (
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <button type="button" onClick={() => setTankAnswer(q.id, true)} style={{
+                                borderRadius: 8, border: "1px solid #E8EAED", padding: "8px 20px", fontSize: 12, fontWeight: 700, cursor: "pointer",
+                                background: tankAnswers[q.id] === true ? "#2D6A4F" : "#fff",
+                                color: tankAnswers[q.id] === true ? "#fff" : "#6B7280",
+                                borderColor: tankAnswers[q.id] === true ? "#2D6A4F" : "#E8EAED",
+                              }}>Yes</button>
+                              <button type="button" onClick={() => setTankAnswer(q.id, false)} style={{
+                                borderRadius: 8, border: "1px solid #E8EAED", padding: "8px 20px", fontSize: 12, fontWeight: 700, cursor: "pointer",
+                                background: tankAnswers[q.id] === false ? "#2D6A4F" : "#fff",
+                                color: tankAnswers[q.id] === false ? "#fff" : "#6B7280",
+                                borderColor: tankAnswers[q.id] === false ? "#2D6A4F" : "#E8EAED",
+                              }}>No</button>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </>
+                  ) : (
+                    <div style={{
+                      marginTop: 16,
+                      padding: "10px 14px",
+                      borderRadius: 10,
+                      background: "#ECFDF5",
+                      border: "1px solid rgba(5,150,105,0.2)",
+                      fontSize: 12,
+                      color: "#065F46",
+                    }}>
+                      All required answers are already available. You can calculate directly.
+                    </div>
+                  )}
+
+                  {tankCapacityError ? (
+                    <div style={{
+                      marginTop: 14,
+                      padding: "10px 14px",
+                      borderRadius: 10,
+                      background: "#FEF2F2",
+                      border: "1px solid rgba(220,38,38,0.2)",
+                      color: "#B91C1C",
+                      fontSize: 12,
+                    }}>
+                      {tankCapacityError}
+                    </div>
+                  ) : null}
+
+                  {tankCapacityEval?.water_pump_requirements ? (
+                    <div style={{
+                      marginTop: 16,
+                      padding: "12px 14px",
+                      borderRadius: 12,
+                      background: "#ECFDF5",
+                      border: "1px solid rgba(5,150,105,0.2)",
+                      color: "#1A1A2E",
+                    }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: "#065F46", marginBottom: 8 }}>Fire Water Capacity Summary</div>
+                      <div style={{ fontSize: 12, display: "grid", gap: 8 }}>
+                        {Object.entries(tankCapacityEval.water_pump_requirements).map(([key, value]) => (
+                          <div key={key} style={{
+                            display: "grid",
+                            gridTemplateColumns: "minmax(180px, 1fr) 1fr",
+                            gap: 10,
+                            alignItems: "start",
+                            padding: "6px 8px",
+                            borderRadius: 8,
+                            background: "rgba(255,255,255,0.65)",
+                          }}>
+                            <div style={{ color: "#065F46", fontWeight: 600 }}>{humanizeWaterPumpKey(key)}</div>
+                            <div style={{ color: "#1A1A2E", fontWeight: 700 }}>{renderWaterPumpValue(key, value)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+                    <button onClick={() => setShowTankCapacityModal(false)} style={btn(false)}>Close</button>
+                    <button
+                      onClick={calculateTankCapacity}
+                      disabled={tankCapacitySaving || tankMissingQuestions.length > 0}
+                      style={btn(true)}
+                    >
+                      {tankCapacitySaving ? "Calculating..." : "Calculate & Save"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </section>
       ) : null}
 
@@ -1017,6 +1387,18 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
             Back to Workspace
           </button>
           <span style={{ fontSize: 13, color: "#6B7280" }}>{project?.name || "Project"}</span>
+          {canEdit ? <div style={{ flex: 1 }} /> : null}
+          {canEdit ? (
+            <button onClick={openTankCapacityModal} style={{
+              padding: "6px 12px", borderRadius: 8,
+              border: "1px solid #E8EAED", background: "#FFFFFF",
+              color: "#1A1A2E", cursor: "pointer", fontSize: 12, fontWeight: 600,
+              display: "flex", alignItems: "center", gap: 6,
+            }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6B7280" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg>
+              Tank Capacity
+            </button>
+          ) : null}
         </div>
         <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
         {isAwaitingFloorReview && project?.files?.render_png && mapping ? (
@@ -1294,6 +1676,167 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
         )}
         </div>
       </section>
+      ) : null}
+
+      {/* Render tank-capacity modal in editor mode as well */}
+      {showTankCapacityModal && !isQuestionnaireMode ? (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 50,
+          background: "rgba(0,0,0,0.35)", backdropFilter: "blur(4px)",
+          display: "grid", placeItems: "center",
+        }} onClick={() => setShowTankCapacityModal(false)}>
+          <div onClick={e => e.stopPropagation()} style={{
+            width: "min(680px, calc(100% - 32px))", borderRadius: 20,
+            background: "#FFFFFF",
+            border: "1px solid #E8EAED", boxShadow: "0 20px 60px rgba(0,0,0,0.15)",
+            padding: 0, maxHeight: "90vh", overflow: "hidden",
+            display: "flex", flexDirection: "column",
+          }}>
+            <div style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              padding: "18px 24px", borderBottom: "1px solid #E8EAED",
+            }}>
+              <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: "#1A1A2E" }}>Calculate Water Tank Capacity</h3>
+              <button onClick={() => setShowTankCapacityModal(false)} style={{
+                background: "none", border: "none", fontSize: 22, color: "#9CA3AF",
+                cursor: "pointer", padding: "4px 8px", lineHeight: 1,
+              }}>&times;</button>
+            </div>
+
+            <div style={{ padding: "0 24px 24px", overflowY: "auto", flex: 1 }}>
+              <div style={{
+                marginTop: 16,
+                padding: "10px 14px",
+                borderRadius: 10,
+                background: "#F8FAFC",
+                border: "1px solid #E2E8F0",
+                fontSize: 12,
+                color: "#334155",
+              }}>
+                This asks only missing NBC inputs. Answers already captured during project creation are reused.
+              </div>
+
+              {tankMissingQuestions.length > 0 ? (
+                <>
+                  {tankMissingQuestions.map((q) => (
+                    <div key={q.id} style={{ marginTop: 16 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: "#6B7280", marginBottom: 6 }}>{q.label}</div>
+                      {q.type === "select" && q.options && (
+                        <select
+                          value={tankAnswers[q.id] ?? ""}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setTankAnswer(q.id, val);
+                            if (q.id === "occupancy_subtype") tankSelectOccupancy(val);
+                          }}
+                          style={{ width: "100%", borderRadius: 10, border: "1px solid #E8EAED", padding: "10px 14px", fontSize: 13, color: "#1A1A2E", background: "#fff", outline: "none", cursor: "pointer" }}
+                        >
+                          <option value="">- Select -</option>
+                          {q.options.map((opt) => (
+                            <option key={opt} value={opt}>
+                              {tankLabels[opt] || opt.replace(/_/g, " ")}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      {q.type === "number" && (
+                        <input
+                          type="number"
+                          value={tankAnswers[q.id] ?? ""}
+                          onChange={(e) => setTankAnswer(q.id, e.target.value === "" ? "" : Number(e.target.value))}
+                          style={{ width: "100%", borderRadius: 10, border: "1px solid #E8EAED", padding: "10px 14px", fontSize: 13, color: "#1A1A2E", background: "#fff", outline: "none" }}
+                          placeholder="0"
+                        />
+                      )}
+                      {q.type === "boolean" && (
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <button type="button" onClick={() => setTankAnswer(q.id, true)} style={{
+                            borderRadius: 8, border: "1px solid #E8EAED", padding: "8px 20px", fontSize: 12, fontWeight: 700, cursor: "pointer",
+                            background: tankAnswers[q.id] === true ? "#2D6A4F" : "#fff",
+                            color: tankAnswers[q.id] === true ? "#fff" : "#6B7280",
+                            borderColor: tankAnswers[q.id] === true ? "#2D6A4F" : "#E8EAED",
+                          }}>Yes</button>
+                          <button type="button" onClick={() => setTankAnswer(q.id, false)} style={{
+                            borderRadius: 8, border: "1px solid #E8EAED", padding: "8px 20px", fontSize: 12, fontWeight: 700, cursor: "pointer",
+                            background: tankAnswers[q.id] === false ? "#2D6A4F" : "#fff",
+                            color: tankAnswers[q.id] === false ? "#fff" : "#6B7280",
+                            borderColor: tankAnswers[q.id] === false ? "#2D6A4F" : "#E8EAED",
+                          }}>No</button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </>
+              ) : (
+                <div style={{
+                  marginTop: 16,
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  background: "#ECFDF5",
+                  border: "1px solid rgba(5,150,105,0.2)",
+                  fontSize: 12,
+                  color: "#065F46",
+                }}>
+                  All required answers are already available. You can calculate directly.
+                </div>
+              )}
+
+              {tankCapacityError ? (
+                <div style={{
+                  marginTop: 14,
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  background: "#FEF2F2",
+                  border: "1px solid rgba(220,38,38,0.2)",
+                  color: "#B91C1C",
+                  fontSize: 12,
+                }}>
+                  {tankCapacityError}
+                </div>
+              ) : null}
+
+              {tankCapacityEval?.water_pump_requirements ? (
+                <div style={{
+                  marginTop: 16,
+                  padding: "12px 14px",
+                  borderRadius: 12,
+                  background: "#ECFDF5",
+                  border: "1px solid rgba(5,150,105,0.2)",
+                  color: "#1A1A2E",
+                }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "#065F46", marginBottom: 8 }}>Fire Water Capacity Summary</div>
+                  <div style={{ fontSize: 12, display: "grid", gap: 8 }}>
+                    {Object.entries(tankCapacityEval.water_pump_requirements).map(([key, value]) => (
+                      <div key={key} style={{
+                        display: "grid",
+                        gridTemplateColumns: "minmax(180px, 1fr) 1fr",
+                        gap: 10,
+                        alignItems: "start",
+                        padding: "6px 8px",
+                        borderRadius: 8,
+                        background: "rgba(255,255,255,0.65)",
+                      }}>
+                        <div style={{ color: "#065F46", fontWeight: 600 }}>{humanizeWaterPumpKey(key)}</div>
+                        <div style={{ color: "#1A1A2E", fontWeight: 700 }}>{renderWaterPumpValue(key, value)}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+                <button onClick={() => setShowTankCapacityModal(false)} style={btn(false)}>Close</button>
+                <button
+                  onClick={calculateTankCapacity}
+                  disabled={tankCapacitySaving || tankMissingQuestions.length > 0}
+                  style={btn(true)}
+                >
+                  {tankCapacitySaving ? "Calculating..." : "Calculate & Save"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       ) : null}
 
       {showGlobalLoader ? (
@@ -2513,7 +3056,7 @@ function RoomEditor({
 
   // ── Detector state ──
   const [detectors, setDetectors] = useState<Detector[]>([]);
-  const [editorMode, setEditorMode] = useState<"rooms" | "select" | "add" | "erase" | "pan" | "pipe_draw" | "pipe_select" | "measure">("rooms");
+  const [editorMode, setEditorMode] = useState<"rooms" | "select" | "add" | "erase" | "pan" | "pipe_draw" | "pipe_select" | "measure" | "shape_rect" | "shape_circle" | "shape_cloud" | "shape_select" | "text_add">("select");
   const [addType, setAddType] = useState<ObjectType>("smoke");
   const [selectedDetectorIds, setSelectedDetectorIds] = useState<string[]>([]);
   const [imgDims, setImgDims] = useState<{w:number; h:number} | null>(null);
@@ -2524,19 +3067,28 @@ function RoomEditor({
   const [selectedPipeIdx, setSelectedPipeIdx] = useState<number | null>(null);
   const [pipeDrawStart, setPipeDrawStart] = useState<{px:number; py:number} | null>(null);
   const [pipeDrawEnd, setPipeDrawEnd] = useState<{px:number; py:number} | null>(null);
+  const [pipeJoinHover, setPipeJoinHover] = useState<{px:number; py:number} | null>(null);
+  const [drawPipeDiameter, setDrawPipeDiameter] = useState<string>("25mm");
   const [groupDrag, setGroupDrag] = useState<{
     ids: string[];
     start: { px: number; py: number };
     origins: Record<string, { px: number; py: number }>;
   } | null>(null);
   const [groupPreview, setGroupPreview] = useState<Record<string, { px: number; py: number }> | null>(null);
+  const [alignmentGuides, setAlignmentGuides] = useState<{ vertical: number[]; horizontal: number[] }>({ vertical: [], horizontal: [] });
   const [isAutoPlacing, setIsAutoPlacing] = useState<string | null>(null);
-  const [sidebarTab, setSidebarTab] = useState<"rooms" | "equipment">("rooms");
+  const [sidebarTab, setSidebarTab] = useState<"rooms" | "equipment">("equipment");
   const [pipesData, setPipesData] = useState<PipesData | null>(null);
   const [isSavingChanges, setIsSavingChanges] = useState(false);
+  const [isExportingDxf, setIsExportingDxf] = useState(false);
   const [measureStart, setMeasureStart] = useState<{px:number; py:number} | null>(null);
   const [measureEnd, setMeasureEnd] = useState<{px:number; py:number} | null>(null);
   const [measureLocked, setMeasureLocked] = useState(false);
+  const [shapes, setShapes] = useState<ShapeAnnotation[]>([]);
+  const [selectedShapeId, setSelectedShapeId] = useState<string | null>(null);
+  const [shapeDraft, setShapeDraft] = useState<{ kind: "rect" | "circle" | "cloud"; start: { px: number; py: number }; end: { px: number; py: number } } | null>(null);
+  const [shapeDrag, setShapeDrag] = useState<{ id: string; start: { px: number; py: number }; origin: ShapeAnnotation } | null>(null);
+  const [shapeResize, setShapeResize] = useState<{ id: string; handle: ShapeResizeHandle; start: { px: number; py: number }; origin: ShapeAnnotation } | null>(null);
 
   // ── Helpers ──
   function samePoint(a: {px:number; py:number}, b: {px:number; py:number}, tolerance = 0.5) {
@@ -2560,6 +3112,150 @@ function RoomEditor({
     const px = ((e.clientX - rect.left) / rect.width) * imgDims.w;
     const py = ((e.clientY - rect.top) / rect.height) * imgDims.h;
     return { px, py };
+  }
+
+  function normalizeShapeRect(a: { px: number; py: number }, b: { px: number; py: number }) {
+    return {
+      x: Math.min(a.px, b.px),
+      y: Math.min(a.py, b.py),
+      w: Math.abs(b.px - a.px),
+      h: Math.abs(b.py - a.py),
+    };
+  }
+
+  function circleRectFromPoints(a: { px: number; py: number }, b: { px: number; py: number }) {
+    const dx = b.px - a.px;
+    const dy = b.py - a.py;
+    const side = Math.max(Math.abs(dx), Math.abs(dy));
+    const end = { px: a.px + Math.sign(dx || 1) * side, py: a.py + Math.sign(dy || 1) * side };
+    return normalizeShapeRect(a, end);
+  }
+
+  function shapeRect(shape: ShapeAnnotation) {
+    return {
+      left: shape.x,
+      top: shape.y,
+      right: shape.x + shape.w,
+      bottom: shape.y + shape.h,
+    };
+  }
+
+  function findShapeAtPoint(point: { px: number; py: number }): string | null {
+    const pad = 6;
+    for (let i = shapes.length - 1; i >= 0; i--) {
+      const s = shapes[i];
+      const r = shapeRect(s);
+      if (s.kind === "circle") {
+        const cx = s.x + s.w * 0.5;
+        const cy = s.y + s.h * 0.5;
+        const rx = Math.max(1, s.w * 0.5);
+        const ry = Math.max(1, s.h * 0.5);
+        const nx = (point.px - cx) / rx;
+        const ny = (point.py - cy) / ry;
+        if (nx * nx + ny * ny <= 1.08) return s.id;
+      } else if (
+        point.px >= r.left - pad &&
+        point.px <= r.right + pad &&
+        point.py >= r.top - pad &&
+        point.py <= r.bottom + pad
+      ) {
+        return s.id;
+      }
+    }
+    return null;
+  }
+
+  function hitShapeResizeHandle(shape: ShapeAnnotation, point: { px: number; py: number }, radius = 8): ShapeResizeHandle | null {
+    const r = shapeRect(shape);
+    const handles: Array<[ShapeResizeHandle, { px: number; py: number }]> = [
+      ["nw", { px: r.left, py: r.top }],
+      ["ne", { px: r.right, py: r.top }],
+      ["sw", { px: r.left, py: r.bottom }],
+      ["se", { px: r.right, py: r.bottom }],
+    ];
+    for (const [name, h] of handles) {
+      if (Math.hypot(point.px - h.px, point.py - h.py) <= radius) return name;
+    }
+    return null;
+  }
+
+  function shapeDimensionLabel(shape: { kind: "rect" | "circle" | "cloud"; x: number; y: number; w: number; h: number }) {
+    const p0 = pixelToWorld(mapping, shape.x, shape.y);
+    const px = pixelToWorld(mapping, shape.x + shape.w, shape.y);
+    const py = pixelToWorld(mapping, shape.x, shape.y + shape.h);
+    const wMeters = Math.abs(px.x - p0.x) * worldToM;
+    const hMeters = Math.abs(py.y - p0.y) * worldToM;
+    if (shape.kind === "circle") {
+      const dMeters = Math.max(wMeters, hMeters);
+      return `D ${dMeters.toFixed(2)} m`;
+    }
+    return `${wMeters.toFixed(2)} m x ${hMeters.toFixed(2)} m`;
+  }
+
+  function editSelectedText() {
+    if (!selectedShapeId || !canEdit) return;
+    const current = shapes.find(s => s.id === selectedShapeId);
+    if (!current || current.kind !== "text") return;
+    const next = window.prompt("Edit text:", current.text || "")?.trim();
+    if (!next) return;
+    setShapes(prev => prev.map(s => {
+      if (s.id !== current.id) return s;
+      const font = s.fontSize || 16;
+      return { ...s, text: next, w: Math.max(44, next.length * Math.max(7, font * 0.58) + 10), h: Math.max(font + 8, s.h) };
+    }));
+  }
+
+  function changeSelectedTextSize(delta: number) {
+    if (!selectedShapeId || !canEdit) return;
+    setShapes(prev => prev.map(s => {
+      if (s.id !== selectedShapeId || s.kind !== "text") return s;
+      const nextFont = Math.max(10, Math.min(72, (s.fontSize || 16) + delta));
+      const textLen = (s.text || "Text").length;
+      return { ...s, fontSize: nextFont, h: nextFont + 8, w: Math.max(44, textLen * Math.max(7, nextFont * 0.58) + 10) };
+    }));
+  }
+
+  function cloudPathFromRect(x: number, y: number, w: number, h: number) {
+    const shortSide = Math.max(1, Math.min(w, h));
+    const bump = Math.max(5, Math.min(16, shortSide * 0.14));
+    const nx = Math.max(3, Math.round(w / Math.max(16, bump * 2.2)));
+    const ny = Math.max(3, Math.round(h / Math.max(16, bump * 2.2)));
+
+    let d = `M ${x} ${y}`;
+
+    // Top edge (outward -Y)
+    for (let i = 0; i < nx; i++) {
+      const x0 = x + (i / nx) * w;
+      const x1 = x + ((i + 1) / nx) * w;
+      const xm = (x0 + x1) * 0.5;
+      d += ` Q ${xm} ${y - bump} ${x1} ${y}`;
+    }
+
+    // Right edge (outward +X)
+    for (let i = 0; i < ny; i++) {
+      const y0 = y + (i / ny) * h;
+      const y1 = y + ((i + 1) / ny) * h;
+      const ym = (y0 + y1) * 0.5;
+      d += ` Q ${x + w + bump} ${ym} ${x + w} ${y1}`;
+    }
+
+    // Bottom edge (outward +Y)
+    for (let i = 0; i < nx; i++) {
+      const x0 = x + w - (i / nx) * w;
+      const x1 = x + w - ((i + 1) / nx) * w;
+      const xm = (x0 + x1) * 0.5;
+      d += ` Q ${xm} ${y + h + bump} ${x1} ${y + h}`;
+    }
+
+    // Left edge (outward -X)
+    for (let i = 0; i < ny; i++) {
+      const y0 = y + h - (i / ny) * h;
+      const y1 = y + h - ((i + 1) / ny) * h;
+      const ym = (y0 + y1) * 0.5;
+      d += ` Q ${x - bump} ${ym} ${x} ${y1}`;
+    }
+
+    return `${d} Z`;
   }
 
   function closestPointOnSegment(point: {px:number; py:number}, a: number[], b: number[]) {
@@ -2598,11 +3294,26 @@ function RoomEditor({
         const res = await authFetch(url);
         const data = await res.json();
         const raw: Room[] = data.rooms || data;
+        const rawShapes: any[] = Array.isArray(data?.shapes) ? data.shapes : [];
         setRooms(
           raw.map((r, i) => ({
             ...r,
             label: (r.label && r.label.trim()) || (r.label_text && r.label_text.trim()) || `Room ${i + 1}`,
           }))
+        );
+        setShapes(
+          rawShapes
+            .filter((s) => s && typeof s === "object")
+            .map((s) => ({
+              id: String(s.id || crypto.randomUUID()),
+              kind: (s.kind === "rect" || s.kind === "circle" || s.kind === "cloud" || s.kind === "text") ? s.kind : "rect",
+              x: Number(s.x) || 0,
+              y: Number(s.y) || 0,
+              w: Math.max(1, Number(s.w) || 1),
+              h: Math.max(1, Number(s.h) || 1),
+              text: typeof s.text === "string" ? s.text : undefined,
+              fontSize: Number.isFinite(Number(s.fontSize)) ? Number(s.fontSize) : undefined,
+            }))
         );
       } catch (e) { console.error("Failed to load rooms", e); }
       finally { setLoading(false); }
@@ -2628,12 +3339,19 @@ function RoomEditor({
       if (e.key === "Delete" || e.key === "Backspace") {
         if ((editorMode === "pipe_select" || editorMode === "pipe_draw") && selectedPipeIdx !== null) {
           deletePipe(selectedPipeIdx);
+        } else if (editorMode === "shape_select" && selectedShapeId && canEdit) {
+          setShapes(prev => prev.filter(s => s.id !== selectedShapeId));
+          setSelectedShapeId(null);
         } else if (selectedDetectorIds.length > 0 && canEdit) {
           deleteDetectorsMany(selectedDetectorIds);
         }
       }
       if (e.key === "Escape") {
-        if (pipeDrawStart) { setPipeDrawStart(null); setPipeDrawEnd(null); }
+        if (pipeDrawStart) { setPipeDrawStart(null); setPipeDrawEnd(null); setPipeJoinHover(null); }
+        if (shapeDraft) setShapeDraft(null);
+        if (shapeDrag) setShapeDrag(null);
+        if (shapeResize) setShapeResize(null);
+        if (selectedShapeId) setSelectedShapeId(null);
         if (selectedPipeIdx !== null) setSelectedPipeIdx(null);
         if (selectedDetectorIds.length > 0) setSelectedDetectorIds([]);
         if (measureStart || measureEnd) {
@@ -2645,7 +3363,20 @@ function RoomEditor({
     }
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  });
+  }, [
+    canEdit,
+    editorMode,
+    measureEnd,
+    measureLocked,
+    measureStart,
+    pipeDrawStart,
+    selectedDetectorIds,
+    selectedPipeIdx,
+    selectedShapeId,
+    shapeDraft,
+    shapeDrag,
+    shapeResize,
+  ]);
 
   // ── Room functions ──
   function roomCentroidPx(room: Room): { cx: number; cy: number } {
@@ -2755,6 +3486,7 @@ function RoomEditor({
       id: crypto.randomUUID(),
       project_id: projectId,
       x: w.x, y: w.y, z: 0,
+      rotation_deg: 0,
       dtype: addType,
       locked: false,
       floor_plan_id: floorPlanId || null,
@@ -2781,6 +3513,15 @@ function RoomEditor({
       if (!pt) return d;
       const w = pixelToWorld(mapping, pt.px, pt.py);
       return { ...d, x: w.x, y: w.y };
+    }));
+  }
+
+  function rotateDetectorsMany(ids: string[], deltaDeg: number) {
+    if (!ids.length || !canEdit) return;
+    const idSet = new Set(ids);
+    setDetectors(prev => prev.map(d => {
+      if (!idSet.has(d.id)) return d;
+      return { ...d, rotation_deg: normalizeAngleDeg((d.rotation_deg ?? 0) + deltaDeg) };
     }));
   }
 
@@ -2813,6 +3554,44 @@ function RoomEditor({
     for (const d of detectors) { if (ids.includes(d.id)) origins[d.id] = worldToPixel(mapping, d.x, d.y); }
     setGroupDrag({ ids, start: at, origins });
     setGroupPreview(origins);
+    setAlignmentGuides({ vertical: [], horizontal: [] });
+  }
+
+  function computeAlignmentGuides(
+    moving: Record<string, { px: number; py: number }>,
+    movingIds: string[],
+    threshold = 6,
+  ): { vertical: number[]; horizontal: number[] } {
+    const movingEntries = Object.entries(moving);
+    if (!movingEntries.length) return { vertical: [], horizontal: [] };
+    const movingSet = new Set(movingIds);
+    const stationary = detectors
+      .filter(d => !movingSet.has(d.id))
+      .map(d => ({ id: d.id, ...worldToPixel(mapping, d.x, d.y) }));
+
+    const verticalRaw: number[] = [];
+    const horizontalRaw: number[] = [];
+
+    for (const [, mp] of movingEntries) {
+      for (const sp of stationary) {
+        if (Math.abs(mp.px - sp.px) <= threshold) verticalRaw.push(sp.px);
+        if (Math.abs(mp.py - sp.py) <= threshold) horizontalRaw.push(sp.py);
+      }
+    }
+
+    const dedupe = (vals: number[]) => {
+      const sorted = [...vals].sort((a, b) => a - b);
+      const out: number[] = [];
+      for (const v of sorted) {
+        if (out.length === 0 || Math.abs(v - out[out.length - 1]) > 2) out.push(v);
+      }
+      return out;
+    };
+
+    return {
+      vertical: dedupe(verticalRaw),
+      horizontal: dedupe(horizontalRaw),
+    };
   }
 
   // ── Load sprinkler pipes ──
@@ -2927,6 +3706,46 @@ function RoomEditor({
     return null;
   }
 
+  function closestPointOnPipe(px: number, py: number, threshold = 10): { px: number; py: number; idx: number } | null {
+    if (!pipesData?.pipes?.length) return null;
+    let best: { px: number; py: number; idx: number } | null = null;
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < pipesData.pipes.length; i++) {
+      const pipe = pipesData.pipes[i];
+      const p1 = worldToPixel(mapping, pipe.from[0], pipe.from[1]);
+      const p2 = worldToPixel(mapping, pipe.to[0], pipe.to[1]);
+      const dx = p2.px - p1.px;
+      const dy = p2.py - p1.py;
+      const len2 = dx * dx + dy * dy;
+      if (len2 < 1e-6) continue;
+      const t = Math.max(0, Math.min(1, ((px - p1.px) * dx + (py - p1.py) * dy) / len2));
+      const cx = p1.px + t * dx;
+      const cy = p1.py + t * dy;
+      const dist = Math.hypot(px - cx, py - cy);
+      if (dist <= threshold && dist < bestDist) {
+        bestDist = dist;
+        best = { px: cx, py: cy, idx: i };
+      }
+    }
+    return best;
+  }
+
+  function resolvePipeDrawEnd(
+    start: { px: number; py: number },
+    end: { px: number; py: number },
+    axisSnapThresholdPx = 6,
+  ): { end: { px: number; py: number }; axis: "horizontal" | "vertical" | null } {
+    const dx = end.px - start.px;
+    const dy = end.py - start.py;
+    if (Math.abs(dx) <= axisSnapThresholdPx) {
+      return { end: { px: start.px, py: end.py }, axis: "vertical" };
+    }
+    if (Math.abs(dy) <= axisSnapThresholdPx) {
+      return { end: { px: end.px, py: start.py }, axis: "horizontal" };
+    }
+    return { end, axis: null };
+  }
+
   function deletePipe(idx: number) {
     if (!pipesData) return;
     const newPipes = pipesData.pipes.filter((_, i) => i !== idx);
@@ -2940,10 +3759,33 @@ function RoomEditor({
     const newSeg: PipeSegment = {
       from: [wFrom.x, wFrom.y],
       to: [wTo.x, wTo.y],
-      diameter: "25mm",
+      diameter: drawPipeDiameter,
     };
     const prev = pipesData || { pipes: [], sources: [] };
     setPipesData({ ...prev, pipes: [...prev.pipes, newSeg] });
+  }
+
+  function clearPipes() {
+    setPipesData(null);
+    setSelectedPipeIdx(null);
+    setPipeDrawStart(null);
+    setPipeDrawEnd(null);
+    setPipeJoinHover(null);
+  }
+
+  function setSelectedPipeDiameter(diameter: string) {
+    if (!pipesData || selectedPipeIdx === null) return;
+    setPipesData(prev => {
+      if (!prev || selectedPipeIdx === null) return prev;
+      const pipes = [...prev.pipes];
+      const current = pipes[selectedPipeIdx];
+      if (!current) return prev;
+      pipes[selectedPipeIdx] = {
+        ...current,
+        diameter,
+      };
+      return { ...prev, pipes };
+    });
   }
 
   async function savePipesData() {
@@ -2967,29 +3809,67 @@ function RoomEditor({
     }
   }
 
+  async function saveAllEdits() {
+    const payload: any = {
+      rooms,
+      shapes,
+      detectors: detectors.map(d => ({
+        id: d.id, x: d.x, y: d.y, z: d.z,
+        rotation_deg: d.rotation_deg ?? 0,
+        dtype: d.dtype, locked: d.locked,
+        floor_plan_id: d.floor_plan_id,
+      })),
+      pipes: pipesData || undefined,
+      floor_plan_id: floorPlanId || undefined,
+    };
+    const res = await authFetch(`/api/projects/${projectId}/bulk_save`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.detectors) setDetectors(data.detectors);
+    }
+  }
+
   async function handleSaveChanges() {
     setIsSavingChanges(true);
     try {
-      const payload: any = {
-        rooms,
-        detectors: detectors.map(d => ({
-          id: d.id, x: d.x, y: d.y, z: d.z,
-          dtype: d.dtype, locked: d.locked,
-          floor_plan_id: d.floor_plan_id,
-        })),
-        pipes: pipesData || undefined,
-        floor_plan_id: floorPlanId || undefined,
-      };
-      const res = await authFetch(`/api/projects/${projectId}/bulk_save`, {
-        method: "PUT",
-        body: JSON.stringify(payload),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.detectors) setDetectors(data.detectors);
-      }
+      await saveAllEdits();
     } catch (e) { console.error("Save changes failed", e); }
     finally { setIsSavingChanges(false); }
+  }
+
+  async function downloadFresh(url: string, filename: string) {
+    const targetUrl = /^https?:\/\//i.test(url) ? url : apiUrl(url);
+    const sep = url.includes("?") ? "&" : "?";
+    const res = await fetch(`${targetUrl}${sep}ts=${Date.now()}`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`Download failed (${res.status})`);
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objectUrl;
+    a.download = `project_${projectId}_${Date.now()}.dxf`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(objectUrl);
+  }
+
+  async function handleExportDxf() {
+    setIsExportingDxf(true);
+    try {
+      await saveAllEdits();
+      const saveResp = await authFetch(`/api/projects/${projectId}/save`, { method: "POST" });
+      const saved = await saveResp.json();
+      const outPath = saved?.files?.output_dxf;
+      if (!outPath) return;
+      await downloadFresh(outPath, `project_${projectId}_${Date.now()}.dxf`);
+    } catch (e) {
+      console.error("Export DXF failed", e);
+    } finally {
+      setIsExportingDxf(false);
+    }
   }
 
   // ── Save & Continue ──
@@ -2999,8 +3879,10 @@ function RoomEditor({
       // Save all user state (rooms + detectors + pipes) before finalizing
       const payload: any = {
         rooms,
+        shapes,
         detectors: detectors.map(d => ({
           id: d.id, x: d.x, y: d.y, z: d.z,
+          rotation_deg: d.rotation_deg ?? 0,
           dtype: d.dtype, locked: d.locked,
           floor_plan_id: d.floor_plan_id,
         })),
@@ -3048,6 +3930,10 @@ function RoomEditor({
   }
 
   const selectedRoom = rooms.find(r => r.id === selectedId);
+  const selectedShape = selectedShapeId ? shapes.find(s => s.id === selectedShapeId) || null : null;
+  const selectedPipeDiameter = selectedPipeIdx !== null && pipesData?.pipes?.[selectedPipeIdx]
+    ? pipesData.pipes[selectedPipeIdx].diameter
+    : null;
   const splitPreviewEnd = splitEnd || splitHover;
   const isPanning = editorMode === "pan";
 
@@ -3056,6 +3942,8 @@ function RoomEditor({
     if (editorMode === "add") return "crosshair";
     if (editorMode === "erase") return "not-allowed";
     if (editorMode === "measure") return "crosshair";
+    if (editorMode === "shape_rect" || editorMode === "shape_circle" || editorMode === "shape_cloud" || editorMode === "text_add") return "crosshair";
+    if (editorMode === "shape_select") return shapeResize ? "nwse-resize" : "pointer";
     if (editorMode === "rooms" && splitMode) return "crosshair";
     if (editorMode === "pipe_draw") return "crosshair";
     if (editorMode === "pipe_select") return "pointer";
@@ -3088,20 +3976,48 @@ function RoomEditor({
             <>
               {/* ── Toolbar ── */}
               <div style={{
-                position: "absolute", top: 14, left: 14, zIndex: 3,
+                position: "absolute", top: 10, left: 10, right: 10, zIndex: 3,
                 display: "flex", flexDirection: "column", gap: 6,
+                pointerEvents: "none",
               }}>
                 <div style={{
                   display: "flex", alignItems: "center", gap: 6,
                   padding: "6px 10px", borderRadius: 12,
-                  background: "#FFFFFF", border: "1px solid #E8EAED",
+                  background: "#F3F4F6", border: "1px solid #D1D5DB",
                   boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+                  pointerEvents: "auto",
                 }}>
-                  <button onClick={() => { setEditorMode("rooms"); setSelectedDetectorIds([]); }} style={ceToolBtn(editorMode === "rooms")}>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="12" y1="3" x2="12" y2="21"/></svg>
-                    Rooms
-                  </button>
-                  <div style={{ width: 1, height: 20, background: "#E8EAED" }} />
+                  {canEdit && (
+                    <>
+                      <button
+                        onClick={handleSaveChanges}
+                        disabled={isSavingChanges || isExportingDxf}
+                        style={cePaintActionBtn}
+                        title="Save changes"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+                          <polyline points="17 21 17 13 7 13 7 21"/>
+                          <polyline points="7 3 7 8 15 8"/>
+                        </svg>
+                        {isSavingChanges ? "Saving..." : "Save"}
+                      </button>
+                      <button
+                        onClick={handleExportDxf}
+                        disabled={isSavingChanges || isExportingDxf}
+                        style={{ ...cePaintActionBtn, background: "#2D6A4F", color: "#fff", borderColor: "#2D6A4F" }}
+                        title="Export DXF"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                          <polyline points="7 10 12 15 17 10"/>
+                          <line x1="12" y1="15" x2="12" y2="3"/>
+                        </svg>
+                        {isExportingDxf ? "Exporting..." : "Export DXF"}
+                      </button>
+                      <div style={{ width: 1, height: 20, background: "#D1D5DB" }} />
+                    </>
+                  )}
                   <button onClick={() => { setEditorMode("select"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "select")}>Select</button>
                   {canEdit && <button onClick={() => { setEditorMode("add"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "add")}>Add</button>}
                   {canEdit && <button onClick={() => { setEditorMode("erase"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "erase")}>Erase</button>}
@@ -3110,9 +4026,19 @@ function RoomEditor({
                     Measure
                   </button>
                   {canEdit && (
+                    <>
+                      <div style={{ width: 1, height: 20, background: "#E8EAED" }} />
+                      <button onClick={() => { setEditorMode("shape_select"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "shape_select")}>Shape Select</button>
+                      <button onClick={() => { setEditorMode("shape_rect"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "shape_rect")}>Rectangle</button>
+                      <button onClick={() => { setEditorMode("shape_circle"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "shape_circle")}>Circle</button>
+                      <button onClick={() => { setEditorMode("shape_cloud"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "shape_cloud")}>Cloud</button>
+                      <button onClick={() => { setEditorMode("text_add"); setSplitMode(false); resetSplitState(); }} style={ceToolBtn(editorMode === "text_add")}>Text</button>
+                    </>
+                  )}
+                  {canEdit && (
                   <>
                   <div style={{ width: 1, height: 20, background: "#E8EAED" }} />
-                  <button onClick={() => { setEditorMode("pipe_draw"); setSplitMode(false); resetSplitState(); setSelectedPipeIdx(null); setPipeDrawStart(null); setPipeDrawEnd(null); }} style={ceToolBtn(editorMode === "pipe_draw" || editorMode === "pipe_select")}>
+                  <button onClick={() => { setEditorMode("pipe_draw"); setSplitMode(false); resetSplitState(); setSelectedPipeIdx(null); setPipeDrawStart(null); setPipeDrawEnd(null); setPipeJoinHover(null); }} style={ceToolBtn(editorMode === "pipe_draw" || editorMode === "pipe_select")}>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
                     Pipes
                   </button>
@@ -3121,17 +4047,20 @@ function RoomEditor({
                   {selectedDetectorIds.length > 0 ? (
                     <>
                       <span style={{ fontSize: 12, color: "#6B7280", marginLeft: 4 }}>Selected: {selectedDetectorIds.length}</span>
+                      {canEdit && <button onClick={() => rotateDetectorsMany(selectedDetectorIds, -15)} style={ceToolBtn(false)}>Rotate -15°</button>}
+                      {canEdit && <button onClick={() => rotateDetectorsMany(selectedDetectorIds, 15)} style={ceToolBtn(false)}>Rotate +15°</button>}
                       {canEdit && <button onClick={() => deleteDetectorsMany(selectedDetectorIds)} style={{ ...ceToolBtn(false), color: "#DC2626", borderColor: "#FECACA" }}>Delete Selected</button>}
                       <button onClick={() => setSelectedDetectorIds([])} style={ceToolBtn(false)}>Clear</button>
                     </>
                   ) : null}
                 </div>
-                {editorMode === "add" ? (
+                {canEdit ? (
                   <div style={{
                     display: "flex", alignItems: "center", gap: 6,
                     padding: "6px 10px", borderRadius: 12,
-                    background: "#FFFFFF", border: "1px solid #E8EAED",
+                    background: "#F3F4F6", border: "1px solid #D1D5DB",
                     boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+                    pointerEvents: "auto",
                   }}>
                     {OBJECT_TYPES.map((otype) => (
                       <button
@@ -3150,19 +4079,65 @@ function RoomEditor({
                   <div style={{
                     display: "flex", alignItems: "center", gap: 6,
                     padding: "6px 10px", borderRadius: 12,
-                    background: "#FFFFFF", border: "1px solid #E8EAED",
+                    background: "#F3F4F6", border: "1px solid #D1D5DB",
                     boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+                    pointerEvents: "auto",
                   }}>
-                    <button onClick={() => { setEditorMode("pipe_draw"); setSelectedPipeIdx(null); }} style={ceToolBtn(editorMode === "pipe_draw")}>
+                    <button onClick={() => { setEditorMode("pipe_draw"); setSelectedPipeIdx(null); setPipeJoinHover(null); }} style={ceToolBtn(editorMode === "pipe_draw")}>
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
                       Draw
                     </button>
-                    <button onClick={() => { setEditorMode("pipe_select"); setPipeDrawStart(null); setPipeDrawEnd(null); }} style={ceToolBtn(editorMode === "pipe_select")}>
+                    <button onClick={() => { setEditorMode("pipe_select"); setPipeDrawStart(null); setPipeDrawEnd(null); setPipeJoinHover(null); }} style={ceToolBtn(editorMode === "pipe_select")}>
                       Select
                     </button>
+                    {editorMode === "pipe_draw" ? (
+                      <select
+                        value={drawPipeDiameter}
+                        onChange={(e) => setDrawPipeDiameter(e.target.value)}
+                        style={{
+                          ...ceToolBtn(false),
+                          height: 30,
+                          minWidth: 112,
+                          padding: "0 8px",
+                          borderColor: "rgba(220,38,38,0.3)",
+                          color: "#DC2626",
+                          background: "#fff",
+                        }}
+                        title="Thickness for new pipes"
+                      >
+                        {PIPE_DIAMETERS_MM.map(mm => (
+                          <option key={mm} value={`${mm}mm`}>{`Draw ${mm} mm`}</option>
+                        ))}
+                      </select>
+                    ) : null}
                     {selectedPipeIdx !== null ? (
                       <button onClick={() => deletePipe(selectedPipeIdx)} style={{ ...ceToolBtn(false), borderColor: "rgba(220,38,38,0.3)", color: "#DC2626" }}>
                         Delete
+                      </button>
+                    ) : null}
+                    {selectedPipeIdx !== null ? (
+                      <select
+                        value={selectedPipeDiameter || "25mm"}
+                        onChange={(e) => setSelectedPipeDiameter(e.target.value)}
+                        style={{
+                          ...ceToolBtn(false),
+                          height: 30,
+                          minWidth: 98,
+                          padding: "0 8px",
+                          borderColor: "rgba(220,38,38,0.3)",
+                          color: "#DC2626",
+                          background: "#fff",
+                        }}
+                        title="Pipe thickness"
+                      >
+                        {PIPE_DIAMETERS_MM.map(mm => (
+                          <option key={mm} value={`${mm}mm`}>{`${mm} mm`}</option>
+                        ))}
+                      </select>
+                    ) : null}
+                    {(pipesData?.pipes?.length || 0) > 0 ? (
+                      <button onClick={clearPipes} style={{ ...ceToolBtn(false), borderColor: "rgba(220,38,38,0.3)", color: "#DC2626" }}>
+                        Clear Pipes
                       </button>
                     ) : null}
                     <span style={{ fontSize: 11, color: "#6B7280" }}>
@@ -3234,6 +4209,70 @@ function RoomEditor({
                         const point = toImagePoint(e);
                         if (!point) return;
                         const { px, py } = point;
+                        if (editorMode === "shape_rect" || editorMode === "shape_circle" || editorMode === "shape_cloud") {
+                          if (!canEdit) return;
+                          setSelectedShapeId(null);
+                          setShapeDrag(null);
+                          setShapeResize(null);
+                          setShapeDraft({
+                            kind: editorMode === "shape_rect" ? "rect" : editorMode === "shape_circle" ? "circle" : "cloud",
+                            start: point,
+                            end: point,
+                          });
+                          return;
+                        }
+                        if (editorMode === "text_add") {
+                          if (!canEdit) return;
+                          const text = window.prompt("Enter text:", "Text");
+                          if (!text || !text.trim()) return;
+                          const clean = text.trim();
+                          const fontSize = 16;
+                          const estW = Math.max(44, clean.length * 9 + 10);
+                          const estH = fontSize + 8;
+                          const shape: ShapeAnnotation = {
+                            id: crypto.randomUUID(),
+                            kind: "text",
+                            x: px,
+                            y: py - estH,
+                            w: estW,
+                            h: estH,
+                            text: clean,
+                            fontSize,
+                          };
+                          setShapes(prev => [...prev, shape]);
+                          setSelectedShapeId(shape.id);
+                          setEditorMode("shape_select");
+                          return;
+                        }
+                        if (editorMode === "shape_select") {
+                          const selected = selectedShapeId ? shapes.find(s => s.id === selectedShapeId) || null : null;
+                          if (selected) {
+                            const hitHandle = hitShapeResizeHandle(selected, point);
+                            if (hitHandle && canEdit) {
+                              setShapeResize({ id: selected.id, handle: hitHandle, start: point, origin: selected });
+                              return;
+                            }
+                          }
+                          const hitId = findShapeAtPoint(point);
+                          if (hitId) {
+                            setSelectedShapeId(hitId);
+                            const hitShape = shapes.find(s => s.id === hitId) || null;
+                            if (hitShape?.kind === "text" && e.detail >= 2 && canEdit) {
+                              const next = window.prompt("Edit text:", hitShape.text || "")?.trim();
+                              if (next) {
+                                const font = hitShape.fontSize || 16;
+                                setShapes(prev => prev.map(s => s.id === hitId ? { ...s, text: next, w: Math.max(44, next.length * Math.max(7, font * 0.58) + 10), h: Math.max(font + 8, s.h) } : s));
+                              }
+                              return;
+                            }
+                            if (canEdit) {
+                              if (hitShape) setShapeDrag({ id: hitId, start: point, origin: hitShape });
+                            }
+                          } else {
+                            setSelectedShapeId(null);
+                          }
+                          return;
+                        }
                         if (editorMode === "measure") {
                           if (!measureStart || measureLocked) {
                             setMeasureStart({ px, py });
@@ -3249,8 +4288,11 @@ function RoomEditor({
                         // Pipe draw mode
                         if (editorMode === "pipe_draw") {
                           if (!pipeDrawStart) {
-                            setPipeDrawStart({ px, py });
-                            setPipeDrawEnd({ px, py });
+                            const join = closestPointOnPipe(px, py, 10);
+                            const startPt = join ? { px: join.px, py: join.py } : { px, py };
+                            setPipeDrawStart(startPt);
+                            setPipeDrawEnd(startPt);
+                            setPipeJoinHover(join ? startPt : null);
                           }
                           return;
                         }
@@ -3278,6 +4320,35 @@ function RoomEditor({
                       onMouseMove={(e) => {
                         const point = toImagePoint(e);
                         if (!point) return;
+                        if (shapeDraft) {
+                          setShapeDraft({ ...shapeDraft, end: point });
+                          return;
+                        }
+                        if (shapeResize) {
+                          const o = shapeResize.origin;
+                          const left = o.x;
+                          const top = o.y;
+                          const right = o.x + o.w;
+                          const bottom = o.y + o.h;
+                          const anchor = {
+                            px: shapeResize.handle.includes("w") ? right : left,
+                            py: shapeResize.handle.includes("n") ? bottom : top,
+                          };
+                          const raw = o.kind === "circle"
+                            ? circleRectFromPoints(anchor, point)
+                            : normalizeShapeRect(anchor, point);
+                          const minSize = o.kind === "text" ? 20 : 8;
+                          const next = { ...o, x: raw.x, y: raw.y, w: Math.max(minSize, raw.w), h: Math.max(minSize, raw.h) };
+                          setShapes(prev => prev.map(s => (s.id === o.id ? next : s)));
+                          return;
+                        }
+                        if (shapeDrag) {
+                          const dx = point.px - shapeDrag.start.px;
+                          const dy = point.py - shapeDrag.start.py;
+                          const o = shapeDrag.origin;
+                          setShapes(prev => prev.map(s => (s.id === o.id ? { ...s, x: o.x + dx, y: o.y + dy } : s)));
+                          return;
+                        }
                         if (editorMode === "rooms" && splitMode && selectedRoom) {
                           const snapped = snapPointToRoomBoundary(selectedRoom, point);
                           setSplitHover(snapped);
@@ -3288,13 +4359,22 @@ function RoomEditor({
                           return;
                         }
                         setHoverPoint(point);
-                        // Pipe draw preview
-                        if (editorMode === "pipe_draw" && pipeDrawStart) {
-                          setPipeDrawEnd(point);
+                        // In pipe draw mode, show join hover point on nearby lines even before first click.
+                        if (editorMode === "pipe_draw") {
+                          const join = closestPointOnPipe(point.px, point.py, 10);
+                          setPipeJoinHover(join ? { px: join.px, py: join.py } : null);
+                          if (pipeDrawStart) {
+                            if (join) setPipeDrawEnd({ px: join.px, py: join.py });
+                            else setPipeDrawEnd(point);
+                          }
                           return;
                         }
                         if (editorMode !== "select" && editorMode !== "erase") return;
-                        if (marquee) { setMarquee({ ...marquee, ex: point.px, ey: point.py }); return; }
+                        if (marquee) {
+                          setMarquee({ ...marquee, ex: point.px, ey: point.py });
+                          setAlignmentGuides({ vertical: [], horizontal: [] });
+                          return;
+                        }
                         if (!groupDrag) return;
                         const dx = point.px - groupDrag.start.px;
                         const dy = point.py - groupDrag.start.py;
@@ -3304,23 +4384,44 @@ function RoomEditor({
                           if (base) next[detId] = { px: base.px + dx, py: base.py + dy };
                         }
                         setGroupPreview(next);
+                        setAlignmentGuides(computeAlignmentGuides(next, groupDrag.ids));
                       }}
                       onMouseUp={() => {
+                        if (shapeDraft) {
+                          const rect = shapeDraft.kind === "circle"
+                            ? circleRectFromPoints(shapeDraft.start, shapeDraft.end)
+                            : normalizeShapeRect(shapeDraft.start, shapeDraft.end);
+                          setShapeDraft(null);
+                          if (rect.w >= 8 && rect.h >= 8 && canEdit) {
+                            const id = crypto.randomUUID();
+                            setShapes(prev => [...prev, { id, kind: shapeDraft.kind, ...rect }]);
+                            setSelectedShapeId(id);
+                            setEditorMode("shape_select");
+                          }
+                          return;
+                        }
+                        if (shapeDrag) {
+                          setShapeDrag(null);
+                          return;
+                        }
+                        if (shapeResize) {
+                          setShapeResize(null);
+                          return;
+                        }
                         if (editorMode === "measure") return;
                         // Finalize pipe draw
                         if (editorMode === "pipe_draw" && pipeDrawStart && pipeDrawEnd) {
                           const dist = Math.hypot(pipeDrawEnd.px - pipeDrawStart.px, pipeDrawEnd.py - pipeDrawStart.py);
                           if (dist > 5) {
-                            // Snap to orthogonal (horizontal or vertical)
-                            const dx = Math.abs(pipeDrawEnd.px - pipeDrawStart.px);
-                            const dy = Math.abs(pipeDrawEnd.py - pipeDrawStart.py);
-                            const snappedEnd = dx > dy
-                              ? { px: pipeDrawEnd.px, py: pipeDrawStart.py }
-                              : { px: pipeDrawStart.px, py: pipeDrawEnd.py };
-                            addPipe(pipeDrawStart, snappedEnd);
+                            const joinedEnd = closestPointOnPipe(pipeDrawEnd.px, pipeDrawEnd.py, 10);
+                            const endPt = joinedEnd
+                              ? { px: joinedEnd.px, py: joinedEnd.py }
+                              : resolvePipeDrawEnd(pipeDrawStart, pipeDrawEnd).end;
+                            addPipe(pipeDrawStart, endPt);
                           }
                           setPipeDrawStart(null);
                           setPipeDrawEnd(null);
+                          setPipeJoinHover(null);
                           return;
                         }
                         if (editorMode !== "select" && editorMode !== "erase") return;
@@ -3333,12 +4434,14 @@ function RoomEditor({
                             setSelectedDetectorIds(idsInRect(rect));
                           }
                           setMarquee(null);
+                          setAlignmentGuides({ vertical: [], horizontal: [] });
                           return;
                         }
                         if (groupDrag && groupPreview) {
                           moveDetectorsToMany(groupPreview);
                           setGroupDrag(null);
                           setGroupPreview(null);
+                          setAlignmentGuides({ vertical: [], horizontal: [] });
                         }
                       }}
                       onMouseLeave={() => {
@@ -3347,7 +4450,11 @@ function RoomEditor({
                         if (marquee) setMarquee(null);
                         if (groupDrag) setGroupDrag(null);
                         if (groupPreview) setGroupPreview(null);
+                        if (shapeDrag) setShapeDrag(null);
+                        if (shapeResize) setShapeResize(null);
                         if (pipeDrawStart) { setPipeDrawStart(null); setPipeDrawEnd(null); }
+                        setPipeJoinHover(null);
+                        setAlignmentGuides({ vertical: [], horizontal: [] });
                       }}
                       onContextMenu={(e) => {
                         e.preventDefault();
@@ -3359,39 +4466,12 @@ function RoomEditor({
                         if (detId) deleteDetector(detId);
                       }}
                     >
-                      {/* Room polygons */}
-                      {rooms.map(room => {
-                        const pts = room.polygon_px.map(p => `${p[0]},${p[1]}`).join(" ");
-                        const { cx, cy } = roomCentroidPx(room);
-                        const isSelected = room.id === selectedId;
-                        return (
-                          <g key={room.id} onClick={() => { if (editorMode === "rooms" && !splitMode) setSelectedId(isSelected ? null : room.id); }}>
-                            <polygon
-                              points={pts}
-                              fill={isSelected ? "rgba(45,106,79,0.25)" : "rgba(45,106,79,0.10)"}
-                              stroke={isSelected ? "#2D6A4F" : "rgba(45,106,79,0.4)"}
-                              strokeWidth={isSelected ? 2.5 : 1.5}
-                              style={{ cursor: editorMode === "rooms" ? "pointer" : "inherit", transition: "fill 0.15s" }}
-                            />
-                            <text
-                              x={cx} y={cy}
-                              textAnchor="middle" dominantBaseline="central"
-                              fill="#1A1A2E"
-                              fontSize={Math.max(12, (imgDims?.w || mapping.width_px) / 80)}
-                              fontWeight={600}
-                              style={{ pointerEvents: "none", textShadow: "0 1px 3px rgba(255,255,255,0.8)" }}
-                            >
-                              {room.label || room.id}
-                            </text>
-                          </g>
-                        );
-                      })}
-
                       {/* Sprinkler pipes */}
                       {pipesData?.pipes?.map((pipe, i) => {
                         const p1 = worldToPixel(mapping, pipe.from[0], pipe.from[1]);
                         const p2 = worldToPixel(mapping, pipe.to[0], pipe.to[1]);
                         const isSel = selectedPipeIdx === i;
+                        const baseW = pipeStrokeWidthPx(pipe.diameter);
                         return (
                           <g key={`pipe-${i}`}
                             onClick={(e) => {
@@ -3401,10 +4481,10 @@ function RoomEditor({
                           >
                             {isSel ? (
                               <line x1={p1.px} y1={p1.py} x2={p2.px} y2={p2.py}
-                                stroke="#ffe58f" strokeWidth={6} opacity={0.5} />
+                                stroke="#ffe58f" strokeWidth={baseW + 3} opacity={0.5} />
                             ) : null}
                             <line x1={p1.px} y1={p1.py} x2={p2.px} y2={p2.py}
-                              stroke={isSel ? "#f59e0b" : "#DC2626"} strokeWidth={isSel ? 3 : 2} opacity={isSel ? 1 : 0.7} />
+                              stroke={isSel ? "#f59e0b" : "#DC2626"} strokeWidth={isSel ? Math.max(3, baseW + 0.8) : baseW} opacity={isSel ? 1 : 0.7} />
                             {(editorMode === "pipe_select" || editorMode === "pipe_draw") ? (
                               <line x1={p1.px} y1={p1.py} x2={p2.px} y2={p2.py}
                                 stroke="transparent" strokeWidth={12} />
@@ -3414,16 +4494,24 @@ function RoomEditor({
                       })}
                       {/* Pipe draw preview */}
                       {editorMode === "pipe_draw" && pipeDrawStart && pipeDrawEnd ? (() => {
-                        const dx = Math.abs(pipeDrawEnd.px - pipeDrawStart.px);
-                        const dy = Math.abs(pipeDrawEnd.py - pipeDrawStart.py);
-                        const snappedEnd = dx > dy
-                          ? { px: pipeDrawEnd.px, py: pipeDrawStart.py }
-                          : { px: pipeDrawStart.px, py: pipeDrawEnd.py };
+                        const drawW = pipeStrokeWidthPx(drawPipeDiameter);
+                        const resolved = resolvePipeDrawEnd(pipeDrawStart, pipeDrawEnd);
+                        const snappedEnd = resolved.end;
+                        const highlightAxis = resolved.axis;
                         return (
-                          <line x1={pipeDrawStart.px} y1={pipeDrawStart.py} x2={snappedEnd.px} y2={snappedEnd.py}
-                            stroke="#DC2626" strokeWidth={2} strokeDasharray="8 4" opacity={0.8} />
+                          <>
+                            {highlightAxis ? (
+                              <line x1={pipeDrawStart.px} y1={pipeDrawStart.py} x2={snappedEnd.px} y2={snappedEnd.py}
+                                stroke="#22C55E" strokeWidth={drawW + 1.2} strokeDasharray="8 4" opacity={0.35} />
+                            ) : null}
+                            <line x1={pipeDrawStart.px} y1={pipeDrawStart.py} x2={snappedEnd.px} y2={snappedEnd.py}
+                              stroke={highlightAxis ? "#16A34A" : "#DC2626"} strokeWidth={drawW} strokeDasharray="8 4" opacity={0.9} />
+                          </>
                         );
                       })() : null}
+                      {editorMode === "pipe_draw" && pipeJoinHover ? (
+                        <circle cx={pipeJoinHover.px} cy={pipeJoinHover.py} r={4.5} fill="#FFFFFF" stroke="#DC2626" strokeWidth={2} />
+                      ) : null}
                       {pipesData?.sources?.map((src, i) => {
                         const p = worldToPixel(mapping, src.x, src.y);
                         return (
@@ -3466,10 +4554,176 @@ function RoomEditor({
                         );
                       })()}
 
+                      {/* Shape annotations */}
+                      {shapes.map((s) => {
+                        const isSelected = selectedShapeId === s.id;
+                        if (s.kind === "text") {
+                          return (
+                            <g key={s.id}>
+                              <text x={s.x + 2} y={s.y + (s.fontSize || 16)} fill="#1F2937" fontSize={s.fontSize || 16} fontWeight={600}>
+                                {s.text || "Text"}
+                              </text>
+                              {isSelected ? (
+                                <rect
+                                  x={s.x}
+                                  y={s.y}
+                                  width={s.w}
+                                  height={s.h}
+                                  fill="none"
+                                  stroke="#2563EB"
+                                  strokeWidth={1.4}
+                                  strokeDasharray="6 4"
+                                />
+                              ) : null}
+                            </g>
+                          );
+                        }
+                        if (s.kind === "circle") {
+                          return (
+                            <ellipse
+                              key={s.id}
+                              cx={s.x + s.w * 0.5}
+                              cy={s.y + s.h * 0.5}
+                              rx={Math.max(1, s.w * 0.5)}
+                              ry={Math.max(1, s.h * 0.5)}
+                              fill="rgba(59,130,246,0.08)"
+                              stroke={isSelected ? "#2563EB" : "#1F2937"}
+                              strokeWidth={isSelected ? 2.2 : 1.8}
+                              strokeDasharray={isSelected ? "6 4" : undefined}
+                            />
+                          );
+                        }
+                        if (s.kind === "cloud") {
+                          return (
+                            <path
+                              key={s.id}
+                              d={cloudPathFromRect(s.x, s.y, s.w, s.h)}
+                              fill="rgba(34,211,238,0.08)"
+                              stroke={isSelected ? "#06B6D4" : "#0891B2"}
+                              strokeWidth={isSelected ? 2.2 : 1.8}
+                              strokeDasharray={isSelected ? "6 4" : undefined}
+                            />
+                          );
+                        }
+                        return (
+                          <rect
+                            key={s.id}
+                            x={s.x}
+                            y={s.y}
+                            width={s.w}
+                            height={s.h}
+                            fill="rgba(16,185,129,0.08)"
+                            stroke={isSelected ? "#2563EB" : "#1F2937"}
+                            strokeWidth={isSelected ? 2.2 : 1.8}
+                            strokeDasharray={isSelected ? "6 4" : undefined}
+                          />
+                        );
+                      })}
+
+                      {/* Draft shape + live dimensions while drawing */}
+                      {shapeDraft ? (() => {
+                        const rect = shapeDraft.kind === "circle"
+                          ? circleRectFromPoints(shapeDraft.start, shapeDraft.end)
+                          : normalizeShapeRect(shapeDraft.start, shapeDraft.end);
+                        const label = shapeDimensionLabel({ kind: shapeDraft.kind, ...rect });
+                        return (
+                          <g style={{ pointerEvents: "none" }}>
+                            {shapeDraft.kind === "circle" ? (
+                              <ellipse
+                                cx={rect.x + rect.w * 0.5}
+                                cy={rect.y + rect.h * 0.5}
+                                rx={Math.max(1, rect.w * 0.5)}
+                                ry={Math.max(1, rect.h * 0.5)}
+                                fill="rgba(59,130,246,0.12)"
+                                stroke="#2563EB"
+                                strokeWidth={2}
+                                strokeDasharray="8 4"
+                              />
+                            ) : shapeDraft.kind === "cloud" ? (
+                              <path
+                                d={cloudPathFromRect(rect.x, rect.y, rect.w, rect.h)}
+                                fill="rgba(34,211,238,0.12)"
+                                stroke="#0891B2"
+                                strokeWidth={2}
+                                strokeDasharray="8 4"
+                              />
+                            ) : (
+                              <rect
+                                x={rect.x}
+                                y={rect.y}
+                                width={rect.w}
+                                height={rect.h}
+                                fill="rgba(59,130,246,0.12)"
+                                stroke="#2563EB"
+                                strokeWidth={2}
+                                strokeDasharray="8 4"
+                              />
+                            )}
+                            <rect x={rect.x} y={rect.y - 22} width={124} height={18} rx={7} fill="rgba(37,99,235,0.92)" />
+                            <text x={rect.x + 62} y={rect.y - 9} textAnchor="middle" fill="#ffffff" fontSize={11} fontWeight={700}>{label}</text>
+                          </g>
+                        );
+                      })() : null}
+
+                      {/* Resize handles for selected shape */}
+                      {selectedShape && editorMode === "shape_select" ? (() => {
+                        const left = selectedShape.x;
+                        const top = selectedShape.y;
+                        const right = selectedShape.x + selectedShape.w;
+                        const bottom = selectedShape.y + selectedShape.h;
+                        const handlePts = [
+                          { px: left, py: top },
+                          { px: right, py: top },
+                          { px: left, py: bottom },
+                          { px: right, py: bottom },
+                        ];
+                        return (
+                          <g>
+                            {handlePts.map((h, i) => (
+                              <rect key={`shape-handle-${i}`} x={h.px - 4} y={h.py - 4} width={8} height={8} rx={1} fill="#ffffff" stroke="#2563EB" strokeWidth={1.4} />
+                            ))}
+                          </g>
+                        );
+                      })() : null}
+
+                      {/* Alignment guides while moving elements */}
+                      {groupDrag ? (
+                        <g style={{ pointerEvents: "none" }}>
+                          {alignmentGuides.vertical.map((x, i) => (
+                            <line
+                              key={`guide-v-${i}-${Math.round(x)}`}
+                              x1={x}
+                              y1={0}
+                              x2={x}
+                              y2={imgDims?.h || 0}
+                              stroke="#2D6A4F"
+                              strokeWidth={1.5}
+                              strokeDasharray="6 4"
+                              opacity={0.75}
+                            />
+                          ))}
+                          {alignmentGuides.horizontal.map((y, i) => (
+                            <line
+                              key={`guide-h-${i}-${Math.round(y)}`}
+                              x1={0}
+                              y1={y}
+                              x2={imgDims?.w || 0}
+                              y2={y}
+                              stroke="#2D6A4F"
+                              strokeWidth={1.5}
+                              strokeDasharray="6 4"
+                              opacity={0.75}
+                            />
+                          ))}
+                        </g>
+                      ) : null}
+
                       {/* Detectors */}
                       {detectors.map(d => {
                         const p = groupPreview?.[d.id] || worldToPixel(mapping, d.x, d.y);
                         const isSel = selectedDetectorIds.includes(d.id);
+                        const isSprinkler = (d.dtype || "").toLowerCase() === "sprinkler";
+                        const rotationDeg = d.rotation_deg ?? 0;
                         return (
                           <g key={d.id}>
                             {isSel ? (
@@ -3478,32 +4732,14 @@ function RoomEditor({
                                 <circle cx={p.px} cy={p.py} r={15} fill="none" stroke="#ffe58f" strokeWidth={3} strokeDasharray="6 4" />
                               </>
                             ) : null}
-                            {renderPlacedObject(d.dtype, p.px, p.py)}
-                            <circle cx={p.px} cy={p.py} r={11} fill="none" stroke={isSel ? "#ffe58f" : "#ffffff"} strokeWidth={isSel ? 3 : 2} />
+                            <g transform={`rotate(${rotationDeg} ${p.px} ${p.py})`}>
+                              {renderPlacedObject(d.dtype, p.px, p.py, mapping, worldToM)}
+                            </g>
+                            {!isSprinkler ? <circle cx={p.px} cy={p.py} r={11} fill="none" stroke={isSel ? "#ffe58f" : "#ffffff"} strokeWidth={isSel ? 3 : 2} /> : null}
                             {isSel ? <circle cx={p.px} cy={p.py} r={3} fill="#fff7d1" /> : null}
                           </g>
                         );
                       })}
-
-                      {/* Split line preview */}
-                      {editorMode === "rooms" && splitMode && splitStart && splitPreviewEnd ? (
-                        <line x1={splitStart.px} y1={splitStart.py} x2={splitPreviewEnd.px} y2={splitPreviewEnd.py}
-                          stroke="#DC2626" strokeWidth={3} strokeDasharray="8 4" />
-                      ) : null}
-                      {editorMode === "rooms" && splitMode && splitHover ? (
-                        <circle cx={splitHover.px} cy={splitHover.py} r={5} fill="#FEE2E2" stroke="#DC2626" strokeWidth={2} style={{ pointerEvents: "none" }} />
-                      ) : null}
-                      {editorMode === "rooms" && splitMode && selectedRoom ? selectedRoom.polygon_px.map((p, idx) => {
-                        const dot = { px: p[0], py: p[1] };
-                        const isStart = !!splitStart && samePoint(splitStart, dot);
-                        return (
-                          <circle key={`split-dot-${idx}`} cx={dot.px} cy={dot.py} r={isStart ? 8 : 6}
-                            fill={isStart ? "#DC2626" : "#FFFFFF"} stroke={isStart ? "#FCA5A5" : "#2D6A4F"} strokeWidth={2}
-                            style={{ cursor: "pointer" }}
-                            onClick={(e) => { e.stopPropagation(); handleSplitDotClick(dot); }}
-                          />
-                        );
-                      }) : null}
 
                       {/* Marquee selection */}
                       {marquee ? (() => {
@@ -3573,82 +4809,18 @@ function RoomEditor({
         {/* Tab bar */}
         <div style={{ display: "flex", borderBottom: "1px solid #E8EAED", flexShrink: 0 }}>
           <button
-            onClick={() => setSidebarTab("rooms")}
-            style={{
-              flex: 1, padding: "12px 0", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600,
-              background: sidebarTab === "rooms" ? "#FFFFFF" : "#FAFBFC",
-              color: sidebarTab === "rooms" ? "#2D6A4F" : "#6B7280",
-              borderBottom: sidebarTab === "rooms" ? "2px solid #2D6A4F" : "2px solid transparent",
-            }}
-          >
-            Rooms ({rooms.length})
-          </button>
-          <button
             onClick={() => setSidebarTab("equipment")}
             style={{
               flex: 1, padding: "12px 0", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600,
-              background: sidebarTab === "equipment" ? "#FFFFFF" : "#FAFBFC",
-              color: sidebarTab === "equipment" ? "#2D6A4F" : "#6B7280",
-              borderBottom: sidebarTab === "equipment" ? "2px solid #2D6A4F" : "2px solid transparent",
+              background: "#FFFFFF",
+              color: "#2D6A4F",
+              borderBottom: "2px solid #2D6A4F",
             }}
           >
             Equipment ({detectors.length})
           </button>
         </div>
 
-        {sidebarTab === "rooms" ? (
-          <>
-            <div style={{ padding: "10px 14px 6px" }}>
-              <p style={{ margin: 0, fontSize: 12, color: "#6B7280", lineHeight: 1.4 }}>
-                Click a room to select, then rename, delete, or split. Switch to Add/Select mode to place equipment.
-              </p>
-            </div>
-            <div style={{ flex: 1, overflow: "auto", padding: "6px 14px" }}>
-              {rooms.map((room) => {
-                const isSelected = room.id === selectedId;
-                return (
-                  <div
-                    key={room.id}
-                    onClick={() => { setSelectedId(isSelected ? null : room.id); setEditorMode("rooms"); }}
-                    style={{
-                      padding: "10px 12px", marginBottom: 6, borderRadius: 10,
-                      border: isSelected ? "1px solid #2D6A4F" : "1px solid #E8EAED",
-                      background: isSelected ? "rgba(45,106,79,0.06)" : "#FAFBFC",
-                      cursor: "pointer", transition: "all 0.15s",
-                    }}
-                  >
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      {editingLabelId === room.id ? (
-                        <input
-                          autoFocus
-                          value={labelDraft}
-                          onChange={e => setLabelDraft(e.target.value)}
-                          onBlur={() => handleRenameCommit(room.id)}
-                          onKeyDown={e => { if (e.key === "Enter") handleRenameCommit(room.id); if (e.key === "Escape") setEditingLabelId(null); }}
-                          onClick={e => e.stopPropagation()}
-                          style={{
-                            background: "#FFFFFF", border: "1px solid #2D6A4F", borderRadius: 6,
-                            color: "#1A1A2E", padding: "4px 8px", fontSize: 13, width: "60%", outline: "none",
-                          }}
-                        />
-                      ) : (
-                        <span style={{ fontSize: 13, fontWeight: 600, color: "#1A1A2E" }}>{room.label || room.id}</span>
-                      )}
-                      <span style={{ fontSize: 11, color: "#9CA3AF" }}>{room.polygon_px.length} pts</span>
-                    </div>
-                    {isSelected && canEdit ? (
-                      <div style={{ marginTop: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
-                        <button onClick={(e) => { e.stopPropagation(); handleRenameStart(room); }} style={ceRoomBtn}>Rename</button>
-                        <button onClick={(e) => { e.stopPropagation(); resetSplitState(); setSplitMode(true); setEditorMode("rooms"); }} style={ceRoomBtn}>Split</button>
-                        <button onClick={(e) => { e.stopPropagation(); handleDeleteRoom(room.id); }} style={{ ...ceRoomBtn, borderColor: "rgba(220,38,38,0.3)", color: "#DC2626" }}>Delete</button>
-                      </div>
-                    ) : null}
-                  </div>
-                );
-              })}
-            </div>
-          </>
-        ) : (
           <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
             <div style={{ padding: "10px 14px 6px" }}>
               <p style={{ margin: 0, fontSize: 12, color: "#6B7280", lineHeight: 1.4 }}>
@@ -3658,24 +4830,6 @@ function RoomEditor({
               </p>
             </div>
 
-            {canEdit && (
-            <div style={{ padding: "0 14px 6px" }}>
-              <button
-                onClick={() => autoPlaceEquipment(addType === "mcb" || addType === "hooter" ? "mcp_hooter" : addType)}
-                disabled={!!isAutoPlacing || rooms.length === 0}
-                style={{
-                  width: "100%", padding: "8px 10px", borderRadius: 8,
-                  border: "none", background: "#2D6A4F", color: "#fff",
-                  fontWeight: 700, fontSize: 12,
-                  cursor: (!!isAutoPlacing || rooms.length === 0) ? "wait" : "pointer",
-                  display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
-                }}
-              >
-                {!!isAutoPlacing ? "Auto-placing..." : `Auto-place Selected (${addType === "mcb" || addType === "hooter" ? "MCP & Hooter" : addType})`}
-              </button>
-            </div>
-            )}
-
             {/* Per-equipment auto-place buttons */}
             {canEdit && (
             <div style={{ padding: "6px 14px", display: "flex", flexDirection: "column", gap: 6 }}>
@@ -3683,7 +4837,7 @@ function RoomEditor({
                 const EQUIPMENT_BUTTONS: { key: string; dtype: string; label: string; icon: React.ReactNode }[] = [
                   {
                     key: "auto_detection_alarm", dtype: "smoke",
-                    label: "Detectors & Alarms",
+                    label: "Smoke Detectors",
                     icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><text x="12" y="16" textAnchor="middle" fontSize="12" fontWeight="700" fill="currentColor" stroke="none">S</text></svg>,
                   },
                   {
@@ -3692,19 +4846,14 @@ function RoomEditor({
                     icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2v6"/><path d="M5 10l7 4 7-4"/><path d="M5 14l2 6"/><path d="M19 14l-2 6"/><path d="M12 14v8"/></svg>,
                   },
                   {
-                    key: "hose_reel", dtype: "fire_hose",
-                    label: "Fire Hose Reels",
-                    icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/></svg>,
+                    key: "yard_hydrant", dtype: "fire_hose",
+                    label: "External Hydrant",
+                    icon: <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden><rect x="2.5" y="10" width="7.5" height="4" fill="none" stroke="currentColor" strokeWidth="1.8"/><line x1="2.7" y1="12" x2="11.6" y2="12" stroke="currentColor" strokeWidth="1.2" opacity="0.9"/><rect x="8.6" y="7.6" width="3.6" height="8.8" fill="currentColor"/><circle cx="14.2" cy="12" r="3.9" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M10.3 12 C 12.1 10.3, 14.8 13.7, 17 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/><path d="M19.6 8.4 Q21 12 19.6 15.6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/><line x1="20.9" y1="8.8" x2="20.9" y2="15.2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>,
                   },
                   {
-                    key: "fire_extinguisher", dtype: "panel",
-                    label: "Fire Extinguishers",
-                    icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="6" y="4" width="12" height="16" rx="2"/><line x1="10" y1="2" x2="14" y2="2"/><line x1="12" y1="8" x2="12" y2="14"/></svg>,
-                  },
-                  {
-                    key: "manual_fire_alarm", dtype: "mcp_hooter",
-                    label: "MCP & Hooter",
-                    icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>,
+                    key: "mcp_hooter", dtype: "mcp_hooter",
+                    label: "MCP + Hooter",
+                    icon: <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden><rect x="2.5" y="8" width="7" height="7" fill="none" stroke="currentColor" strokeWidth="1.6"/><circle cx="6" cy="11.5" r="1.4" fill="currentColor"/><path d="M14 15.8h7v2.2h-7z" fill="currentColor" opacity="0.35"/><path d="M15 14h5.5Q20.5 9.8 18 9q-2.5.8-3 5z" fill="currentColor"/><line x1="18" y1="6.6" x2="18" y2="4.8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/></svg>,
                   },
                 ];
 
@@ -3937,6 +5086,17 @@ function RoomEditor({
                         >
                           Select / Delete
                         </button>
+                        <button
+                          onClick={clearPipes}
+                          style={{
+                            padding: "6px 10px", borderRadius: 8,
+                            border: "1px solid rgba(220,38,38,0.25)",
+                            background: "#FFFFFF",
+                            color: "#DC2626", fontWeight: 700, fontSize: 11, cursor: "pointer",
+                          }}
+                        >
+                          Clear Pipes
+                        </button>
                       </div>
                     ) : null}
                   </div>
@@ -3957,14 +5117,7 @@ function RoomEditor({
               )}
             </div>
           </div>
-        )}
 
-        {/* Split mode hint */}
-        {editorMode === "rooms" && splitMode && selectedRoom ? (
-          <div style={{ padding: "0 14px 8px", fontSize: 12, color: "#6B7280" }}>
-            Click two points on the selected room boundary to split.
-          </div>
-        ) : null}
         {editorMode === "measure" ? (
           <div style={{ padding: "0 14px 8px", fontSize: 12, color: "#6B7280", display: "flex", alignItems: "center", gap: 8 }}>
             Click first point, click second to lock. Click again to start a new measurement.
@@ -3978,50 +5131,49 @@ function RoomEditor({
             ) : null}
           </div>
         ) : null}
+        {(editorMode === "shape_rect" || editorMode === "shape_circle" || editorMode === "shape_cloud" || editorMode === "shape_select" || editorMode === "text_add") ? (
+          <div style={{ padding: "0 14px 8px", fontSize: 12, color: "#6B7280", display: "flex", alignItems: "center", gap: 8 }}>
+            {editorMode === "shape_select"
+              ? "Drag shapes to move. Drag corner handles to resize."
+              : editorMode === "text_add"
+                ? "Click on drawing to place text."
+                : editorMode === "shape_cloud"
+                  ? "Click and drag to draw cloud outline stencil. Dimensions are shown while drawing."
+                  : "Click and drag to draw shape. Dimensions are shown while drawing."}
+            {(editorMode === "shape_select" && selectedShapeId) ? (
+              <button
+                onClick={() => { setShapes(prev => prev.filter(s => s.id !== selectedShapeId)); setSelectedShapeId(null); }}
+                style={{ ...ceRoomBtn, padding: "4px 8px", fontSize: 11 }}
+              >
+                Delete Shape
+              </button>
+            ) : null}
+            {(editorMode === "shape_select" && selectedShape?.kind === "text") ? (
+              <>
+                <button
+                  onClick={editSelectedText}
+                  style={{ ...ceRoomBtn, padding: "4px 8px", fontSize: 11 }}
+                >
+                  Edit Text
+                </button>
+                <button
+                  onClick={() => changeSelectedTextSize(-2)}
+                  style={{ ...ceRoomBtn, padding: "4px 8px", fontSize: 11 }}
+                >
+                  A-
+                </button>
+                <button
+                  onClick={() => changeSelectedTextSize(2)}
+                  style={{ ...ceRoomBtn, padding: "4px 8px", fontSize: 11 }}
+                >
+                  A+
+                </button>
+                <span style={{ fontSize: 11, color: "#4B5563" }}>{selectedShape.fontSize || 16}px</span>
+              </>
+            ) : null}
+          </div>
+        ) : null}
 
-        {/* Bottom action bar */}
-        {canEdit && (
-        <div style={{ padding: "12px 14px", borderTop: "1px solid #E8EAED", display: "flex", gap: 8, flexShrink: 0 }}>
-          {splitMode ? (
-            <button onClick={() => { setSplitMode(false); resetSplitState(); }} style={{ ...ceRoomBtn, flex: 1, background: "rgba(220,38,38,0.06)" }}>
-              Cancel Split
-            </button>
-          ) : null}
-          <button
-            onClick={handleSaveChanges}
-            disabled={isSavingChanges || isContinuing}
-            style={{
-              flex: 1, padding: "10px 16px", borderRadius: 10,
-              border: "1px solid #2D6A4F",
-              background: isSavingChanges ? "rgba(45,106,79,0.08)" : "#FFFFFF",
-              color: "#2D6A4F",
-              fontWeight: 600, fontSize: 13,
-              cursor: (isSavingChanges || isContinuing) ? "wait" : "pointer",
-              opacity: (isSavingChanges || isContinuing) ? 0.5 : 1,
-              display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
-            }}
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
-              <polyline points="17 21 17 13 7 13 7 21"/>
-              <polyline points="7 3 7 8 15 8"/>
-            </svg>
-            {isSavingChanges ? "Saving..." : "Save Changes"}
-          </button>
-          <button
-            onClick={handleContinue}
-            disabled={isSavingRooms || isContinuing || rooms.length === 0}
-            style={{
-              flex: 1, padding: "10px 16px", borderRadius: 10, border: "none",
-              background: "linear-gradient(135deg, #2D6A4F, #40916C)", color: "#fff",
-              fontWeight: 600, fontSize: 13, cursor: (isSavingRooms || isContinuing) ? "wait" : "pointer",
-              opacity: (isSavingRooms || isContinuing) ? 0.5 : 1,
-            }}
-          >
-            {isContinuing ? "Finalizing..." : "Finalize & Export"}
-          </button>
-        </div>
-        )}
       </div>
     </div>
   );
@@ -4035,6 +5187,22 @@ const ceToolBtn = (active: boolean): CSSProperties => ({
   cursor: "pointer", fontSize: 12, fontWeight: 600,
   display: "inline-flex", alignItems: "center", gap: 5,
 });
+
+const cePaintActionBtn: CSSProperties = {
+  borderRadius: 8,
+  border: "1px solid #D1D5DB",
+  background: "#FFFFFF",
+  color: "#1A1A2E",
+  height: 30,
+  minWidth: 70,
+  padding: "0 10px",
+  cursor: "pointer",
+  fontSize: 12,
+  fontWeight: 700,
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 5,
+};
 
 const ceObjectBtn = (active: boolean): CSSProperties => ({
   borderRadius: 8, border: active ? "1px solid #2D6A4F" : "1px solid #E8EAED",
@@ -4335,6 +5503,7 @@ function Editor({
       id: crypto.randomUUID(),
       project_id: projectId,
       x: w.x, y: w.y, z: 0,
+      rotation_deg: 0,
       dtype: addType,
       locked: false,
       floor_plan_id: floorPlanId || null,
@@ -4346,6 +5515,7 @@ function Editor({
       const payload: any = {
         detectors: detectors.map(d => ({
           id: d.id, x: d.x, y: d.y, z: d.z,
+          rotation_deg: d.rotation_deg ?? 0,
           dtype: d.dtype, locked: d.locked,
           floor_plan_id: d.floor_plan_id,
         })),
@@ -4421,11 +5591,11 @@ function Editor({
     // Draw sprinkler pipes
     if (pipesData?.pipes) {
       ctx.strokeStyle = "#DC2626";
-      ctx.lineWidth = 2;
       ctx.globalAlpha = 0.7;
       for (const pipe of pipesData.pipes) {
         const p1 = worldToPixel(mapping, pipe.from[0], pipe.from[1]);
         const p2 = worldToPixel(mapping, pipe.to[0], pipe.to[1]);
+        ctx.lineWidth = pipeStrokeWidthPx(pipe.diameter);
         ctx.beginPath();
         ctx.moveTo(p1.px, p1.py);
         ctx.lineTo(p2.px, p2.py);
@@ -4453,12 +5623,19 @@ function Editor({
 
     for (const d of detectors) {
       const p = worldToPixel(mapping, d.x, d.y);
-      drawPlacedObjectOnCanvas(ctx, d.dtype, p.px, p.py);
-      ctx.beginPath();
-      ctx.arc(p.px, p.py, 11, 0, Math.PI * 2);
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 2;
-      ctx.stroke();
+      const rotationRad = ((d.rotation_deg ?? 0) * Math.PI) / 180;
+      ctx.save();
+      ctx.translate(p.px, p.py);
+      ctx.rotate(rotationRad);
+      drawPlacedObjectOnCanvas(ctx, d.dtype, 0, 0, mapping, worldToM);
+      ctx.restore();
+      if ((d.dtype || "").toLowerCase() !== "sprinkler") {
+        ctx.beginPath();
+        ctx.arc(p.px, p.py, 11, 0, Math.PI * 2);
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
     }
 
     const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
@@ -4488,6 +5665,15 @@ function Editor({
       if (!pt) return d;
       const w = pixelToWorld(mapping, pt.px, pt.py);
       return { ...d, x: w.x, y: w.y };
+    }));
+  }
+
+  function rotateDetectorsMany(ids: string[], deltaDeg: number) {
+    if (!ids.length || !canEdit) return;
+    const idSet = new Set(ids);
+    setDetectors(prev => prev.map(d => {
+      if (!idSet.has(d.id)) return d;
+      return { ...d, rotation_deg: normalizeAngleDeg((d.rotation_deg ?? 0) + deltaDeg) };
     }));
   }
 
@@ -4634,6 +5820,8 @@ function Editor({
                 </span>
                 {selectedIds.length > 0 ? (
                   <>
+                    {canEdit && <button onClick={() => rotateDetectorsMany(selectedIds, -15)} style={toolBtn(false)}>Rotate -15°</button>}
+                    {canEdit && <button onClick={() => rotateDetectorsMany(selectedIds, 15)} style={toolBtn(false)}>Rotate +15°</button>}
                     {canEdit && <button onClick={() => deleteDetectorsMany(selectedIds)} style={{ ...toolBtn(false), color: "#FF6B6B" }}>Delete Selected</button>}
                     <button onClick={() => setSelectedIds([])} style={toolBtn(false)}>Clear</button>
                   </>
@@ -4820,7 +6008,7 @@ function Editor({
                       const p2 = worldToPixel(mapping, pipe.to[0], pipe.to[1]);
                       return (
                         <line key={`pipe-${i}`} x1={p1.px} y1={p1.py} x2={p2.px} y2={p2.py}
-                          stroke="#DC2626" strokeWidth={2} opacity={0.7} />
+                          stroke="#DC2626" strokeWidth={pipeStrokeWidthPx(pipe.diameter)} opacity={0.7} />
                       );
                     })}
                     {pipesData?.sources?.map((src, i) => {
@@ -4836,6 +6024,8 @@ function Editor({
                     {detectors.map((d)=> {
                       const p = groupPreview?.[d.id] || worldToPixel(mapping, d.x, d.y);
                       const isSelected = selectedIds.includes(d.id);
+                      const isSprinkler = (d.dtype || "").toLowerCase() === "sprinkler";
+                      const rotationDeg = d.rotation_deg ?? 0;
                       return (
                         <g key={d.id}>
                           {isSelected ? (
@@ -4844,8 +6034,10 @@ function Editor({
                               <circle cx={p.px} cy={p.py} r={15} fill="none" stroke="#ffe58f" strokeWidth={3} strokeDasharray="6 4" />
                             </>
                           ) : null}
-                          {renderPlacedObject(d.dtype, p.px, p.py)}
-                          <circle cx={p.px} cy={p.py} r={11} fill="none" stroke={isSelected ? "#ffe58f" : "#ffffff"} strokeWidth={isSelected ? 3 : 2} />
+                          <g transform={`rotate(${rotationDeg} ${p.px} ${p.py})`}>
+                            {renderPlacedObject(d.dtype, p.px, p.py, mapping, worldToM)}
+                          </g>
+                          {!isSprinkler ? <circle cx={p.px} cy={p.py} r={11} fill="none" stroke={isSelected ? "#ffe58f" : "#ffffff"} strokeWidth={isSelected ? 3 : 2} /> : null}
                           {isSelected ? (
                             <circle cx={p.px} cy={p.py} r={3} fill="#fff7d1" />
                           ) : null}
@@ -4948,10 +6140,26 @@ function objectFill(dtype: string): string {
   if (key === "hooter") return "#c77dff";
   if (key === "mcb") return "#4ecdc4";
   if (key === "sprinkler") return "#DC2626";
+  if (key === "fire_hose") return "#DC2626";
+  if (key === "internal_hydrant") return "#D946EF";
+  if (key === "beam_detector") return "#FF00CC";
+  if (key === "reflector") return "#2563EB";
   return "#ff5a7e";
 }
 
-function renderPlacedObject(dtype: string, cx: number, cy: number) {
+function scaledDeviceRadiusPx(mapping: Mapping, worldToM: number, cx: number, cy: number, fallbackPx: number, radiusMeters = 0.02) {
+  if (!Number.isFinite(worldToM) || worldToM <= 0) return fallbackPx;
+  const radiusWorld = radiusMeters / worldToM;
+  if (!Number.isFinite(radiusWorld) || radiusWorld <= 0) return fallbackPx;
+
+  const centerWorld = pixelToWorld(mapping, cx, cy);
+  const edgePx = worldToPixel(mapping, centerWorld.x + radiusWorld, centerWorld.y);
+  const radiusPx = Math.hypot(edgePx.px - cx, edgePx.py - cy);
+  if (!Number.isFinite(radiusPx) || radiusPx <= 0) return fallbackPx;
+  return radiusPx;
+}
+
+function renderPlacedObject(dtype: string, cx: number, cy: number, mapping: Mapping, worldToM: number) {
   const key = (dtype || "").toLowerCase();
 
   if (key === "panel") {
@@ -4991,11 +6199,77 @@ function renderPlacedObject(dtype: string, cx: number, cy: number) {
   }
 
   if (key === "sprinkler") {
+    const radiusPx = Math.max(4, scaledDeviceRadiusPx(mapping, worldToM, cx, cy, 9, 0.01));
+    const arm = Math.max(2.8, radiusPx * 0.67);
+    const strokeW = Math.max(1.2, Math.min(2.2, radiusPx * 0.4));
+    const haloW = strokeW + 1.4;
     return (
       <>
-        <circle cx={cx} cy={cy} r={9} fill="none" stroke="#DC2626" strokeWidth={2.2} />
-        <line x1={cx - 6} y1={cy} x2={cx + 6} y2={cy} stroke="#DC2626" strokeWidth={2.2} />
-        <line x1={cx} y1={cy - 6} x2={cx} y2={cy + 6} stroke="#DC2626" strokeWidth={2.2} />
+        <line x1={cx - arm} y1={cy} x2={cx + arm} y2={cy} stroke="#FFFFFF" strokeOpacity={0.96} strokeWidth={haloW} strokeLinecap="round" />
+        <line x1={cx} y1={cy - arm} x2={cx} y2={cy + arm} stroke="#FFFFFF" strokeOpacity={0.96} strokeWidth={haloW} strokeLinecap="round" />
+        <circle cx={cx} cy={cy} r={radiusPx} fill="none" stroke="#DC2626" strokeWidth={strokeW} />
+        <line x1={cx - arm} y1={cy} x2={cx + arm} y2={cy} stroke="#DC2626" strokeWidth={strokeW} strokeLinecap="round" />
+        <line x1={cx} y1={cy - arm} x2={cx} y2={cy + arm} stroke="#DC2626" strokeWidth={strokeW} strokeLinecap="round" />
+      </>
+    );
+  }
+
+  if (key === "fire_hose") {
+    return (
+      <>
+        <rect x={cx - 16} y={cy - 3.4} width={9} height={6.8} fill="none" stroke="#DC2626" strokeWidth={2.1} />
+        <line x1={cx - 15.8} y1={cy} x2={cx - 3.8} y2={cy} stroke="#FFFFFF" strokeWidth={1.4} strokeOpacity={0.92} />
+        <rect x={cx - 9.5} y={cy - 8.4} width={4.8} height={16.8} fill="#DC2626" />
+        <circle cx={cx - 1.8} cy={cy} r={6.2} fill="none" stroke="#DC2626" strokeWidth={2.1} />
+        <path d={`M ${cx - 8} ${cy} C ${cx - 4.6} ${cy - 2.8}, ${cx + 1.6} ${cy + 2.8}, ${cx + 6.8} ${cy}`} fill="none" stroke="#DC2626" strokeWidth={1.8} strokeLinecap="round" />
+        <path d={`M ${cx + 7.6} ${cy - 4.8} Q ${cx + 9.4} ${cy} ${cx + 7.6} ${cy + 4.8}`} fill="none" stroke="#DC2626" strokeWidth={2.1} strokeLinecap="round" />
+        <line x1={cx + 9.6} y1={cy - 4.2} x2={cx + 9.6} y2={cy + 4.2} stroke="#DC2626" strokeWidth={2.1} strokeLinecap="round" />
+      </>
+    );
+  }
+
+  if (key === "internal_hydrant") {
+    return (
+      <>
+        <rect x={cx - 14} y={cy - 9} width={28} height={18} fill="none" stroke="#D946EF" strokeWidth={2.1} />
+        <polygon points={`${cx - 13.2},${cy + 8.2} ${cx - 13.2},${cy - 7.8} ${cx + 9.8},${cy + 8.2}`} fill="#E879F9" fillOpacity={0.95} />
+        <polyline points={`${cx - 7.8},${cy - 4.2} ${cx - 3.9},${cy - 1.8} ${cx + 0.1},${cy + 0.6} ${cx + 4.1},${cy + 3} ${cx + 8.1},${cy + 5.4}`} fill="none" stroke="#B91CFF" strokeWidth={1.4} strokeLinecap="square" strokeLinejoin="miter" />
+      </>
+    );
+  }
+
+  if (key === "beam_detector") {
+    return (
+      <>
+        <rect x={cx - 18} y={cy - 10} width={36} height={20} fill="none" stroke="#FF00CC" strokeWidth={1.8} />
+        <path d={`M ${cx - 15} ${cy + 10} L ${cx} ${cy + 2} L ${cx + 15} ${cy + 10}`} fill="none" stroke="#FF00CC" strokeWidth={1.4} />
+        <line x1={cx - 12} y1={cy + 10} x2={cx - 5} y2={cy + 6} stroke="#FF00CC" strokeWidth={1} />
+        <line x1={cx - 8} y1={cy + 10} x2={cx - 1} y2={cy + 6} stroke="#FF00CC" strokeWidth={1} />
+        <line x1={cx - 4} y1={cy + 10} x2={cx + 3} y2={cy + 6} stroke="#FF00CC" strokeWidth={1} />
+        <line x1={cx} y1={cy + 10} x2={cx + 7} y2={cy + 6} stroke="#FF00CC" strokeWidth={1} />
+        <line x1={cx + 4} y1={cy + 10} x2={cx + 11} y2={cy + 6} stroke="#FF00CC" strokeWidth={1} />
+        <text x={cx} y={cy - 1} textAnchor="middle" fontSize={11} fontWeight={700} fill="#FF00CC">B</text>
+      </>
+    );
+  }
+
+  if (key === "reflector") {
+    return (
+      <>
+        <rect x={cx - 16} y={cy - 8} width={32} height={16} fill="none" stroke="#2563EB" strokeWidth={1.8} />
+        <path d={`M ${cx - 14} ${cy + 8} L ${cx} ${cy + 2} L ${cx + 14} ${cy + 8}`} fill="none" stroke="#2563EB" strokeWidth={1.4} />
+        <line x1={cx} y1={cy + 2} x2={cx} y2={cy + 8} stroke="#2563EB" strokeWidth={1.2} />
+        <text x={cx} y={cy - 1} textAnchor="middle" fontSize={11} fontWeight={700} fill="#2563EB">R</text>
+      </>
+    );
+  }
+
+  if (key === "smoke" || key === "heat") {
+    const radiusPx = scaledDeviceRadiusPx(mapping, worldToM, cx, cy, 9);
+    return (
+      <>
+        <circle cx={cx} cy={cy} r={radiusPx} fill="none" stroke="#ff5a7e" strokeWidth={2.2} />
+        <text x={cx} y={cy + 3} textAnchor="middle" fontSize={10} fontWeight={700} fill="#ff5a7e">S</text>
       </>
     );
   }
@@ -5008,7 +6282,7 @@ function renderPlacedObject(dtype: string, cx: number, cy: number) {
   );
 }
 
-function drawPlacedObjectOnCanvas(ctx: CanvasRenderingContext2D, dtype: string, cx: number, cy: number) {
+function drawPlacedObjectOnCanvas(ctx: CanvasRenderingContext2D, dtype: string, cx: number, cy: number, mapping: Mapping, worldToM: number) {
   const key = (dtype || "").toLowerCase();
 
   if (key === "panel") {
@@ -5072,19 +6346,187 @@ function drawPlacedObjectOnCanvas(ctx: CanvasRenderingContext2D, dtype: string, 
   }
 
   if (key === "sprinkler") {
+    const radiusPx = Math.max(4, scaledDeviceRadiusPx(mapping, worldToM, cx, cy, 9, 0.01));
+    const arm = Math.max(2.8, radiusPx * 0.67);
+    const strokeW = Math.max(1.2, Math.min(2.2, radiusPx * 0.4));
+    const haloW = strokeW + 1.4;
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
     ctx.beginPath();
-    ctx.arc(cx, cy, 9, 0, Math.PI * 2);
-    ctx.strokeStyle = "#DC2626";
-    ctx.lineWidth = 2.2;
+    ctx.moveTo(cx - arm, cy);
+    ctx.lineTo(cx + arm, cy);
+    ctx.moveTo(cx, cy - arm);
+    ctx.lineTo(cx, cy + arm);
+    ctx.strokeStyle = "rgba(255,255,255,0.96)";
+    ctx.lineWidth = haloW;
     ctx.stroke();
     ctx.beginPath();
-    ctx.moveTo(cx - 6, cy);
-    ctx.lineTo(cx + 6, cy);
-    ctx.moveTo(cx, cy - 6);
-    ctx.lineTo(cx, cy + 6);
+    ctx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
     ctx.strokeStyle = "#DC2626";
+    ctx.lineWidth = strokeW;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx - arm, cy);
+    ctx.lineTo(cx + arm, cy);
+    ctx.moveTo(cx, cy - arm);
+    ctx.lineTo(cx, cy + arm);
+    ctx.strokeStyle = "#DC2626";
+    ctx.lineWidth = strokeW;
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
+  if (key === "fire_hose") {
+    ctx.save();
+    ctx.strokeStyle = "#DC2626";
+    ctx.lineWidth = 2.1;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+
+    ctx.strokeRect(cx - 16, cy - 3.4, 9, 6.8);
+    ctx.beginPath();
+    ctx.moveTo(cx - 15.8, cy);
+    ctx.lineTo(cx - 3.8, cy);
+    ctx.strokeStyle = "rgba(255,255,255,0.92)";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+
+    ctx.fillStyle = "#DC2626";
+    ctx.fillRect(cx - 9.5, cy - 8.4, 4.8, 16.8);
+
+    ctx.strokeStyle = "#DC2626";
+    ctx.lineWidth = 2.1;
+    ctx.beginPath();
+    ctx.arc(cx - 1.8, cy, 6.2, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(cx - 8, cy);
+    ctx.bezierCurveTo(cx - 4.6, cy - 2.8, cx + 1.6, cy + 2.8, cx + 6.8, cy);
+    ctx.lineWidth = 1.8;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(cx + 7.6, cy - 4.8);
+    ctx.lineWidth = 2.1;
+    ctx.quadraticCurveTo(cx + 9.4, cy, cx + 7.6, cy + 4.8);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(cx + 9.6, cy - 4.2);
+    ctx.lineTo(cx + 9.6, cy + 4.2);
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
+  if (key === "internal_hydrant") {
+    ctx.save();
+    ctx.strokeStyle = "#D946EF";
+    ctx.lineWidth = 2.1;
+    ctx.strokeRect(cx - 14, cy - 9, 28, 18);
+
+    ctx.fillStyle = "rgba(232,121,249,0.95)";
+    ctx.beginPath();
+    ctx.moveTo(cx - 13.2, cy + 8.2);
+    ctx.lineTo(cx - 13.2, cy - 7.8);
+    ctx.lineTo(cx + 9.8, cy + 8.2);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = "#B91CFF";
+    ctx.lineWidth = 1.4;
+    ctx.lineCap = "square";
+    ctx.lineJoin = "miter";
+    ctx.beginPath();
+    ctx.moveTo(cx - 7.8, cy - 4.2);
+    ctx.lineTo(cx - 3.9, cy - 1.8);
+    ctx.lineTo(cx + 0.1, cy + 0.6);
+    ctx.lineTo(cx + 4.1, cy + 3);
+    ctx.lineTo(cx + 8.1, cy + 5.4);
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
+  if (key === "beam_detector") {
+    ctx.strokeStyle = "#FF00CC";
+    ctx.lineWidth = 1.8;
+    ctx.strokeRect(cx - 18, cy - 10, 36, 20);
+
+    ctx.beginPath();
+    ctx.moveTo(cx - 15, cy + 10);
+    ctx.lineTo(cx, cy + 2);
+    ctx.lineTo(cx + 15, cy + 10);
+    ctx.strokeStyle = "#FF00CC";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+
+    const hatch: [number, number, number, number][] = [
+      [cx - 12, cy + 10, cx - 5, cy + 6],
+      [cx - 8, cy + 10, cx - 1, cy + 6],
+      [cx - 4, cy + 10, cx + 3, cy + 6],
+      [cx, cy + 10, cx + 7, cy + 6],
+      [cx + 4, cy + 10, cx + 11, cy + 6],
+    ];
+    ctx.strokeStyle = "#FF00CC";
+    ctx.lineWidth = 1;
+    for (const [x1, y1, x2, y2] of hatch) {
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = "#FF00CC";
+    ctx.font = "700 11px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("B", cx, cy - 1);
+    return;
+  }
+
+  if (key === "reflector") {
+    ctx.strokeStyle = "#2563EB";
+    ctx.lineWidth = 1.8;
+    ctx.strokeRect(cx - 16, cy - 8, 32, 16);
+
+    ctx.beginPath();
+    ctx.moveTo(cx - 14, cy + 8);
+    ctx.lineTo(cx, cy + 2);
+    ctx.lineTo(cx + 14, cy + 8);
+    ctx.strokeStyle = "#2563EB";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + 2);
+    ctx.lineTo(cx, cy + 8);
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+
+    ctx.fillStyle = "#2563EB";
+    ctx.font = "700 11px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("R", cx, cy - 1);
+    return;
+  }
+
+  if (key === "smoke" || key === "heat") {
+    const radiusPx = scaledDeviceRadiusPx(mapping, worldToM, cx, cy, 9);
+    ctx.beginPath();
+    ctx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
+    ctx.strokeStyle = "#ff5a7e";
     ctx.lineWidth = 2.2;
     ctx.stroke();
+    ctx.fillStyle = "#ff5a7e";
+    ctx.font = "700 11px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("S", cx, cy + 0.5);
     return;
   }
 
@@ -5104,6 +6546,10 @@ function objectLabel(dtype: ObjectType): string {
   if (dtype === "mcb") return "MCP";
   if (dtype === "panel") return "FACP";
   if (dtype === "sprinkler") return "Sprinkler";
+  if (dtype === "fire_hose") return "External Hydrant";
+  if (dtype === "internal_hydrant") return "Internal Hydrant";
+  if (dtype === "beam_detector") return "Beam Det.";
+  if (dtype === "reflector") return "Reflector";
   return dtype.charAt(0).toUpperCase() + dtype.slice(1);
 }
 
@@ -5160,6 +6606,51 @@ function renderObjectIcon(dtype: ObjectType) {
         <circle cx="7" cy="7" r="4.2" fill="none" stroke="#DC2626" strokeWidth="1.2" />
         <line x1="4.2" y1="7" x2="9.8" y2="7" stroke="#DC2626" strokeWidth="1.2" />
         <line x1="7" y1="4.2" x2="7" y2="9.8" stroke="#DC2626" strokeWidth="1.2" />
+      </svg>
+    );
+  }
+
+  if (dtype === "fire_hose") {
+    return (
+      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
+        <rect x="0.8" y="6.1" width="4.8" height="3.8" fill="none" stroke="#EF4444" strokeWidth="1.4" />
+        <line x1="1" y1="8" x2="6.8" y2="8" stroke="#FFFFFF" strokeWidth="1" opacity="0.9" />
+        <rect x="4.6" y="3.6" width="2.4" height="8.8" fill="#EF4444" />
+        <circle cx="8.5" cy="8" r="3.2" fill="none" stroke="#EF4444" strokeWidth="1.4" />
+        <path d="M5.3 8 C 6.8 6.8, 9.3 9.2, 11.1 8" fill="none" stroke="#EF4444" strokeWidth="1.2" strokeLinecap="round" />
+        <path d="M12.9 5.8 Q14 8 12.9 10.2" fill="none" stroke="#EF4444" strokeWidth="1.4" strokeLinecap="round" />
+        <line x1="14.3" y1="6.2" x2="14.3" y2="9.8" stroke="#EF4444" strokeWidth="1.4" strokeLinecap="round" />
+      </svg>
+    );
+  }
+
+  if (dtype === "internal_hydrant") {
+    return (
+      <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden>
+        <rect x="1.1" y="2" width="13.8" height="12" fill="none" stroke="#E879F9" strokeWidth="1.4" />
+        <polygon points="1.8,13.2 1.8,3.2 12.9,13.2" fill="#D946EF" />
+        <polyline points="4.5,5.5 6.3,6.6 8.2,7.7 10.1,8.8 12,9.9" fill="none" stroke="#A21CAF" strokeWidth="0.9" strokeLinecap="square" strokeLinejoin="miter" />
+      </svg>
+    );
+  }
+
+  if (dtype === "beam_detector") {
+    return (
+      <svg width="18" height="14" viewBox="0 0 18 14" aria-hidden>
+        <rect x="1.2" y="1" width="15.6" height="12" fill="none" stroke="#FF00CC" strokeWidth="1.2" />
+        <path d="M2.3 13 L9 8.8 L15.7 13" fill="none" stroke="#FF00CC" strokeWidth="1" />
+        <text x="9" y="7.2" textAnchor="middle" fontSize="5" fontWeight="700" fill="#FF00CC">B</text>
+      </svg>
+    );
+  }
+
+  if (dtype === "reflector") {
+    return (
+      <svg width="18" height="14" viewBox="0 0 18 14" aria-hidden>
+        <rect x="1.2" y="1.6" width="15.6" height="10.8" fill="none" stroke="#2563EB" strokeWidth="1.2" />
+        <path d="M2.5 12.2 L9 8.8 L15.5 12.2" fill="none" stroke="#2563EB" strokeWidth="1" />
+        <line x1="9" y1="8.8" x2="9" y2="12.2" stroke="#2563EB" strokeWidth="1" />
+        <text x="9" y="7" textAnchor="middle" fontSize="5" fontWeight="700" fill="#2563EB">R</text>
       </svg>
     );
   }
