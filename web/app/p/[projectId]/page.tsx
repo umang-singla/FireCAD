@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import { use, useEffect, useRef, useState } from "react";
+import { use, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
 import { getToken, getTenantRole } from "../../lib/auth";
@@ -183,6 +183,10 @@ type NBCSettingsQuestion = {
   options?: string[];
 };
 
+function isBlankNbcAnswer(value: any) {
+  return value === null || value === undefined || value === "";
+}
+
 type Detector = {
   id: string;
   project_id: string;
@@ -286,6 +290,32 @@ function pipeStrokeWidthPx(diameter?: string) {
   return 10.8;
 }
 
+function formatLitersWithKl(value: any) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return String(value ?? "-");
+  const liters = Math.round(n);
+  const kl = n / 1000;
+  const klText = Number.isInteger(kl) ? `${kl}` : kl.toFixed(2);
+  return `${liters.toLocaleString()} L (${klText} KL)`;
+}
+
+function humanizeWaterPumpKey(key: string) {
+  const labelMap: Record<string, string> = {
+    underground_static_tank_l: "Underground Static Water Tank",
+    terrace_tank_l: "Terrace Water Tank",
+    pump_near_underground_tank: "Pump Near Underground Tank",
+    pump_at_terrace_lpm: "Pump at Terrace",
+  };
+  return labelMap[key] || key.replace(/_/g, " ");
+}
+
+function renderWaterPumpValue(key: string, value: any) {
+  if (value === "NR") return "Not Required";
+  if (key.endsWith("_l") && Number.isFinite(Number(value))) return formatLitersWithKl(value);
+  if (key.endsWith("_lpm") && Number.isFinite(Number(value))) return `${Number(value).toLocaleString()} LPM`;
+  return String(value ?? "-");
+}
+
 export default function ProjectPage({ params }: { params: Promise<{ projectId: string }> }) {
   const { projectId } = use(params);
   const [project, setProject] = useState<Project | null>(null);
@@ -302,6 +332,14 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   const [nbcSettingsAnswers, setNbcSettingsAnswers] = useState<Record<string, any>>({});
   const [nbcSettingsLabels, setNbcSettingsLabels] = useState<Record<string, string>>({});
   const [nbcSettingsSaving, setNbcSettingsSaving] = useState(false);
+  const [showTankCapacityModal, setShowTankCapacityModal] = useState(false);
+  const [tankQuestions, setTankQuestions] = useState<NBCSettingsQuestion[]>([]);
+  const [tankFollowups, setTankFollowups] = useState<NBCSettingsQuestion[]>([]);
+  const [tankAnswers, setTankAnswers] = useState<Record<string, any>>({});
+  const [tankLabels, setTankLabels] = useState<Record<string, string>>({});
+  const [tankCapacitySaving, setTankCapacitySaving] = useState(false);
+  const [tankCapacityError, setTankCapacityError] = useState<string | null>(null);
+  const [tankCapacityEval, setTankCapacityEval] = useState<any | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
   const [mediaVersion, setMediaVersion] = useState<number>(Date.now());
 
@@ -505,6 +543,82 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
       console.error("Failed to save NBC settings:", e);
     } finally {
       setNbcSettingsSaving(false);
+    }
+  }
+
+  async function openTankCapacityModal() {
+    setShowTankCapacityModal(true);
+    setTankCapacityError(null);
+    setTankCapacityEval(project?.nbc_evaluation || settings?.nbc_evaluation || null);
+    const existingAnswers = project?.nbc_answers || settings?.nbc_answers || {};
+    setTankAnswers(existingAnswers);
+    try {
+      const [qs, labels] = await Promise.all([
+        (await authFetch("/api/nbc/questions")).json(),
+        (await authFetch("/api/nbc/occupancy_types")).json(),
+      ]);
+      setTankQuestions(qs);
+      setTankLabels(labels);
+
+      const occ = existingAnswers?.occupancy_subtype;
+      if (occ) {
+        const followups: NBCSettingsQuestion[] = await (await authFetch(`/api/nbc/followup_fields?occupancy_subtype=${encodeURIComponent(occ)}`)).json();
+        setTankFollowups(followups);
+      } else {
+        setTankFollowups([]);
+      }
+    } catch {
+      setTankCapacityError("Could not load questionnaire. Please try again.");
+    }
+  }
+
+  async function tankSelectOccupancy(subtype: string) {
+    setTankAnswers((prev: Record<string, any>) => ({ ...prev, occupancy_subtype: subtype }));
+    try {
+      const followups: NBCSettingsQuestion[] = await (await authFetch(`/api/nbc/followup_fields?occupancy_subtype=${encodeURIComponent(subtype)}`)).json();
+      setTankFollowups(followups);
+    } catch {
+      setTankFollowups([]);
+    }
+  }
+
+  function setTankAnswer(id: string, value: any) {
+    setTankAnswers((prev: Record<string, any>) => ({ ...prev, [id]: value }));
+  }
+
+  const tankMissingQuestions = useMemo(() => {
+    const visible = [...tankQuestions, ...tankFollowups];
+    return visible.filter((q) => isBlankNbcAnswer(tankAnswers[q.id]));
+  }, [tankQuestions, tankFollowups, tankAnswers]);
+
+  async function calculateTankCapacity() {
+    setTankCapacitySaving(true);
+    setTankCapacityError(null);
+    try {
+      const evalResult = await (await authFetch("/api/nbc/evaluate", {
+        method: "POST",
+        body: JSON.stringify({ answers: tankAnswers }),
+      })).json();
+
+      const normalizedSettings = {
+        ...settings,
+        world_to_m: deriveWorldToMFromUnits(String(settings.units || "mm")),
+        nbc_answers: tankAnswers,
+        nbc_evaluation: evalResult,
+      };
+
+      await authFetch(`/api/projects/${projectId}/settings`, {
+        method: "POST",
+        body: JSON.stringify({ settings: normalizedSettings }),
+      });
+
+      setSettings(normalizedSettings);
+      setTankCapacityEval(evalResult);
+      await refresh();
+    } catch (e: any) {
+      setTankCapacityError(e?.message || "Tank capacity calculation failed.");
+    } finally {
+      setTankCapacitySaving(false);
     }
   }
 
@@ -722,6 +836,17 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                 }}>View Only</span>
               )}
               {canEdit && (
+                <button onClick={openTankCapacityModal} style={{
+                  padding: "8px 14px", borderRadius: 10,
+                  border: "1px solid #E8EAED", background: "#FFFFFF",
+                  color: "#1A1A2E", cursor: "pointer", fontSize: 12, fontWeight: 600,
+                  display: "flex", alignItems: "center", gap: 6,
+                }}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6B7280" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg>
+                  Tank Capacity
+                </button>
+              )}
+              {canEdit && (
                 <button onClick={openSettingsModal} style={{
                   padding: "8px 14px", borderRadius: 10,
                   border: "1px solid #E8EAED", background: "#FFFFFF",
@@ -763,6 +888,25 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                   border: "1px solid rgba(5,150,105,0.2)",
                 }}>{eq.label}</span>
               ))}
+              {project.nbc_evaluation.water_pump_requirements ? (
+                <div style={{ width: "100%", marginTop: 6, fontSize: 12, color: "#064E3B" }}>
+                  <strong>Water Pump Requirements:</strong>
+                  <div style={{ marginTop: 4, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    {Object.entries(project.nbc_evaluation.water_pump_requirements).map(([key, value]) => (
+                      <span key={key} style={{
+                        fontSize: 11,
+                        padding: "2px 8px",
+                        borderRadius: 8,
+                        background: "#D1FAE5",
+                        border: "1px solid rgba(5,150,105,0.2)",
+                        color: "#065F46",
+                      }}>
+                        {key.replace(/_/g, " ")}: {String(value)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
             </div>
           ) : null}
 
@@ -1064,6 +1208,167 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
               </div>
             </div>
           ) : null}
+
+          {/* ── Tank Capacity Calculator modal ── */}
+          {showTankCapacityModal ? (
+            <div style={{
+              position: "fixed", inset: 0, zIndex: 50,
+              background: "rgba(0,0,0,0.35)", backdropFilter: "blur(4px)",
+              display: "grid", placeItems: "center",
+            }} onClick={() => setShowTankCapacityModal(false)}>
+              <div onClick={e => e.stopPropagation()} style={{
+                width: "min(680px, calc(100% - 32px))", borderRadius: 20,
+                background: "#FFFFFF",
+                border: "1px solid #E8EAED", boxShadow: "0 20px 60px rgba(0,0,0,0.15)",
+                padding: 0, maxHeight: "90vh", overflow: "hidden",
+                display: "flex", flexDirection: "column",
+              }}>
+                <div style={{
+                  display: "flex", justifyContent: "space-between", alignItems: "center",
+                  padding: "18px 24px", borderBottom: "1px solid #E8EAED",
+                }}>
+                  <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: "#1A1A2E" }}>Calculate Water Tank Capacity</h3>
+                  <button onClick={() => setShowTankCapacityModal(false)} style={{
+                    background: "none", border: "none", fontSize: 22, color: "#9CA3AF",
+                    cursor: "pointer", padding: "4px 8px", lineHeight: 1,
+                  }}>&times;</button>
+                </div>
+
+                <div style={{ padding: "0 24px 24px", overflowY: "auto", flex: 1 }}>
+                  <div style={{
+                    marginTop: 16,
+                    padding: "10px 14px",
+                    borderRadius: 10,
+                    background: "#F8FAFC",
+                    border: "1px solid #E2E8F0",
+                    fontSize: 12,
+                    color: "#334155",
+                  }}>
+                    This asks only missing NBC inputs. Answers already captured during project creation are reused.
+                  </div>
+
+                  {tankMissingQuestions.length > 0 ? (
+                    <>
+                      {tankMissingQuestions.map((q) => (
+                        <div key={q.id} style={{ marginTop: 16 }}>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: "#6B7280", marginBottom: 6 }}>{q.label}</div>
+                          {q.type === "select" && q.options && (
+                            <select
+                              value={tankAnswers[q.id] ?? ""}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setTankAnswer(q.id, val);
+                                if (q.id === "occupancy_subtype") tankSelectOccupancy(val);
+                              }}
+                              style={{ width: "100%", borderRadius: 10, border: "1px solid #E8EAED", padding: "10px 14px", fontSize: 13, color: "#1A1A2E", background: "#fff", outline: "none", cursor: "pointer" }}
+                            >
+                              <option value="">- Select -</option>
+                              {q.options.map((opt) => (
+                                <option key={opt} value={opt}>
+                                  {tankLabels[opt] || opt.replace(/_/g, " ")}
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                          {q.type === "number" && (
+                            <input
+                              type="number"
+                              value={tankAnswers[q.id] ?? ""}
+                              onChange={(e) => setTankAnswer(q.id, e.target.value === "" ? "" : Number(e.target.value))}
+                              style={{ width: "100%", borderRadius: 10, border: "1px solid #E8EAED", padding: "10px 14px", fontSize: 13, color: "#1A1A2E", background: "#fff", outline: "none" }}
+                              placeholder="0"
+                            />
+                          )}
+                          {q.type === "boolean" && (
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <button type="button" onClick={() => setTankAnswer(q.id, true)} style={{
+                                borderRadius: 8, border: "1px solid #E8EAED", padding: "8px 20px", fontSize: 12, fontWeight: 700, cursor: "pointer",
+                                background: tankAnswers[q.id] === true ? "#2D6A4F" : "#fff",
+                                color: tankAnswers[q.id] === true ? "#fff" : "#6B7280",
+                                borderColor: tankAnswers[q.id] === true ? "#2D6A4F" : "#E8EAED",
+                              }}>Yes</button>
+                              <button type="button" onClick={() => setTankAnswer(q.id, false)} style={{
+                                borderRadius: 8, border: "1px solid #E8EAED", padding: "8px 20px", fontSize: 12, fontWeight: 700, cursor: "pointer",
+                                background: tankAnswers[q.id] === false ? "#2D6A4F" : "#fff",
+                                color: tankAnswers[q.id] === false ? "#fff" : "#6B7280",
+                                borderColor: tankAnswers[q.id] === false ? "#2D6A4F" : "#E8EAED",
+                              }}>No</button>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </>
+                  ) : (
+                    <div style={{
+                      marginTop: 16,
+                      padding: "10px 14px",
+                      borderRadius: 10,
+                      background: "#ECFDF5",
+                      border: "1px solid rgba(5,150,105,0.2)",
+                      fontSize: 12,
+                      color: "#065F46",
+                    }}>
+                      All required answers are already available. You can calculate directly.
+                    </div>
+                  )}
+
+                  {tankCapacityError ? (
+                    <div style={{
+                      marginTop: 14,
+                      padding: "10px 14px",
+                      borderRadius: 10,
+                      background: "#FEF2F2",
+                      border: "1px solid rgba(220,38,38,0.2)",
+                      color: "#B91C1C",
+                      fontSize: 12,
+                    }}>
+                      {tankCapacityError}
+                    </div>
+                  ) : null}
+
+                  {tankCapacityEval?.water_pump_requirements ? (
+                    <div style={{
+                      marginTop: 16,
+                      padding: "12px 14px",
+                      borderRadius: 12,
+                      background: "#ECFDF5",
+                      border: "1px solid rgba(5,150,105,0.2)",
+                      color: "#1A1A2E",
+                    }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: "#065F46", marginBottom: 8 }}>Fire Water Capacity Summary</div>
+                      <div style={{ fontSize: 12, display: "grid", gap: 8 }}>
+                        {Object.entries(tankCapacityEval.water_pump_requirements).map(([key, value]) => (
+                          <div key={key} style={{
+                            display: "grid",
+                            gridTemplateColumns: "minmax(180px, 1fr) 1fr",
+                            gap: 10,
+                            alignItems: "start",
+                            padding: "6px 8px",
+                            borderRadius: 8,
+                            background: "rgba(255,255,255,0.65)",
+                          }}>
+                            <div style={{ color: "#065F46", fontWeight: 600 }}>{humanizeWaterPumpKey(key)}</div>
+                            <div style={{ color: "#1A1A2E", fontWeight: 700 }}>{renderWaterPumpValue(key, value)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+                    <button onClick={() => setShowTankCapacityModal(false)} style={btn(false)}>Close</button>
+                    <button
+                      onClick={calculateTankCapacity}
+                      disabled={tankCapacitySaving || tankMissingQuestions.length > 0}
+                      style={btn(true)}
+                    >
+                      {tankCapacitySaving ? "Calculating..." : "Calculate & Save"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </section>
       ) : null}
 
@@ -1082,6 +1387,18 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
             Back to Workspace
           </button>
           <span style={{ fontSize: 13, color: "#6B7280" }}>{project?.name || "Project"}</span>
+          {canEdit ? <div style={{ flex: 1 }} /> : null}
+          {canEdit ? (
+            <button onClick={openTankCapacityModal} style={{
+              padding: "6px 12px", borderRadius: 8,
+              border: "1px solid #E8EAED", background: "#FFFFFF",
+              color: "#1A1A2E", cursor: "pointer", fontSize: 12, fontWeight: 600,
+              display: "flex", alignItems: "center", gap: 6,
+            }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6B7280" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg>
+              Tank Capacity
+            </button>
+          ) : null}
         </div>
         <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
         {isAwaitingFloorReview && project?.files?.render_png && mapping ? (
@@ -1359,6 +1676,167 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
         )}
         </div>
       </section>
+      ) : null}
+
+      {/* Render tank-capacity modal in editor mode as well */}
+      {showTankCapacityModal && !isQuestionnaireMode ? (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 50,
+          background: "rgba(0,0,0,0.35)", backdropFilter: "blur(4px)",
+          display: "grid", placeItems: "center",
+        }} onClick={() => setShowTankCapacityModal(false)}>
+          <div onClick={e => e.stopPropagation()} style={{
+            width: "min(680px, calc(100% - 32px))", borderRadius: 20,
+            background: "#FFFFFF",
+            border: "1px solid #E8EAED", boxShadow: "0 20px 60px rgba(0,0,0,0.15)",
+            padding: 0, maxHeight: "90vh", overflow: "hidden",
+            display: "flex", flexDirection: "column",
+          }}>
+            <div style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              padding: "18px 24px", borderBottom: "1px solid #E8EAED",
+            }}>
+              <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: "#1A1A2E" }}>Calculate Water Tank Capacity</h3>
+              <button onClick={() => setShowTankCapacityModal(false)} style={{
+                background: "none", border: "none", fontSize: 22, color: "#9CA3AF",
+                cursor: "pointer", padding: "4px 8px", lineHeight: 1,
+              }}>&times;</button>
+            </div>
+
+            <div style={{ padding: "0 24px 24px", overflowY: "auto", flex: 1 }}>
+              <div style={{
+                marginTop: 16,
+                padding: "10px 14px",
+                borderRadius: 10,
+                background: "#F8FAFC",
+                border: "1px solid #E2E8F0",
+                fontSize: 12,
+                color: "#334155",
+              }}>
+                This asks only missing NBC inputs. Answers already captured during project creation are reused.
+              </div>
+
+              {tankMissingQuestions.length > 0 ? (
+                <>
+                  {tankMissingQuestions.map((q) => (
+                    <div key={q.id} style={{ marginTop: 16 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: "#6B7280", marginBottom: 6 }}>{q.label}</div>
+                      {q.type === "select" && q.options && (
+                        <select
+                          value={tankAnswers[q.id] ?? ""}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setTankAnswer(q.id, val);
+                            if (q.id === "occupancy_subtype") tankSelectOccupancy(val);
+                          }}
+                          style={{ width: "100%", borderRadius: 10, border: "1px solid #E8EAED", padding: "10px 14px", fontSize: 13, color: "#1A1A2E", background: "#fff", outline: "none", cursor: "pointer" }}
+                        >
+                          <option value="">- Select -</option>
+                          {q.options.map((opt) => (
+                            <option key={opt} value={opt}>
+                              {tankLabels[opt] || opt.replace(/_/g, " ")}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      {q.type === "number" && (
+                        <input
+                          type="number"
+                          value={tankAnswers[q.id] ?? ""}
+                          onChange={(e) => setTankAnswer(q.id, e.target.value === "" ? "" : Number(e.target.value))}
+                          style={{ width: "100%", borderRadius: 10, border: "1px solid #E8EAED", padding: "10px 14px", fontSize: 13, color: "#1A1A2E", background: "#fff", outline: "none" }}
+                          placeholder="0"
+                        />
+                      )}
+                      {q.type === "boolean" && (
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <button type="button" onClick={() => setTankAnswer(q.id, true)} style={{
+                            borderRadius: 8, border: "1px solid #E8EAED", padding: "8px 20px", fontSize: 12, fontWeight: 700, cursor: "pointer",
+                            background: tankAnswers[q.id] === true ? "#2D6A4F" : "#fff",
+                            color: tankAnswers[q.id] === true ? "#fff" : "#6B7280",
+                            borderColor: tankAnswers[q.id] === true ? "#2D6A4F" : "#E8EAED",
+                          }}>Yes</button>
+                          <button type="button" onClick={() => setTankAnswer(q.id, false)} style={{
+                            borderRadius: 8, border: "1px solid #E8EAED", padding: "8px 20px", fontSize: 12, fontWeight: 700, cursor: "pointer",
+                            background: tankAnswers[q.id] === false ? "#2D6A4F" : "#fff",
+                            color: tankAnswers[q.id] === false ? "#fff" : "#6B7280",
+                            borderColor: tankAnswers[q.id] === false ? "#2D6A4F" : "#E8EAED",
+                          }}>No</button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </>
+              ) : (
+                <div style={{
+                  marginTop: 16,
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  background: "#ECFDF5",
+                  border: "1px solid rgba(5,150,105,0.2)",
+                  fontSize: 12,
+                  color: "#065F46",
+                }}>
+                  All required answers are already available. You can calculate directly.
+                </div>
+              )}
+
+              {tankCapacityError ? (
+                <div style={{
+                  marginTop: 14,
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  background: "#FEF2F2",
+                  border: "1px solid rgba(220,38,38,0.2)",
+                  color: "#B91C1C",
+                  fontSize: 12,
+                }}>
+                  {tankCapacityError}
+                </div>
+              ) : null}
+
+              {tankCapacityEval?.water_pump_requirements ? (
+                <div style={{
+                  marginTop: 16,
+                  padding: "12px 14px",
+                  borderRadius: 12,
+                  background: "#ECFDF5",
+                  border: "1px solid rgba(5,150,105,0.2)",
+                  color: "#1A1A2E",
+                }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "#065F46", marginBottom: 8 }}>Fire Water Capacity Summary</div>
+                  <div style={{ fontSize: 12, display: "grid", gap: 8 }}>
+                    {Object.entries(tankCapacityEval.water_pump_requirements).map(([key, value]) => (
+                      <div key={key} style={{
+                        display: "grid",
+                        gridTemplateColumns: "minmax(180px, 1fr) 1fr",
+                        gap: 10,
+                        alignItems: "start",
+                        padding: "6px 8px",
+                        borderRadius: 8,
+                        background: "rgba(255,255,255,0.65)",
+                      }}>
+                        <div style={{ color: "#065F46", fontWeight: 600 }}>{humanizeWaterPumpKey(key)}</div>
+                        <div style={{ color: "#1A1A2E", fontWeight: 700 }}>{renderWaterPumpValue(key, value)}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+                <button onClick={() => setShowTankCapacityModal(false)} style={btn(false)}>Close</button>
+                <button
+                  onClick={calculateTankCapacity}
+                  disabled={tankCapacitySaving || tankMissingQuestions.length > 0}
+                  style={btn(true)}
+                >
+                  {tankCapacitySaving ? "Calculating..." : "Calculate & Save"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       ) : null}
 
       {showGlobalLoader ? (

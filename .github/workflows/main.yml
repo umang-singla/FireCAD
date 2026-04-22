@@ -62,7 +62,7 @@ jobs:
             --ports 80 8000\
             --os-type Linux \
             --cpu 1 \
-            --memory 4 \
+            --memory 8 \
             --environment-variables \
               API_HOST=0.0.0.0 \
               API_PORT=8000 \
