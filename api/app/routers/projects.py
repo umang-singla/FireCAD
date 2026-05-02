@@ -1472,14 +1472,49 @@ def auto_place_floor_plan(project_id: str, fp_id: str, payload: dict = None, use
 
 @router.get("/projects/{project_id}/sprinkler_pipes")
 def get_sprinkler_pipes(project_id: str, user=Depends(get_current_user)):
-    """Return sprinkler pipe routing data for the project."""
+    """Return sprinkler pipe routing data for the project.
+
+    Merges project-level ``sprinkler_pipes.json`` with any per-block
+    ``sprinkler_pipes_{block_index}.json`` files so the viewer can show
+    every routed pipe without forcing the user to select a block first.
+    """
     with db() as con:
-        r = _authorize_project(con, project_id, user)
-    pipes_path = os.path.join(project_dir(project_id), "sprinkler_pipes.json")
-    if not os.path.exists(pipes_path):
+        _authorize_project(con, project_id, user)
+        fp_rows = con.execute(
+            "SELECT block_index FROM floor_plans WHERE project_id=? ORDER BY block_index ASC",
+            (project_id,),
+        ).fetchall()
+
+    merged_pipes: list = []
+    merged_sources: list = []
+
+    def _ingest(path: str) -> None:
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        if isinstance(data, dict):
+            pipes = data.get("pipes")
+            if isinstance(pipes, list):
+                merged_pipes.extend(pipes)
+            sources = data.get("sources")
+            if isinstance(sources, list):
+                merged_sources.extend(sources)
+
+    pdir = project_dir(project_id)
+    _ingest(os.path.join(pdir, "sprinkler_pipes.json"))
+    for fp in fp_rows:
+        idx = int(fp["block_index"]) if "block_index" in fp.keys() else None
+        if idx is None:
+            continue
+        _ingest(os.path.join(pdir, f"sprinkler_pipes_{idx}.json"))
+
+    if not merged_pipes and not merged_sources:
         raise HTTPException(404, "no sprinkler pipes data")
-    with open(pipes_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return {"pipes": merged_pipes, "sources": merged_sources}
 
 
 @router.put("/projects/{project_id}/sprinkler_pipes")
@@ -1497,6 +1532,19 @@ def update_sprinkler_pipes(project_id: str, payload: dict, user=Depends(get_curr
     return pipes_data
 
 
+@router.delete("/projects/{project_id}/sprinkler_pipes")
+def clear_sprinkler_pipes(project_id: str, user=Depends(get_current_user)):
+    """Clear sprinkler pipe routing data for the whole project."""
+    with db() as con:
+        _authorize_project_write(con, project_id, user)
+
+    pipes_path = os.path.join(project_dir(project_id), "sprinkler_pipes.json")
+    existed = os.path.exists(pipes_path)
+    if existed:
+        os.remove(pipes_path)
+    return {"ok": True, "cleared": existed}
+
+
 @router.get("/projects/{project_id}/floor_plans/{fp_id}/sprinkler_pipes")
 def get_floor_plan_sprinkler_pipes(project_id: str, fp_id: str, user=Depends(get_current_user)):
     """Return sprinkler pipe routing data for a specific floor plan block."""
@@ -1510,6 +1558,22 @@ def get_floor_plan_sprinkler_pipes(project_id: str, fp_id: str, user=Depends(get
         raise HTTPException(404, "no sprinkler pipes data for this floor plan")
     with open(pipes_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+@router.delete("/projects/{project_id}/floor_plans/{fp_id}/sprinkler_pipes")
+def clear_floor_plan_sprinkler_pipes(project_id: str, fp_id: str, user=Depends(get_current_user)):
+    """Clear sprinkler pipe routing data for a specific floor plan block."""
+    with db() as con:
+        _authorize_project_write(con, project_id, user)
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
+        if not fp:
+            raise HTTPException(404, "floor plan block not found")
+
+    pipes_path = os.path.join(project_dir(project_id), f"sprinkler_pipes_{fp['block_index']}.json")
+    existed = os.path.exists(pipes_path)
+    if existed:
+        os.remove(pipes_path)
+    return {"ok": True, "cleared": existed}
 
 
 @router.get("/projects/{project_id}/detect_sources")
