@@ -266,7 +266,7 @@ export default function Dashboard() {
           <div style={S.brandIcon}>
             <Icon name="box" />
           </div>
-          <span style={S.brandText}>FireCAD</span>
+          <span style={S.brandText}>Mepit.AI</span>
         </div>
 
         <div style={S.sidebarLabel}>MENU</div>

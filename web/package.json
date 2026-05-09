@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "dxf-viewer": "^1.0.47",
+    "three-dxf-viewer": "^1.0.44",
     "next": "16.1.6",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

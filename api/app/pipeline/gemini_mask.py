@@ -1,5 +1,7 @@
 import os
 import base64
+import random
+import time
 from io import BytesIO
 from PIL import Image
 from google import genai
@@ -7,10 +9,86 @@ import cv2
 import numpy as np
 import logging
 
-logger = logging.getLogger("firecad.pipeline.gemini_mask")
+logger = logging.getLogger("mepit.pipeline.gemini_mask")
 
 # Corner marker size in pixels (on the thumbnail sent to Gemini)
 MARKER_SIZE = 40
+
+# ── Exponential backoff configuration ─────────────────────────
+# Override via env vars if needed.
+GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "5"))
+GEMINI_INITIAL_BACKOFF = float(os.getenv("GEMINI_INITIAL_BACKOFF", "1.0"))
+GEMINI_MAX_BACKOFF = float(os.getenv("GEMINI_MAX_BACKOFF", "60.0"))
+GEMINI_BACKOFF_MULTIPLIER = float(os.getenv("GEMINI_BACKOFF_MULTIPLIER", "2.0"))
+GEMINI_BACKOFF_JITTER = float(os.getenv("GEMINI_BACKOFF_JITTER", "0.25"))
+
+
+class _EmptyImagePayload(Exception):
+    """Raised when Gemini returns a response with no inline image data."""
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    """Return True if the exception looks like a transient/retryable failure."""
+    # Empty image payload — model occasionally returns text only; retry helps.
+    if isinstance(exc, _EmptyImagePayload):
+        return True
+
+    # google-genai SDK errors expose `code` (HTTP status) and `status`.
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if isinstance(code, int):
+        if code == 408 or code == 409 or code == 425 or code == 429:
+            return True
+        if 500 <= code < 600:
+            return True
+
+    status = getattr(exc, "status", None)
+    if isinstance(status, str):
+        s = status.upper()
+        if s in {
+            "RESOURCE_EXHAUSTED",
+            "UNAVAILABLE",
+            "DEADLINE_EXCEEDED",
+            "INTERNAL",
+            "ABORTED",
+            "CANCELLED",
+        }:
+            return True
+
+    # Network/timeout style errors from underlying transports.
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+
+    msg = str(exc).lower()
+    for needle in (
+        "rate limit",
+        "quota",
+        "resource exhausted",
+        "temporarily unavailable",
+        "deadline exceeded",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection aborted",
+        "503",
+        "504",
+        "429",
+        "500",
+    ):
+        if needle in msg:
+            return True
+
+    return False
+
+
+def _compute_backoff(attempt: int) -> float:
+    """Compute exponential backoff delay (seconds) for a given 0-based attempt."""
+    base = GEMINI_INITIAL_BACKOFF * (GEMINI_BACKOFF_MULTIPLIER ** attempt)
+    base = min(base, GEMINI_MAX_BACKOFF)
+    if GEMINI_BACKOFF_JITTER > 0:
+        # Full jitter in the range [base * (1 - j), base * (1 + j)].
+        spread = base * GEMINI_BACKOFF_JITTER
+        base = max(0.0, base + random.uniform(-spread, spread))
+    return base
 
 
 def _iter_response_parts(resp):
@@ -176,21 +254,50 @@ def generate_mask_image(
 
     client = genai.Client(api_key=api_key)
 
-    resp = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config={"response_modalities": ["IMAGE"]},
-    )
+    last_exc: BaseException | None = None
+    saved = False
+    for attempt in range(GEMINI_MAX_RETRIES + 1):
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config={"response_modalities": ["IMAGE"]},
+            )
 
-    # Extract first image part
-    got = False
-    for part in _iter_response_parts(resp):
-        if getattr(part, "inline_data", None) is not None:
-            im = _part_to_image(part)
-            if im is not None:
-                im.save(out_mask_png)
-                got = True
-                break
+            # Extract first image part
+            im = None
+            for part in _iter_response_parts(resp):
+                if getattr(part, "inline_data", None) is not None:
+                    im = _part_to_image(part)
+                    if im is not None:
+                        break
 
-    if not got:
-        raise RuntimeError("Gemini response had no image payload. Check model/prompt/quota.")
+            if im is None:
+                raise _EmptyImagePayload(
+                    "Gemini response had no image payload. Check model/prompt/quota."
+                )
+
+            im.save(out_mask_png)
+            saved = True
+            break
+
+        except Exception as exc:  # noqa: BLE001 — we re-raise non-retryable below
+            last_exc = exc
+            if attempt >= GEMINI_MAX_RETRIES or not _is_retryable_error(exc):
+                raise
+            delay = _compute_backoff(attempt)
+            logger.warning(
+                "Gemini mask generation failed (attempt %d/%d): %s. "
+                "Retrying in %.2fs...",
+                attempt + 1,
+                GEMINI_MAX_RETRIES + 1,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+
+    if not saved:
+        # Defensive: should be unreachable since the loop either saves or raises.
+        raise RuntimeError(
+            "Gemini mask generation exhausted retries without producing an image."
+        ) from last_exc

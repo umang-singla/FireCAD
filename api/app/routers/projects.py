@@ -11,12 +11,13 @@ from app.pipeline.run_pipeline import (
     continue_pipeline_after_floor_review,
     continue_pipeline_after_alignment,
     continue_pipeline_after_rooms,
+    retry_mask_generation,
     PipelineOptions,
 )
 from app.pipeline.gemini_mask import generate_mask_image, DEFAULT_PROMPT
 from app.pipeline.mask_align import align_perfect_tight_box
 from app.pipeline.dxf_export import write_detectors_to_dxf, write_combined_sheets_dxf
-from app.pipeline.render import render_dwg_to_png_with_qcad, write_mapping_from_dxf_and_png, get_dxf_bbox
+from app.pipeline.render import get_dxf_bbox
 from app.pipeline.nbc_rules import (
     get_questions as nbc_get_questions,
     evaluate_building,
@@ -204,7 +205,6 @@ def create_project(payload: ProjectCreateWithNBC, user=Depends(get_current_user)
     }
     if payload.unit:
         settings["units"] = payload.unit
-        settings["qcad_input_unit"] = payload.unit
 
     pid = new_id()
     project_dir(pid)
@@ -392,12 +392,46 @@ def continue_floor_review(project_id: str, bg: BackgroundTasks, user=Depends(get
     return _project_row_to_out(r2)
 
 
+@router.post("/projects/{project_id}/retry_mask_generation", response_model=ProjectOut)
+def retry_mask_generation_endpoint(project_id: str, bg: BackgroundTasks, user=Depends(get_current_user)):
+    """Resume pipeline by re-running ONLY the Gemini mask + auto-align step.
+
+    Used when the previous mask generation failed (status == ``mask_failed``).
+    Skips blocks that already have a valid mask file, so multi-block runs only
+    retry what failed.
+    """
+    with db() as con:
+        r = _authorize_project_write(con, project_id, user)
+        if r["status"] == "running":
+            raise HTTPException(409, "pipeline already running")
+        if r["status"] != "mask_failed":
+            raise HTTPException(409, "project is not in mask_failed state")
+
+        con.execute(
+            "UPDATE projects SET status=?, error=NULL, updated_at=? WHERE id=?",
+            ("running", now(), project_id),
+        )
+
+    with db() as con:
+        r = _authorize_project(con, project_id, user)
+        settings = json.loads(r["settings_json"] or "{}")
+
+    opts = PipelineOptions.from_env().merge_settings(settings)
+    bg.add_task(retry_mask_generation, project_id, opts)
+
+    with db() as con:
+        r2 = _authorize_project(con, project_id, user)
+    return _project_row_to_out(r2)
+
+
 @router.post("/projects/{project_id}/floor_plans")
 def add_floor_plan(project_id: str, payload: dict, user=Depends(get_current_user)):
-    """Add a user-defined floor plan block by specifying pixel bounding box on the master render.
+    """Add a user-defined floor plan block.
 
-    Payload: {"pixel_bbox": [x0, y0, x1, y1]}
-    Converts pixel bbox to world coords and inserts into DB.
+    Accepts either:
+    - Payload: {"pixel_bbox": [x0, y0, x1, y1]} - for pixel-based selection (legacy)
+    - Payload: {"world_bbox": {"xmin": x0, "ymin": y0, "xmax": x1, "ymax": y1}} - for world coords (frontend)
+    
     Block rendering is deferred until the user confirms the floor plan review.
     """
     from app.pipeline.floor_plan_split import _pixel_to_dxf
@@ -406,28 +440,45 @@ def add_floor_plan(project_id: str, payload: dict, user=Depends(get_current_user
     with db() as con:
         r = _authorize_project_write(con, project_id, user)
 
+    # Support both world_bbox (from frontend) and pixel_bbox (legacy)
+    world_bbox = payload.get("world_bbox")
     pixel_bbox = payload.get("pixel_bbox")
-    if not pixel_bbox or len(pixel_bbox) != 4:
-        raise HTTPException(400, "pixel_bbox must be [x0, y0, x1, y1]")
+    
+    if world_bbox:
+        # Frontend is providing world coordinates directly
+        wxmin = float(world_bbox.get("xmin", 0))
+        wymin = float(world_bbox.get("ymin", 0))
+        wxmax = float(world_bbox.get("xmax", 1))
+        wymax = float(world_bbox.get("ymax", 1))
+        if wxmax <= wxmin or wymax <= wymin:
+            raise HTTPException(400, "invalid world bbox dimensions")
+        pixel_bbox_data = None  # No pixel bbox for frontend submissions
+    elif pixel_bbox:
+        # Legacy pixel-based selection
+        if not pixel_bbox or len(pixel_bbox) != 4:
+            raise HTTPException(400, "pixel_bbox must be [x0, y0, x1, y1]")
 
-    bx0, by0, bx1, by1 = [int(v) for v in pixel_bbox]
-    if bx1 <= bx0 or by1 <= by0:
-        raise HTTPException(400, "invalid bounding box dimensions")
+        bx0, by0, bx1, by1 = [int(v) for v in pixel_bbox]
+        if bx1 <= bx0 or by1 <= by0:
+            raise HTTPException(400, "invalid bounding box dimensions")
 
-    master_mapping_path = r["mapping_json_path"]
-    if not master_mapping_path or not os.path.exists(master_mapping_path):
-        raise HTTPException(400, "master mapping not available")
+        master_mapping_path = r["mapping_json_path"]
+        if not master_mapping_path or not os.path.exists(master_mapping_path):
+            raise HTTPException(400, "master mapping not available")
 
-    with open(master_mapping_path, "r", encoding="utf-8") as f:
-        master_map = json.load(f)
+        with open(master_mapping_path, "r", encoding="utf-8") as f:
+            master_map = json.load(f)
 
-    # Convert pixel bbox to world coords
-    dxf_tl_x, dxf_tl_y = _pixel_to_dxf(bx0, by0, master_map)
-    dxf_br_x, dxf_br_y = _pixel_to_dxf(bx1, by1, master_map)
-    wxmin = min(dxf_tl_x, dxf_br_x)
-    wxmax = max(dxf_tl_x, dxf_br_x)
-    wymin = min(dxf_tl_y, dxf_br_y)
-    wymax = max(dxf_tl_y, dxf_br_y)
+        # Convert pixel bbox to world coords
+        dxf_tl_x, dxf_tl_y = _pixel_to_dxf(bx0, by0, master_map)
+        dxf_br_x, dxf_br_y = _pixel_to_dxf(bx1, by1, master_map)
+        wxmin = min(dxf_tl_x, dxf_br_x)
+        wxmax = max(dxf_tl_x, dxf_br_x)
+        wymin = min(dxf_tl_y, dxf_br_y)
+        wymax = max(dxf_tl_y, dxf_br_y)
+        pixel_bbox_data = [bx0, by0, bx1, by1]
+    else:
+        raise HTTPException(400, "Must provide either world_bbox or pixel_bbox")
 
     # Find next block index
     with db() as con:
@@ -447,13 +498,52 @@ def add_floor_plan(project_id: str, payload: dict, user=Depends(get_current_user
             (
                 fp_id, project_id, next_idx,
                 json.dumps({"xmin": wxmin, "ymin": wymin, "xmax": wxmax, "ymax": wymax}),
-                json.dumps([bx0, by0, bx1, by1]),
+                json.dumps(pixel_bbox_data) if pixel_bbox_data else None,
                 None, None,
                 "created", now(), now(),
             ),
         )
         fp = con.execute("SELECT * FROM floor_plans WHERE id=?", (fp_id,)).fetchone()
     return _floor_plan_row_to_dict(fp)
+
+
+@router.post("/projects/{project_id}/floor_plans/{fp_id}/render_image")
+async def upload_floor_plan_render_image(
+    project_id: str,
+    fp_id: str,
+    file: UploadFile = File(...),
+    user=Depends(get_current_user),
+):
+    """Upload the frontend-generated floor-plan image used for mask generation."""
+    with db() as con:
+        _authorize_project_write(con, project_id, user)
+        fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
+        if not fp:
+            raise HTTPException(404, "floor plan block not found")
+
+    filename = (file.filename or "floor_plan.png").strip().lower()
+    ext = os.path.splitext(filename)[1]
+    if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+        raise HTTPException(400, "Upload floor plan image as .png/.jpg/.jpeg/.webp")
+
+    data = await file.read()
+    if len(data) < 100:
+        raise HTTPException(400, "File too small")
+
+    idx = fp["block_index"]
+    blocks_dir = os.path.join(project_dir(project_id), "blocks")
+    os.makedirs(blocks_dir, exist_ok=True)
+    render_path = os.path.join(blocks_dir, f"block_{idx}.png")
+    with open(render_path, "wb") as f:
+        f.write(data)
+
+    with db() as con:
+        con.execute(
+            "UPDATE floor_plans SET render_png_path=?, status=?, updated_at=? WHERE id=?",
+            (render_path, "rendered", now(), fp_id),
+        )
+        fp2 = con.execute("SELECT * FROM floor_plans WHERE id=?", (fp_id,)).fetchone()
+    return _floor_plan_row_to_dict(fp2)
 
 
 @router.delete("/projects/{project_id}/floor_plans/{fp_id}")
@@ -464,8 +554,32 @@ def delete_floor_plan(project_id: str, fp_id: str, user=Depends(get_current_user
         fp = con.execute("SELECT * FROM floor_plans WHERE id=? AND project_id=?", (fp_id, project_id)).fetchone()
         if not fp:
             raise HTTPException(404, "floor plan block not found")
+        idx = int(fp["block_index"])
         con.execute("DELETE FROM floor_plans WHERE id=?", (fp_id,))
         con.execute("DELETE FROM detectors WHERE project_id=? AND floor_plan_id=?", (project_id, fp_id))
+
+    # Best-effort cleanup for artifacts belonging to the removed block.
+    blocks_dir = os.path.join(project_dir(project_id), "blocks")
+    stale_files = [
+        os.path.join(blocks_dir, f"block_{idx}.png"),
+        os.path.join(blocks_dir, f"block_{idx}_mask.png"),
+        os.path.join(blocks_dir, f"block_{idx}_aligned.png"),
+        os.path.join(blocks_dir, f"block_{idx}_align_overlay.jpg"),
+        os.path.join(blocks_dir, f"block_{idx}_align_boxes.jpg"),
+        os.path.join(blocks_dir, f"block_{idx}_color.png"),
+        os.path.join(blocks_dir, f"block_{idx}_mapping.json"),
+        os.path.join(blocks_dir, f"block_{idx}_fixed_wall.png"),
+        os.path.join(blocks_dir, f"block_{idx}_rooms.json"),
+        os.path.join(blocks_dir, f"block_{idx}_rooms_debug.png"),
+        os.path.join(project_dir(project_id), f"sprinkler_pipes_{idx}.json"),
+    ]
+    for p in stale_files:
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+        except OSError:
+            # Do not fail deletion because optional artifacts could not be removed.
+            pass
     return {"ok": True}
 
 
@@ -672,7 +786,7 @@ def reset_detectors(project_id: str, user=Depends(get_current_user)):
 
 @router.put("/projects/{project_id}/bulk_save")
 def bulk_save(project_id: str, payload: dict, user=Depends(get_current_user)):
-    """Save rooms, detectors, and pipes in a single call. No QCAD rendering."""
+    """Save rooms, detectors, and pipes in a single call."""
     with db() as con:
         r = _authorize_project_write(con, project_id, user)
 
@@ -1095,33 +1209,10 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
             world_bbox=world_bbox,
         )
 
-        out_png = os.path.join(project_dir(project_id), "detectors_preview.png")
-        out_map = os.path.join(project_dir(project_id), "detectors_preview_mapping.json")
-
-        # Strict WYSIWYG preview: render and mapping must use the exact same world window.
-        wxmin, wymin, wxmax, wymax = get_dxf_bbox(out_dxf, pad_frac=0.0)
-        render_window = f"{wxmin},{wymin},{(wxmax - wxmin)},{(wymax - wymin)}"
-
-        render_dwg_to_png_with_qcad(
-            dwg_path=out_dxf,
-            out_png=out_png,
-            target_long_side_px=min(opts.target_long_side_px, 8000),
-            background="white",
-            window=render_window,
-            margin_px_override=0,
-            postprocess_bolden=False,
-        )
-        write_mapping_from_dxf_and_png(
-            dxf_path=out_dxf,
-            png_path=out_png,
-            out_json=out_map,
-            pad_frac=0.0,
-            bbox_override=(wxmin, wymin, wxmax, wymax),
-        )
-
+        # No PNG preview rendering needed - frontend handles DXF visualization
         con.execute(
-            "UPDATE projects SET output_dxf_path=?, output_preview_png_path=?, error=NULL, updated_at=? WHERE id=?",
-            (out_combined, out_png, now(), project_id),
+            "UPDATE projects SET output_dxf_path=?, error=NULL, updated_at=? WHERE id=?",
+            (out_combined, now(), project_id),
         )
         log_activity(con, user, "saved_project", "project", project_id, r["name"])
         r2 = _authorize_project(con, project_id, user)

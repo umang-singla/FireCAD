@@ -45,7 +45,7 @@ try:
 except ImportError:
     _GENAI_OK = False
 
-logger = logging.getLogger("firecad.pipeline.sprinkler_routing")
+logger = logging.getLogger("mepit.pipeline.sprinkler_routing")
 
 # ── runtime defaults (overridden by callers) ──────────────────────
 WORLD_TO_M = 0.001

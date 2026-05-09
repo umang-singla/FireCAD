@@ -40,7 +40,7 @@ function LoginContent() {
     <div style={styles.bg}>
       <div style={styles.card} className="login-card">
         <section style={styles.hero}>
-          <div style={styles.brand}>FIRECAD</div>
+          <div style={styles.brand}>MEPIT.AI</div>
           <h1 style={styles.heroTitle}>Modern fire-safety CAD workflow</h1>
           <p style={styles.heroSub}>
             Upload, align, detect rooms, and export clean DXF outputs with a streamlined pipeline.

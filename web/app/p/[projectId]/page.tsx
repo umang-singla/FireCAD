@@ -2,8 +2,12 @@
 
 import { use, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
+import { useRouter } from "next/navigation";
 import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
 import { getToken, getTenantRole } from "../../lib/auth";
+import dynamic from "next/dynamic";
+
+const FloorPlanExtractor = dynamic(() => import("./components/FloorPlanExtractor"), { ssr: false });
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
 const WS_BASE = (process.env.NEXT_PUBLIC_WS_BASE || "").replace(/\/$/, "");
@@ -31,7 +35,7 @@ function apiMediaUrl(path: string, version: number) {
   return `${base}${base.includes("?") ? "&" : "?"}v=${version}`;
 }
 
-const NETWORK_PENDING_EVENT = "firecad-network-pending";
+const NETWORK_PENDING_EVENT = "mepit-network-pending";
 let networkPendingCount = 0;
 
 function emitNetworkPending() {
@@ -288,6 +292,7 @@ function pipeStrokeWidthPx(diameter?: string) {
 
 export default function ProjectPage({ params }: { params: Promise<{ projectId: string }> }) {
   const { projectId } = use(params);
+  const router = useRouter();
   const [project, setProject] = useState<Project | null>(null);
   const [detectors, setDetectors] = useState<Detector[]>([]);
   const [mapping, setMapping] = useState<Mapping | null>(null);
@@ -390,7 +395,7 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           if (msg.type === "status") {
             // Full refresh to pick up new files/status from the API
             refresh();
-            if (msg.status === "ready" || msg.status === "failed" || msg.status === "ready_no_mask" || msg.status === "awaiting_alignment_review" || msg.status === "awaiting_floor_review") {
+            if (msg.status === "ready" || msg.status === "failed" || msg.status === "mask_failed" || msg.status === "ready_no_mask" || msg.status === "awaiting_alignment_review" || msg.status === "awaiting_floor_review") {
               setPipelineStage(null);
             }
           } else if (msg.type === "stage") {
@@ -531,7 +536,6 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     const normalizedSettings = {
       ...settings,
       units: normalizedUnit,
-      qcad_input_unit: normalizedUnit,
       // Keep both scale keys in sync with selected unit for measurement and pipeline use.
       dxf_to_world: nextScale,
       world_to_m: nextScale,
@@ -554,13 +558,19 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     await refresh();
   }
 
+  async function retryMaskGenerationStep() {
+    setPipelineStage(null);
+    await authFetch(`/api/projects/${projectId}/retry_mask_generation`, { method: "POST" });
+    await refresh();
+  }
+
   const isReady = project?.status === "ready";
   const isAwaitingFloorReview = project?.status === "awaiting_floor_review";
   const isAwaitingAlignmentReview = project?.status === "awaiting_alignment_review";
   const isAwaitingRoomReview = project?.status === "awaiting_room_review";
   // Treat ALL intermediate pipeline statuses as "running" so the loader
   // stays visible until a review step or final output appears.
-  const IDLE_STATUSES = new Set(["created", "uploaded", "ready", "ready_no_mask", "failed", "awaiting_alignment_review", "awaiting_room_review", "awaiting_floor_review"]);
+  const IDLE_STATUSES = new Set(["created", "uploaded", "ready", "ready_no_mask", "failed", "mask_failed", "awaiting_alignment_review", "awaiting_room_review", "awaiting_floor_review"]);
   const isRunning = !!project && !IDLE_STATUSES.has(project.status);
   const isQuestionnaireMode = !editorOpen;
   const showGlobalLoader = project === null || networkPending > 0;
@@ -593,16 +603,38 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     setEditorOpen(false);
   }
 
-  async function addFloorPlan(pixelBbox: number[]) {
-    await authFetch(`/api/projects/${projectId}/floor_plans`, {
+  async function addFloorPlan(worldBbox: { xmin: number; ymin: number; xmax: number; ymax: number }) {
+    const res = await authFetch(`/api/projects/${projectId}/floor_plans`, {
       method: "POST",
-      body: JSON.stringify({ pixel_bbox: pixelBbox }),
+      body: JSON.stringify({ world_bbox: worldBbox }),
     });
     await refresh();
+    return await res.json();
+  }
+
+  async function uploadFloorPlanRenderImage(fpId: string, blob: Blob) {
+    const fd = new FormData();
+    fd.append("file", blob, "floor_plan.png");
+    await authFetch(`/api/projects/${projectId}/floor_plans/${fpId}/render_image`, {
+      method: "POST",
+      body: fd,
+    });
   }
 
   async function deleteFloorPlan(fpId: string) {
     await authFetch(`/api/projects/${projectId}/floor_plans/${fpId}`, { method: "DELETE" });
+    await refresh();
+  }
+
+  async function clearAllFloorPlansForProject() {
+    const res = await authFetch(`/api/projects/${projectId}/floor_plans`);
+    const existing = await res.json();
+    if (!Array.isArray(existing) || existing.length === 0) return;
+    for (const fp of existing) {
+      if (fp?.id) {
+        await authFetch(`/api/projects/${projectId}/floor_plans/${fp.id}`, { method: "DELETE" });
+      }
+    }
     await refresh();
   }
 
@@ -844,16 +876,17 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                 const s = (project?.status || "").toLowerCase();
                 const done = s === "ready";
                 const fail = s === "failed";
+                const maskFail = s === "mask_failed";
                 const reviewing = s === "awaiting_alignment_review" || s === "awaiting_room_review" || s === "awaiting_floor_review";
-                const run = !["created","uploaded","ready","ready_no_mask","failed","awaiting_alignment_review","awaiting_room_review","awaiting_floor_review"].includes(s);
+                const run = !["created","uploaded","ready","ready_no_mask","failed","mask_failed","awaiting_alignment_review","awaiting_room_review","awaiting_floor_review"].includes(s);
                 const canOpenEditor = done || reviewing;
                 return (
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
                       <div style={{
                         width: 42, height: 42, borderRadius: 12,
-                        background: done ? "#ECFDF5" : run ? "#EFF6FF" : fail ? "#FEF2F2" : reviewing ? "#EFF6FF" : "#F3F4F6",
-                        border: done ? "1px solid rgba(5,150,105,0.2)" : run ? "1px solid rgba(37,99,235,0.2)" : fail ? "1px solid rgba(220,38,38,0.2)" : reviewing ? "1px solid rgba(37,99,235,0.2)" : "1px solid #E8EAED",
+                        background: done ? "#ECFDF5" : run ? "#EFF6FF" : (fail || maskFail) ? "#FEF2F2" : reviewing ? "#EFF6FF" : "#F3F4F6",
+                        border: done ? "1px solid rgba(5,150,105,0.2)" : run ? "1px solid rgba(37,99,235,0.2)" : (fail || maskFail) ? "1px solid rgba(220,38,38,0.2)" : reviewing ? "1px solid rgba(37,99,235,0.2)" : "1px solid #E8EAED",
                         display: "grid", placeItems: "center", flexShrink: 0,
                       }}>
                         {run ? (
@@ -863,10 +896,10 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                             animation: "spin 1s linear infinite",
                           }} />
                         ) : (
-                          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={done ? "#059669" : fail ? "#DC2626" : reviewing ? "#2563EB" : "#6B7280"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={done ? "#059669" : (fail || maskFail) ? "#DC2626" : reviewing ? "#2563EB" : "#6B7280"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                             {done ? (
                               <><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></>
-                            ) : fail ? (
+                            ) : (fail || maskFail) ? (
                               <><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></>
                             ) : reviewing ? (
                               <><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></>
@@ -878,16 +911,25 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                       </div>
                       <div>
                         <div style={{ fontSize: 14, fontWeight: 700, color: "#1A1A2E" }}>
-                          {done ? "Drawing Complete" : fail ? "Drawing Failed" : run ? "Processing Drawing" : reviewing ? "Awaiting Review" : "Edit Drawing"}
+                          {done ? "Drawing Complete" : maskFail ? "Mask Generation Failed" : fail ? "Drawing Failed" : run ? "Processing Drawing" : reviewing ? "Awaiting Review" : "Edit Drawing"}
                         </div>
                         <div style={{ fontSize: 12, color: "#6B7280", marginTop: 2 }}>
-                          {done ? "Detectors placed successfully." : fail ? (project?.error || "An error occurred. Click to retry.") : run ? (pipelineStage ? pipelineStage.replace(/_/g, " ") : "Pipeline is running\u2026") : reviewing ? "Review is pending. Open the editor to continue." : "Run the placement pipeline on your uploaded drawing."}
+                          {done ? "Detectors placed successfully." : maskFail ? "Gemini failed to generate the mask. You can retry just this step." : fail ? (project?.error || "An error occurred. Click to retry.") : run ? (pipelineStage ? pipelineStage.replace(/_/g, " ") : "Pipeline is running\u2026") : reviewing ? "Review is pending. Open the editor to continue." : "Run the placement pipeline on your uploaded drawing."}
                         </div>
                       </div>
                     </div>
                     <div style={{ display: "flex", gap: 8 }}>
                       {canOpenEditor ? (
-                        <button onClick={() => setEditorOpen(true)} style={{
+                        <button onClick={() => {
+                          // Final "ready" stage and the room-review stage open the
+                          // dedicated DXF editor. Earlier review stages (Gemini mask
+                          // alignment, floor plan extraction) keep the inline UI.
+                          if (done || isAwaitingRoomReview) {
+                            router.push(`/p/${projectId}/dxf`);
+                          } else {
+                            setEditorOpen(true);
+                          }
+                        }} style={{
                           padding: "10px 20px", borderRadius: 12,
                           border: "none", background: "#2D6A4F", color: "#fff",
                           cursor: "pointer", fontSize: 13, fontWeight: 700,
@@ -902,7 +944,25 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
                           {canEdit ? "Open Editor" : "View Editor"}
                         </button>
                       ) : null}
-                      {canEdit && !run && !canOpenEditor ? (
+                      {canEdit && !run && !canOpenEditor && maskFail ? (
+                        <button onClick={retryMaskGenerationStep} style={{
+                          padding: "10px 20px", borderRadius: 12,
+                          border: "none",
+                          background: "#2D6A4F",
+                          color: "#fff",
+                          cursor: "pointer", fontSize: 13, fontWeight: 700,
+                          display: "flex", alignItems: "center", gap: 8,
+                          boxShadow: "0 4px 12px rgba(45,106,79,0.3)",
+                          whiteSpace: "nowrap",
+                        }}>
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <polyline points="1 4 1 10 7 10"/>
+                            <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
+                          </svg>
+                          Retry Mask Generation
+                        </button>
+                      ) : null}
+                      {canEdit && !run && !canOpenEditor && !maskFail ? (
                         <button onClick={runPipeline} style={{
                           padding: "10px 20px", borderRadius: 12,
                           border: "none",
@@ -1084,22 +1144,60 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
           <span style={{ fontSize: 13, color: "#6B7280" }}>{project?.name || "Project"}</span>
         </div>
         <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
-        {isAwaitingFloorReview && project?.files?.render_png && mapping ? (
-          <FloorPlanReview
-            renderUrl={apiUrl(project.files.render_png)}
+        {isAwaitingFloorReview && project?.files?.dxf ? (
+          <FloorPlanExtractor
+            dxfUrl={apiUrl(project.files.dxf)}
             mapping={mapping}
-            floorPlans={floorPlans}
-            initialHeightsByFloorPlanId={Object.fromEntries(
-              floorPlans
-                .filter((fp) => Number.isFinite(fp.height_m as number))
-                .map((fp) => [fp.id, Number(fp.height_m)]),
-            )}
-            onConfirm={continuePipelineAfterFloorReview}
-            onAddFloorPlan={addFloorPlan}
-            onDeleteFloorPlan={deleteFloorPlan}
-            onRefresh={refresh}
+            onConfirm={async (plans) => {
+              // Create floor plans from detected boxes, upload frontend-rendered PNGs,
+              // then continue the backend mask-generation pipeline.
+              await clearAllFloorPlansForProject();
+              const created: any[] = [];
+              for (const plan of plans) {
+                const fp = await addFloorPlan(plan.world_bbox);
+                if (!fp?.id) continue;
+                if (!plan.render_blob) {
+                  throw new Error(`Missing rendered image for floor plan ${fp.id}`);
+                }
+                await uploadFloorPlanRenderImage(fp.id, plan.render_blob);
+                created.push({ id: fp.id, height_m: plan.height_m });
+              }
+              // Persist user-entered floor heights
+              for (const item of created) {
+                if (item.id && Number.isFinite(Number(item.height_m)) && Number(item.height_m) > 0) {
+                  await authFetch(`/api/projects/${projectId}/floor_plans/${item.id}`, {
+                    method: "PUT",
+                    body: JSON.stringify({ height_m: Number(item.height_m) }),
+                  });
+                }
+              }
+              // Then continue pipeline
+              await continuePipelineAfterFloorReview();
+            }}
             canEdit={canEdit}
           />
+        ) : isAwaitingFloorReview ? (
+          <div style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            height: "100%",
+            padding: 20,
+            background: "#FEF2F2",
+            border: "1px solid rgba(220,38,38,0.2)",
+            color: "#991B1B",
+          }}>
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ marginBottom: 16 }}>
+              <circle cx="12" cy="12" r="10" />
+              <line x1="12" y1="8" x2="12" y2="12" />
+              <line x1="12" y1="16" x2="12.01" y2="16" />
+            </svg>
+            <p style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>DXF File Required</p>
+            <p style={{ fontSize: 14, color: "#991B1B", textAlign: "center" }}>
+              Floor plan extraction requires a DXF file. Please upload a DWG file which will be converted to DXF.
+            </p>
+          </div>
         ) : isAwaitingAlignmentReview ? (
           floorPlans.length > 0 ? (
             /* ── Floor-plan-based alignment review ── */

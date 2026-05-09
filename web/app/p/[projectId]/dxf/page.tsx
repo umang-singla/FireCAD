@@ -2125,16 +2125,21 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       }
       const placed: Detector[] = await res.json();
 
-      // Merge like the editor: replace this type's detectors with the new results.
+      // Merge like the editor: replace this type's detectors with the new
+      // results, but ONLY for the floor we just ran automation on. Detectors
+      // belonging to other floor plans must remain untouched (the backend
+      // also scopes its delete by floor_plan_id, so they were never removed
+      // server-side either).
+      const isCurrentFloor = (d: Detector) => d.floor_plan_id === selectedFloorId;
       setDetectors(prev => {
         if (dtype === "mcp_hooter") {
           return [
-            ...prev.filter(d => d.dtype !== "mcb" && d.dtype !== "hooter"),
+            ...prev.filter(d => !isCurrentFloor(d) || (d.dtype !== "mcb" && d.dtype !== "hooter")),
             ...placed.filter(d => d.dtype === "mcb" || d.dtype === "hooter"),
           ];
         }
         return [
-          ...prev.filter(d => d.dtype !== dtype),
+          ...prev.filter(d => !isCurrentFloor(d) || d.dtype !== dtype),
           ...placed.filter(d => d.dtype === dtype),
         ];
       });
