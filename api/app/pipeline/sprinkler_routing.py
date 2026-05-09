@@ -45,7 +45,7 @@ try:
 except ImportError:
     _GENAI_OK = False
 
-logger = logging.getLogger("firecad.pipeline.sprinkler_routing")
+logger = logging.getLogger("mepit.pipeline.sprinkler_routing")
 
 # ── runtime defaults (overridden by callers) ──────────────────────
 WORLD_TO_M = 0.001
@@ -1394,39 +1394,89 @@ def write_sprinklers_to_dxf(
     doc = ezdxf.readfile(base_dxf)
     msp = doc.modelspace()
 
-    # Remove only sprinkler-layer entities from previous exports.
-    # This avoids duplicate/offset-looking pipe overlays while preserving other AI layers.
-    stale = []
-    for ent in msp:
-        try:
-            if str(getattr(ent.dxf, "layer", "")) in {DXF_LAYER_SPRINKLER, DXF_LAYER_PIPES, DXF_LAYER_SOURCE}:
-                stale.append(ent)
-        except Exception:
-            continue
-    for ent in stale:
-        try:
-            msp.delete_entity(ent)
-        except Exception:
-            continue
-
     for layer_name in [DXF_LAYER_SPRINKLER, DXF_LAYER_PIPES, DXF_LAYER_SOURCE]:
         if layer_name not in doc.layers:
             doc.layers.add(layer_name)
+
+    def _diameter_mm(label: str) -> float:
+        s = str(label or "").strip().lower().replace(" ", "")
+        if s.endswith("mm"):
+            s = s[:-2]
+        try:
+            return max(0.0, float(s))
+        except Exception:
+            return 25.0
+
+    def _lineweight_for_diameter_mm(d_mm: float) -> int:
+        # DXF lineweight values are in 1/100 mm. Keep values from the
+        # common supported set so CAD viewers display them consistently.
+        if d_mm <= 25:
+            return 25
+        if d_mm <= 32:
+            return 35
+        if d_mm <= 40:
+            return 50
+        if d_mm <= 50:
+            return 70
+        if d_mm <= 65:
+            return 90
+        if d_mm <= 80:
+            return 106
+        if d_mm <= 100:
+            return 140
+        if d_mm <= 150:
+            return 200
+        return 211
+
+    def _pipe_width_world_from_diameter_mm(d_mm: float) -> float:
+        # Diameter mm -> meters -> drawing units.
+        w = (max(1.0, d_mm) / 1000.0) / max(1e-9, world_to_m)
+        # Keep a minimum visible width in drawings with large world units.
+        return max(w, 0.008 / max(1e-9, world_to_m))
+
+    def _add_pipe_band(pt1: tuple[float, float], pt2: tuple[float, float], width_world: float):
+        x1, y1 = float(pt1[0]), float(pt1[1])
+        x2, y2 = float(pt2[0]), float(pt2[1])
+        dx = x2 - x1
+        dy = y2 - y1
+        seg_len = math.hypot(dx, dy)
+        if seg_len <= 1e-9:
+            return
+
+        half_w = width_world * 0.5
+        nx = -dy / seg_len * half_w
+        ny = dx / seg_len * half_w
+
+        p1 = (x1 + nx, y1 + ny)
+        p2 = (x2 + nx, y2 + ny)
+        p3 = (x2 - nx, y2 - ny)
+        p4 = (x1 - nx, y1 - ny)
+
+        # Solid fill gives deterministic visual thickness across CAD viewers.
+        hatch = msp.add_hatch(color=1, dxfattribs={"layer": DXF_LAYER_PIPES})
+        hatch.paths.add_polyline_path([p1, p2, p3, p4], is_closed=True)
+        hatch.set_solid_fill(color=1, rgb=(255, 0, 0))
+
+        # Add crisp borders to keep edge definition when fills are subdued.
+        msp.add_lwpolyline([p1, p2, p3, p4], close=True, dxfattribs={"layer": DXF_LAYER_PIPES, "color": 1})
 
     # Increase readability for pipe size labels in output drawings.
     pipe_text_height = text_height_world * 1.10
     # Pipes
     for (pt1, pt2), label in pipes:
+        d_mm = _diameter_mm(label)
+        lw = _lineweight_for_diameter_mm(d_mm)
+        band_w = _pipe_width_world_from_diameter_mm(d_mm)
+        _add_pipe_band(pt1, pt2, band_w)
         # Export centerline geometry to keep visual alignment with editor.
         # Wide LWPOLYLINE rendering can appear laterally biased in some CAD viewers.
         msp.add_line(
             pt1,
             pt2,
-            dxfattribs={"layer": DXF_LAYER_PIPES, "color": 1},
+            dxfattribs={"layer": DXF_LAYER_PIPES, "color": 1, "lineweight": lw},
         )
         dx = pt2[0] - pt1[0]
         dy = pt2[1] - pt1[1]
-        length = math.hypot(dx, dy)
         mid_x = (pt1[0] + pt2[0]) / 2.0
         mid_y = (pt1[1] + pt2[1]) / 2.0
         is_horizontal = abs(dx) > abs(dy)

@@ -8,7 +8,7 @@ from shapely.geometry import LinearRing, LineString, Point, Polygon
 from shapely.ops import nearest_points, split, unary_union
 from shapely.validation import make_valid
 
-logger = logging.getLogger("firecad.pipeline.mcp_hooter")
+logger = logging.getLogger("mepit.pipeline.mcp_hooter")
 
 # Geometry defaults adapted from notebook logic.
 MIN_REGION_AREA_M2 = 2.5

@@ -14,7 +14,7 @@ from ezdxf.addons.drawing.pymupdf import PyMuPdfBackend
 from ezdxf.math import BoundingBox2d
 from PIL import Image
 
-logger = logging.getLogger("firecad.pipeline.render")
+logger = logging.getLogger("mepit.pipeline.render")
 
 
 def _build_mapping(width_px: int, height_px: int, xmin_p: float, ymin_p: float, xmax_p: float, ymax_p: float):

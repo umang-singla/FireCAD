@@ -14,7 +14,7 @@ from typing import Any
 
 from fastapi import WebSocket
 
-logger = logging.getLogger("firecad.ws")
+logger = logging.getLogger("mepit.ws")
 
 
 class ConnectionManager:
