@@ -31,7 +31,7 @@ export default function SignupPage() {
     <div style={styles.bg}>
       <div style={styles.card} className="signup-card">
         <section style={styles.hero}>
-          <div style={styles.brand}>FIRECAD</div>
+          <div style={styles.brand}>MEPIT.AI</div>
           <h1 style={styles.heroTitle}>Build safer plans faster</h1>
           <p style={styles.heroSub}>
             Create your workspace to process drawings, run detector placement, and export production-ready CAD.
@@ -41,7 +41,7 @@ export default function SignupPage() {
 
         <section style={styles.formPanel}>
           <h1 style={styles.title}>Create account</h1>
-          <p style={styles.sub}>Automate MEP drawings with FireCAD.</p>
+          <p style={styles.sub}>Automate MEP drawings with Mepit.AI.</p>
 
           <form onSubmit={onSubmit} style={{ width: "100%" }}>
             <label style={styles.label}>Name</label>

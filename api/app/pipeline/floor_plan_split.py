@@ -30,7 +30,7 @@ from app.pipeline.render import (
     render_dwg_to_png_with_qcad,
 )
 
-logger = logging.getLogger("firecad.pipeline.split")
+logger = logging.getLogger("mepit.pipeline.split")
 
 
 # ---------------------------------------------------------------------------

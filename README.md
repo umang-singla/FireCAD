@@ -1,4 +1,4 @@
-# FireCAD Web App (DWG/DXF → Auto-place → Edit → Export)
+# Mepit.AI Web App (DWG/DXF → Auto-place → Edit → Export)
 
 This repo is a **complete, runnable MVP** web app based on your Colab notebook pipeline:
 - Convert/upload drawing (DXF; DWG supported if ODAFileConverter is installed)

@@ -4,7 +4,7 @@ import logging
 from ezdxf import recover
 from ezdxf.enums import TextEntityAlignment
 
-logger = logging.getLogger("firecad.pipeline.dxf_export")
+logger = logging.getLogger("mepit.pipeline.dxf_export")
 
 # Symbol radius as a fraction of the shorter side of the content bounding box.
 # ~0.5 % of the bbox short side gives a visually proportional symbol.
@@ -799,7 +799,7 @@ def write_combined_sheets_dxf(
             i += 1
 
     # ── Build a single DXF with everything in modelspace ──
-    tmpdir = tempfile.mkdtemp(prefix="firecad_combined_")
+    tmpdir = tempfile.mkdtemp(prefix="mepit_combined_")
     try:
         tmp_dxf = os.path.join(tmpdir, "all_overlay.dxf")
         shutil.copy2(base_dxf, tmp_dxf)

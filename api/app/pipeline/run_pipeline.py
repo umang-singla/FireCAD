@@ -1,20 +1,16 @@
 import os
+import re
 import traceback
 import time
 import logging
 import uuid
 import json as _json
+import cv2
 
 from app.db import db, now
 from app.storage import project_dir
 from app.pipeline.options import PipelineOptions
 from app.pipeline.convert import dwg_to_dxf
-from app.pipeline.render import (
-    render_dwg_to_png_with_qcad,
-    write_mapping_from_dxf_and_png,
-    render_master_cropped,
-    get_dxf_bbox,
-)
 from app.pipeline.gemini_mask import generate_mask_image
 from app.pipeline.mask_align import align_perfect_tight_box
 from app.pipeline.wall_fix import fix_walls
@@ -27,11 +23,9 @@ from app.pipeline.sprinkler_routing import (
     write_sprinklers_to_dxf,
 )
 from app.pipeline.mcp_hooter_placement import place_mcp_hooter_from_rooms_payload
-from app.pipeline.floor_plan_split import split_floor_plans
-from app.pipeline.floor_plan_split import _render_block
 from app.ws_manager import manager as ws_manager
 
-logger = logging.getLogger("firecad.pipeline")
+logger = logging.getLogger("mepit.pipeline")
 
 # NOTE:
 # This uses your notebook flow. For production, split into a proper job queue.
@@ -88,6 +82,88 @@ def _get_floor_plans(con, project_id: str):
         "SELECT * FROM floor_plans WHERE project_id=? ORDER BY block_index ASC",
         (project_id,),
     ).fetchall()
+
+
+def _cleanup_orphan_block_artifacts(project_id: str, valid_block_indices: set[int]):
+    """Remove stale block files not tied to current floor-plan rows.
+
+    This prevents old block_* artifacts from previous runs from being mistaken
+    as current inputs/outputs in debugging and review flows.
+    """
+    pdir = project_dir(project_id)
+    blocks_dir = os.path.join(pdir, "blocks")
+    if not os.path.isdir(blocks_dir):
+        return
+
+    block_file_re = re.compile(r"^block_(\d+)(?:_.+)?\.(?:png|jpg|jpeg|json)$", re.IGNORECASE)
+    for name in os.listdir(blocks_dir):
+        m = block_file_re.match(name)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        if idx in valid_block_indices:
+            continue
+        path = os.path.join(blocks_dir, name)
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            logger.warning("cleanup project=%s skipped file=%s", project_id, path)
+
+
+def _build_block_mapping_from_world_bbox(
+    *,
+    world_bbox: dict,
+    width_px: int,
+    height_px: int,
+) -> dict:
+    """Create a mapping payload matching the renderer's contain-fit behavior."""
+    xmin = float(world_bbox["xmin"])
+    xmax = float(world_bbox["xmax"])
+    ymin = float(world_bbox["ymin"])
+    ymax = float(world_bbox["ymax"])
+
+    span_x = max(1e-9, xmax - xmin)
+    span_y = max(1e-9, ymax - ymin)
+    wpx = max(1, int(width_px))
+    hpx = max(1, int(height_px))
+
+    scale = min(wpx / span_x, hpx / span_y)
+    draw_w = span_x * scale
+    draw_h = span_y * scale
+    offset_x = (wpx - draw_w) * 0.5
+    offset_y = (hpx - draw_h) * 0.5
+
+    return {
+        "width_px": wpx,
+        "height_px": hpx,
+        "world_bbox": {
+            "xmin": xmin,
+            "xmax": xmax,
+            "ymin": ymin,
+            "ymax": ymax,
+        },
+        "pixel_fit": {
+            "mode": "contain",
+            "scale": float(scale),
+            "offset_x": float(offset_x),
+            "offset_y": float(offset_y),
+        },
+    }
+
+    for name in os.listdir(pdir):
+        m = re.match(r"^sprinkler_pipes_(\d+)\.json$", name)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        if idx in valid_block_indices:
+            continue
+        path = os.path.join(pdir, name)
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            logger.warning("cleanup project=%s skipped file=%s", project_id, path)
 
 def _replace_detectors(con, project_id: str, dets: list[dict], floor_plan_id: str = None):
     if floor_plan_id:
@@ -255,7 +331,8 @@ def _run_multi_block_post_alignment(
     for fp in fps:
         fp_id = fp["id"]
         idx = fp["block_index"]
-        fp_dir = os.path.dirname(fp["render_png_path"])
+        render_png_path = fp["render_png_path"]
+        fp_dir = os.path.dirname(render_png_path) if render_png_path else os.path.join(pdir, "blocks")
         aligned = fp["aligned_mask_path"]
         mapping_json = fp["mapping_json_path"]
 
@@ -271,6 +348,31 @@ def _run_multi_block_post_alignment(
         stage_done(f"fix_walls_block_{idx}", stage_ts)
         with db() as con:
             _set_floor_plan(con, fp_id, fixed_wall_path=fixed, status="walls_fixed")
+
+        # Ensure each block has a mapping json. Floor plans created from frontend
+        # world bboxes don't have mapping_json_path by default.
+        if not mapping_json or not os.path.exists(mapping_json):
+            wb = _json.loads(fp["world_bbox_json"]) if fp["world_bbox_json"] else None
+            if not wb:
+                raise RuntimeError(f"Missing world bbox for block {idx}; cannot build mapping.")
+
+            ref_img_path = fixed if os.path.exists(fixed) else aligned
+            img = cv2.imread(ref_img_path)
+            if img is None:
+                raise RuntimeError(f"Could not read block image for mapping (block {idx}).")
+            h, w = img.shape[:2]
+
+            mapping_json = os.path.join(fp_dir, f"block_{idx}_mapping.json")
+            mapping_payload = _build_block_mapping_from_world_bbox(
+                world_bbox=wb,
+                width_px=w,
+                height_px=h,
+            )
+            with open(mapping_json, "w", encoding="utf-8") as mf:
+                _json.dump(mapping_payload, mf, indent=2)
+
+            with db() as con:
+                _set_floor_plan(con, fp_id, mapping_json_path=mapping_json)
 
         # Extract rooms per block
         stage_ts = time.perf_counter()
@@ -549,40 +651,11 @@ def _run_post_room_review_steps(
     )
     stage_done("export_dxf", stage_ts, out_dxf=out_dxf, out_combined=out_combined)
 
-    # 10) Render output preview PNG
-    stage_ts = time.perf_counter()
-    stage_start("render_output_preview")
-    out_png = os.path.join(pdir, "detectors_preview.png")
-    out_map = os.path.join(pdir, "detectors_preview_mapping.json")
-
-    # Strict WYSIWYG preview: keep render window and mapping bbox identical.
-    wxmin, wymin, wxmax, wymax = get_dxf_bbox(out_dxf, pad_frac=0.0)
-    render_window = f"{wxmin},{wymin},{(wxmax - wxmin)},{(wymax - wymin)}"
-
-    render_dwg_to_png_with_qcad(
-        dwg_path=out_dxf,
-        out_png=out_png,
-        target_long_side_px=min(opts.target_long_side_px, 8000),
-        background="white",
-        window=render_window,
-        margin_px_override=0,
-        postprocess_bolden=False,
-    )
-    write_mapping_from_dxf_and_png(
-        dxf_path=out_dxf,
-        png_path=out_png,
-        out_json=out_map,
-        pad_frac=0.0,
-        bbox_override=(wxmin, wymin, wxmax, wymax),
-    )
-
-    stage_done("render_output_preview", stage_ts, out_png=out_png, renderer="qcad")
-
+    # Set final status - no rendering needed, frontend handles DXF visualization
     with db() as con:
         _set_project(con, project_id,
                      status="ready",
                      output_dxf_path=out_combined,
-                     output_preview_png_path=out_png,
                      error=None)
 
 def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
@@ -641,72 +714,45 @@ def run_pipeline_for_project(project_id: str, opts: PipelineOptions):
             dxf_path = dwg_to_dxf(in_path, pdir)
         stage_done("ensure_dxf", stage_ts, ext=ext, dxf=dxf_path)
 
-        # 2) Render full master DXF → PNG + mapping.json (cropped to content)
-        #    Produces both colored (for UI) and grayscale (for processing/splitting)
+        # 2) Generate a frontend-safe placeholder mapping without DXF parsing.
+        #    Frontend handles DXF rendering/extraction and provides floor-plan images.
         stage_ts = time.perf_counter()
-        stage_start("render_input")
-        render_png = os.path.join(pdir, "render.png")
-        render_gray_png = os.path.join(pdir, "render_gray.png")
+        stage_start("generate_mapping")
         mapping_json = os.path.join(pdir, "mapping.json")
-        render_master_cropped(
-            dxf_path=dxf_path,
-            out_png=render_png,
-            out_json=mapping_json,
-            target_long_side_px=opts.target_long_side_px,
-            pad_frac=opts.pad_frac,
-            out_gray_png=render_gray_png,
-        )
-        stage_done("render_input", stage_ts, render=render_png, gray=render_gray_png, mapping=mapping_json, renderer="qcad")
 
+        mapping_data = {
+            "width_px": 2048,
+            "height_px": 2048,
+            "world_bbox": {
+                "xmin": 0.0,
+                "xmax": 1.0,
+                "ymin": 0.0,
+                "ymax": 1.0,
+            },
+            "pixel_fit": {
+                "mode": "contain",
+                "scale": 1.0,
+                "offset_x": 0.0,
+                "offset_y": 0.0,
+            },
+        }
+        import json as _json_lib
+        with open(mapping_json, "w", encoding="utf-8") as f:
+            _json_lib.dump(mapping_data, f, indent=2)
+
+        stage_done("generate_mapping", stage_ts, mapping=mapping_json)
+
+        # 3) Set status to awaiting_floor_review - frontend will handle floor plan detection
         with db() as con:
             _set_project(con, project_id,
-                         status="rendered",
+                         status="awaiting_floor_review",
                          dxf_path=dxf_path,
-                         render_png_path=render_png,
-                         mapping_json_path=mapping_json)
+                         mapping_json_path=mapping_json,
+                         error=None)
 
-        # 3) XY-cut: split master into floor-plan blocks (uses grayscale image)
-        stage_ts = time.perf_counter()
-        stage_start("split_floor_plans")
-        blocks_dir = os.path.join(pdir, "blocks")
-        blocks = split_floor_plans(
-            dxf_path=dxf_path,
-            master_png=render_gray_png,
-            master_mapping_json=mapping_json,
-            out_dir=blocks_dir,
-            block_render_px=min(opts.target_long_side_px, 3000),
-            pad_frac=opts.pad_frac,
-        )
-        stage_done("split_floor_plans", stage_ts, blocks=len(blocks))
-
-        # Delete old floor_plans for this project, insert new ones
-        with db() as con:
-            con.execute("DELETE FROM floor_plans WHERE project_id=?", (project_id,))
-            for blk in blocks:
-                fp_id = str(uuid.uuid4())
-                _insert_floor_plan(con, {
-                    "id": fp_id,
-                    "project_id": project_id,
-                    "block_index": blk["index"],
-                    "world_bbox": blk["world_bbox"],
-                    "pixel_bbox": blk["pixel_bbox"],
-                    "render_png": blk["render_png"],
-                    "mapping_json": blk["mapping_json"],
-                })
-            _set_project(con, project_id, status="split")
-
-        # Broadcast floor plan count
-        ws_manager.broadcast_sync(project_id, {
-            "type": "floor_plans",
-            "count": len(blocks),
-        })
-
-        # ── Pause for user floor plan review ──
-        with db() as con:
-            _set_project(con, project_id, status="awaiting_floor_review", error=None)
         logger.info(
-            "pipeline project=%s status=awaiting_floor_review blocks=%d total_elapsed=%.2fs",
-            project_id, len(blocks), time.perf_counter() - start_ts,
+            "pipeline project=%s status=awaiting_floor_review (frontend will detect floor plans) total_elapsed=%.2fs",
+            project_id, time.perf_counter() - start_ts,
         )
 
     except Exception as e:
@@ -758,42 +804,32 @@ def continue_pipeline_after_floor_review(project_id: str, opts: PipelineOptions)
                 _set_project(con, project_id, status="failed", error="DXF not found for floor review continue flow.")
             return
 
-        # Render each confirmed floor plan block
+        # Use frontend-uploaded floor plan images; the backend no longer renders blocks.
         with db() as con:
             fps = _get_floor_plans(con, project_id)
+
+        # Remove stale block artifacts from previous floor-plan selections.
+        _cleanup_orphan_block_artifacts(
+            project_id,
+            valid_block_indices={int(fp["block_index"]) for fp in fps},
+        )
 
         for fp in fps:
             idx = fp["block_index"]
             fp_id = fp["id"]
             wb = _json.loads(fp["world_bbox_json"]) if fp["world_bbox_json"] else None
             if not wb:
-                logger.warning("block %d has no world bbox, skipping render", idx)
+                logger.warning("block %d has no world bbox, skipping", idx)
                 continue
 
-            stage_ts = time.perf_counter()
-            stage_start(f"render_block_{idx}")
-            block_png = os.path.join(blocks_dir, f"block_{idx}.png")
-            block_color_png = os.path.join(blocks_dir, f"block_{idx}_color.png")
-            block_map_json = os.path.join(blocks_dir, f"block_{idx}_mapping.json")
-
-            _render_block(
-                dxf_path=dxf_path,
-                out_png=block_png,
-                out_json=block_map_json,
-                world_bbox=(wb["xmin"], wb["ymin"], wb["xmax"], wb["ymax"]),
-                target_long_side_px=min(opts.target_long_side_px, 3000),
-                pad_frac=opts.pad_frac,
-                out_color_png=block_color_png,
-            )
-            stage_done(f"render_block_{idx}", stage_ts)
-
-            # Use colored image for UI display if available, else fall back to grayscale
-            ui_png = block_color_png if os.path.exists(block_color_png) else block_png
+            render_path = fp["render_png_path"]
+            if not render_path or not os.path.exists(render_path):
+                logger.warning("block %d has no frontend render image, skipping", idx)
+                continue
 
             with db() as con:
                 _set_floor_plan(con, fp_id,
-                                render_png_path=ui_png,
-                                mapping_json_path=block_map_json)
+                                status="rendered")
 
         # Gemini mask generation
         if not opts.use_gemini:
@@ -803,70 +839,211 @@ def continue_pipeline_after_floor_review(project_id: str, opts: PipelineOptions)
             logger.warning("pipeline-floor-review project=%s status=ready_no_mask reason=gemini_key_missing", project_id)
             return
 
+        ok = _run_mask_and_align_for_blocks(
+            project_id=project_id,
+            opts=opts,
+            blocks_dir=blocks_dir,
+            stage_start=stage_start,
+            stage_done=stage_done,
+            log_prefix="pipeline-floor-review",
+            start_ts=start_ts,
+            resume=False,
+        )
+        if not ok:
+            # Mask failed — status set to "mask_failed" by helper. Stop here so
+            # the user can retry just the mask step instead of the full pipeline.
+            return
+
+    except Exception as e:
+        err = f"{e}\n\n{traceback.format_exc()}"
+        logger.exception("pipeline-floor-review project=%s status=failed", project_id)
         with db() as con:
-            fps = _get_floor_plans(con, project_id)
+            _set_project(con, project_id, status="failed", error=err)
 
-        for fp in fps:
-            idx = fp["block_index"]
-            fp_id = fp["id"]
-            # Use grayscale block render for Gemini mask (better for processing)
-            block_gray = os.path.join(blocks_dir, f"block_{idx}.png")
-            block_render = block_gray if os.path.exists(block_gray) else fp["render_png_path"]
 
-            stage_ts = time.perf_counter()
-            stage_start(f"gemini_mask_block_{idx}")
-            mask_png = os.path.join(blocks_dir, f"block_{idx}_mask.png")
+def _run_mask_and_align_for_blocks(
+    *,
+    project_id: str,
+    opts: PipelineOptions,
+    blocks_dir: str,
+    stage_start,
+    stage_done,
+    log_prefix: str,
+    start_ts: float,
+    resume: bool,
+) -> bool:
+    """Run Gemini mask generation + auto-alignment for each floor-plan block.
+
+    When ``resume`` is True, blocks that already have a valid mask file on disk
+    are skipped — this allows retrying after a Gemini failure without
+    re-doing successful blocks.
+
+    On Gemini failure for any block, the project status is set to
+    ``mask_failed`` (not ``failed``) so the UI can offer a targeted retry of
+    just the mask step. Returns True on success, False on mask failure.
+    """
+    with db() as con:
+        fps = _get_floor_plans(con, project_id)
+
+    # ── Mask generation ────────────────────────────────────────
+    for fp in fps:
+        idx = fp["block_index"]
+        fp_id = fp["id"]
+        block_render = fp["render_png_path"]
+        mask_png = os.path.join(blocks_dir, f"block_{idx}_mask.png")
+
+        if not block_render or not os.path.exists(block_render):
+            err = f"Missing frontend floor-plan image for block {idx}."
+            logger.error(
+                "%s project=%s stage=gemini_mask_block_%d status=failed reason=missing_frontend_render",
+                log_prefix, project_id, idx,
+            )
+            with db() as con:
+                _set_floor_plan(con, fp_id, status="mask_failed")
+                _set_project(con, project_id, status="mask_failed", error=err)
+            return False
+
+        existing_mask = fp["mask_png_path"]
+        if resume and existing_mask and os.path.exists(existing_mask):
+            logger.info(
+                "%s project=%s stage=gemini_mask_block_%d status=skipped reason=already_masked",
+                log_prefix, project_id, idx,
+            )
+            continue
+
+        stage_ts = time.perf_counter()
+        stage_start(f"gemini_mask_block_{idx}")
+        try:
             generate_mask_image(
                 input_png=block_render,
                 out_mask_png=mask_png,
                 model=opts.gemini_model,
             )
-            stage_done(f"gemini_mask_block_{idx}", stage_ts)
+        except Exception as e:
+            err = (
+                f"Gemini mask generation failed for block {idx}: {e}\n\n"
+                f"{traceback.format_exc()}"
+            )
+            logger.exception(
+                "%s project=%s stage=gemini_mask_block_%d status=mask_failed",
+                log_prefix, project_id, idx,
+            )
             with db() as con:
-                _set_floor_plan(con, fp_id, mask_png_path=mask_png, status="masked")
-
+                _set_floor_plan(con, fp_id, status="mask_failed")
+                _set_project(con, project_id, status="mask_failed", error=err)
+            return False
+        stage_done(f"gemini_mask_block_{idx}", stage_ts)
         with db() as con:
-            _set_project(con, project_id, status="masked")
+            _set_floor_plan(con, fp_id, mask_png_path=mask_png, status="masked")
 
-        # Auto-align mask for each block
+    with db() as con:
+        _set_project(con, project_id, status="masked")
+
+    # ── Auto-alignment ─────────────────────────────────────────
+    with db() as con:
+        fps = _get_floor_plans(con, project_id)
+
+    for fp in fps:
+        idx = fp["block_index"]
+        fp_id = fp["id"]
+        block_render = fp["render_png_path"]
+        block_mask = fp["mask_png_path"]
+        if not block_render or not os.path.exists(block_render):
+            continue
+        if not block_mask or not os.path.exists(block_mask):
+            continue
+
+        existing_aligned = fp["aligned_mask_path"]
+        if resume and existing_aligned and os.path.exists(existing_aligned):
+            logger.info(
+                "%s project=%s stage=align_mask_block_%d status=skipped reason=already_aligned",
+                log_prefix, project_id, idx,
+            )
+            continue
+
+        stage_ts = time.perf_counter()
+        stage_start(f"align_mask_block_{idx}")
+        aligned = os.path.join(blocks_dir, f"block_{idx}_aligned.png")
+        overlay_dbg = os.path.join(blocks_dir, f"block_{idx}_align_overlay.jpg")
+        boxes_dbg = os.path.join(blocks_dir, f"block_{idx}_align_boxes.jpg")
+        align_perfect_tight_box(block_render, block_mask, aligned,
+                                overlay_debug=overlay_dbg, boxes_debug=boxes_dbg)
+        stage_done(f"align_mask_block_{idx}", stage_ts)
         with db() as con:
-            fps = _get_floor_plans(con, project_id)
+            _set_floor_plan(con, fp_id, aligned_mask_path=aligned, status="aligned")
 
-        for fp in fps:
-            idx = fp["block_index"]
-            fp_id = fp["id"]
-            # Use grayscale block render for alignment (better for pixel matching)
-            block_gray = os.path.join(blocks_dir, f"block_{idx}.png")
-            block_render = block_gray if os.path.exists(block_gray) else fp["render_png_path"]
-            block_mask = fp["mask_png_path"]
-            if not block_mask or not os.path.exists(block_mask):
-                continue
+    with db() as con:
+        _set_project(con, project_id, status="aligned")
 
-            stage_ts = time.perf_counter()
-            stage_start(f"align_mask_block_{idx}")
-            aligned = os.path.join(blocks_dir, f"block_{idx}_aligned.png")
-            overlay_dbg = os.path.join(blocks_dir, f"block_{idx}_align_overlay.jpg")
-            boxes_dbg = os.path.join(blocks_dir, f"block_{idx}_align_boxes.jpg")
-            align_perfect_tight_box(block_render, block_mask, aligned,
-                                    overlay_debug=overlay_dbg, boxes_debug=boxes_dbg)
-            stage_done(f"align_mask_block_{idx}", stage_ts)
-            with db() as con:
-                _set_floor_plan(con, fp_id, aligned_mask_path=aligned, status="aligned")
+    # Pause for user alignment review (all blocks)
+    with db() as con:
+        _set_project(con, project_id, status="awaiting_alignment_review", error=None)
+    logger.info(
+        "%s project=%s status=awaiting_alignment_review blocks=%d total_elapsed=%.2fs",
+        log_prefix, project_id, len(fps), time.perf_counter() - start_ts,
+    )
+    return True
 
-        with db() as con:
-            _set_project(con, project_id, status="aligned")
 
-        # Pause for user alignment review (all blocks)
-        with db() as con:
-            _set_project(con, project_id, status="awaiting_alignment_review", error=None)
+def retry_mask_generation(project_id: str, opts: PipelineOptions):
+    """Background task: re-run only the Gemini mask + align step.
+
+    Intended to be triggered by the `/retry_mask_generation` endpoint after
+    a previous mask-step failure (status == ``mask_failed``). Skips blocks
+    that already have a mask, so multi-block runs only retry what failed.
+    """
+    start_ts = time.perf_counter()
+
+    def stage_start(name: str):
+        logger.info("pipeline-retry-mask project=%s stage=%s status=start", project_id, name)
+        ws_manager.broadcast_sync(project_id, {"type": "stage", "stage": name, "event": "start"})
+
+    def stage_done(name: str, stage_ts: float, **extra):
+        suffix = " ".join(f"{k}={v}" for k, v in extra.items())
+        if suffix:
+            suffix = f" {suffix}"
         logger.info(
-            "pipeline-floor-review project=%s status=awaiting_alignment_review blocks=%d total_elapsed=%.2fs",
-            project_id, len(fps), time.perf_counter() - start_ts,
+            "pipeline-retry-mask project=%s stage=%s status=done elapsed=%.2fs%s",
+            project_id, name, time.perf_counter() - stage_ts, suffix,
         )
+        ws_manager.broadcast_sync(project_id, {
+            "type": "stage", "stage": name, "event": "done",
+            "elapsed": round(time.perf_counter() - stage_ts, 2),
+        })
 
+    logger.info("pipeline-retry-mask project=%s status=start", project_id)
+    try:
+        with db() as con:
+            p = _get_project(con, project_id)
+            if not p:
+                logger.warning("pipeline-retry-mask project=%s status=aborted reason=project_not_found", project_id)
+                return
+
+        if not opts.use_gemini:
+            with db() as con:
+                _set_project(
+                    con, project_id, status="mask_failed",
+                    error="GEMINI_API_KEY not set; cannot retry mask generation.",
+                )
+            return
+
+        pdir = project_dir(project_id)
+        blocks_dir = os.path.join(pdir, "blocks")
+        os.makedirs(blocks_dir, exist_ok=True)
+
+        _run_mask_and_align_for_blocks(
+            project_id=project_id,
+            opts=opts,
+            blocks_dir=blocks_dir,
+            stage_start=stage_start,
+            stage_done=stage_done,
+            log_prefix="pipeline-retry-mask",
+            start_ts=start_ts,
+            resume=True,
+        )
     except Exception as e:
         err = f"{e}\n\n{traceback.format_exc()}"
-        logger.exception("pipeline-floor-review project=%s status=failed", project_id)
+        logger.exception("pipeline-retry-mask project=%s status=failed", project_id)
         with db() as con:
             _set_project(con, project_id, status="failed", error=err)
 

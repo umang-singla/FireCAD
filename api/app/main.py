@@ -9,7 +9,7 @@ from app.routers import projects, detectors, auth, ws, teams, activity
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-app = FastAPI(title="FireCAD API", version="0.1.0")
+app = FastAPI(title="Mepit.AI API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,

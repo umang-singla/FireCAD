@@ -1,0 +1,23 @@
+
+> build
+> next build
+
+Γû▓ Next.js 16.1.6 (Turbopack)
+
+ΓÜá The "middleware" file convention is deprecated. Please use "proxy" instead. Learn more: https://nextjs.org/docs/messages/middleware-to-proxy
+  Creating an optimized production build ...
+Γ£ô Compiled successfully in 8.0s
+  Running TypeScript ...
+Failed to compile.
+
+./app/p/[projectId]/components/FloorPlanExtractor.tsx:841:13
+Type error: Type '"xs"' is not assignable to type 'TextAlign'.
+
+  839 |             left: 14,
+  840 |             padding: "6px 10px",
+> 841 |             textAlign: "xs",
+      |             ^
+  842 |             background: "rgba(250,204,21,0.9)",
+  843 |             color: "#000",
+  844 |             borderRadius: 6,
+Next.js build worker exited with code: 1 and signal: null

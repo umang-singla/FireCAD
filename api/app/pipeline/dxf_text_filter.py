@@ -4,7 +4,7 @@ from typing import List, Tuple
 
 from shapely.geometry import Point, Polygon
 
-logger = logging.getLogger("firecad.pipeline.dxf_text_filter")
+logger = logging.getLogger("mepit.pipeline.dxf_text_filter")
 
 try:
     import ezdxf

@@ -4,7 +4,7 @@ import shutil
 import time
 import logging
 
-logger = logging.getLogger("firecad.pipeline.convert")
+logger = logging.getLogger("mepit.pipeline.convert")
 
 
 def _tail(text: str, lines: int = 20) -> str:

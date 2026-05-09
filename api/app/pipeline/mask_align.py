@@ -10,7 +10,7 @@ from .gemini_mask import (
     MARKER_SIZE,
 )
 
-logger = logging.getLogger("firecad.pipeline.mask_align")
+logger = logging.getLogger("mepit.pipeline.mask_align")
 
 def get_tight_components(image, is_mask=False):
     """Detect floor-plan components and return tight boxes sorted in stable reading order."""

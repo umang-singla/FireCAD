@@ -42,7 +42,7 @@ logger = logging.getLogger("proxy")
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="FireCAD Proxy", version="0.1.0")
+app = FastAPI(title="Mepit.AI Proxy", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
