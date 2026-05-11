@@ -20,7 +20,7 @@ OUTPUT_IMAGE = "data\\projects\\1d4d4a6e-983f-47b4-805c-8ab106455ce2\\detectors_
 
 # Scaling (assumes DXF units are mm, so 0.001 m/mm)
 WORLD_TO_M = 0.001
-DETECTOR_SPACING_M = 5
+DETECTOR_SPACING_M = 7
 
 # Wall Splitting & Geometry Sensitivity
 MIN_REGION_AREA_M2 = 2.5

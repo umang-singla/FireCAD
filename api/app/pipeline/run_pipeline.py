@@ -15,12 +15,11 @@ from app.pipeline.gemini_mask import generate_mask_image
 from app.pipeline.mask_align import align_perfect_tight_box
 from app.pipeline.wall_fix import fix_walls
 from app.pipeline.rooms_from_image import extract_rooms
-from app.pipeline.dxf_export import write_detectors_to_dxf, write_combined_sheets_dxf
+from app.pipeline.dxf_export import write_combined_sheets_dxf
 from app.pipeline.place_detectors_advanced import place_detectors_from_rooms_json
 from app.pipeline.dxf_text_filter import filter_rooms_by_dxf_text
 from app.pipeline.sprinkler_routing import (
     place_sprinklers_from_rooms_json,
-    write_sprinklers_to_dxf,
 )
 from app.pipeline.mcp_hooter_placement import place_mcp_hooter_from_rooms_payload
 from app.ws_manager import manager as ws_manager
@@ -584,10 +583,9 @@ def _run_post_room_review_steps(
                 _replace_detectors_of_types(con, project_id, all_sprinkler_dets, ["sprinkler"])
             stage_done("place_sprinklers", stage_ts, sprinklers=len(all_sprinkler_dets))
 
-    # 9) Export DXF with all detectors across all floor plans
+    # 9) Export DXF — single-pass: load once, write once
     stage_ts = time.perf_counter()
     stage_start("export_dxf")
-    out_dxf = os.path.join(pdir, "detectors_overlay.dxf")
     with db() as con:
         existing = con.execute(
             "SELECT id, x, y, z, dtype, locked, floor_plan_id FROM detectors WHERE project_id=? ORDER BY created_at ASC",
@@ -624,32 +622,19 @@ def _run_post_room_review_steps(
         with open(mapping_json, "r", encoding="utf-8") as mf:
             combined_bbox = _json.load(mf).get("world_bbox")
 
-    write_detectors_to_dxf(dxf_path, out_dxf, combined_dets,
-                           world_to_m=opts.world_to_m, world_bbox=combined_bbox)
-
-    # If sprinklers were placed, also write pipes + sources into the same DXF
-    if all_sprinkler_pipes:
-        write_sprinklers_to_dxf(
-            out_dxf, out_dxf,
-            [(d["x"], d["y"]) for d in all_sprinkler_dets],
-            all_sprinkler_pipes,
-            all_sprinkler_sources,
-            world_to_m=opts.world_to_m,
-            world_bbox=combined_bbox,
-        )
-
-    # Combined multi-sheet DXF (separate tabs for fire alarm vs sprinkler)
+    # Single-pass combined export: load DXF once, add all overlays, write once.
     out_combined = os.path.join(pdir, "detectors_combined_sheets.dxf")
     write_combined_sheets_dxf(
         base_dxf=dxf_path,
         out_combined_dxf=out_combined,
         detectors=combined_dets,
+        annotations=None,
         sprinkler_pipes=all_sprinkler_pipes,
         sprinkler_sources=[(s[0], s[1]) for s in all_sprinkler_sources] if all_sprinkler_sources else [],
         world_to_m=opts.world_to_m,
         world_bbox=combined_bbox,
     )
-    stage_done("export_dxf", stage_ts, out_dxf=out_dxf, out_combined=out_combined)
+    stage_done("export_dxf", stage_ts, out_combined=out_combined)
 
     # Set final status - no rendering needed, frontend handles DXF visualization
     with db() as con:

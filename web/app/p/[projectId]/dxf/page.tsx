@@ -44,7 +44,7 @@ type Detector = {
   floor_plan_id?: string | null;
 };
 
-type EditTool = "pan" | "select" | "add" | "erase" | "draw-pipe";
+type EditTool = "pan" | "select" | "add" | "erase" | "draw-pipe" | "measure";
 type RibbonTab = "home" | "insert" | "automation" | "view";
 
 type PointerInfo = {
@@ -114,6 +114,30 @@ const DTYPE_RADIUS_M: Record<string, number> = {
 const DEFAULT_RADIUS_M = 0.05;
 
 const PIPE_DIAMETERS_MM = [20, 25, 32, 40, 50, 65, 80, 100, 125, 150, 200, 250, 300, 350, 400] as const;
+
+/** One distinct colour per standard pipe diameter. Values chosen for high contrast. */
+const PIPE_DIAMETER_COLOR_HEX: Record<number, number> = {
+  20:  0x8B5CF6, // violet
+  25:  0xDC2626, // red
+  32:  0xD97706, // amber
+  40:  0x16A34A, // green
+  50:  0x2563EB, // blue
+  65:  0x9333EA, // purple
+  80:  0xEA580C, // orange
+  100: 0x0891B2, // cyan
+  125: 0xDB2777, // pink
+  150: 0x78716C, // stone
+  200: 0x64748B, // slate
+};
+
+function pipeDiameterColor(diameter?: string): number {
+  const mm = normalizePipeDiameter(diameter);
+  // Walk thresholds ascending and return the first matching colour.
+  for (const key of [20, 25, 32, 40, 50, 65, 80, 100, 125, 150, 200] as const) {
+    if (mm <= key) return PIPE_DIAMETER_COLOR_HEX[key];
+  }
+  return PIPE_DIAMETER_COLOR_HEX[200];
+}
 
 function normalizePipeDiameter(diameter?: string) {
   const raw = (diameter || "25mm").toLowerCase().trim();
@@ -208,6 +232,9 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   const [pipeDrawStart, setPipeDrawStart] = useState<{ x: number; y: number } | null>(null);
   const [pipeDrawPreview, setPipeDrawPreview] = useState<{ x: number; y: number } | null>(null);
   const [manualPipes, setManualPipes] = useState<{ from: [number, number]; to: [number, number]; diameter: string }[]>([]);
+  const [measureStart, setMeasureStart] = useState<{ x: number; y: number } | null>(null);
+  const [measureEnd, setMeasureEnd] = useState<{ x: number; y: number } | null>(null);
+  const [measurePreview, setMeasurePreview] = useState<{ x: number; y: number } | null>(null);
   // Selected pipe (kind: "auto" → backend-routed, "manual" → drawn locally)
   const [selectedPipe, setSelectedPipe] = useState<{ kind: "auto" | "manual"; index: number } | null>(null);
   // Tracks whether the user has edited (deleted/resized) auto-routed pipes since last save.
@@ -810,7 +837,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     clearPipeMarkers();
     const hasSelectionOverlay = sourceSelectMode && (detectedSources.length > 0 || !!chosenSource);
     const hasManualPipes = manualPipes.length > 0 || !!pipeDrawStart;
-    if ((!pipesData || !showPipes) && !hasSelectionOverlay && !hasManualPipes) return;
+    const hasMeasureOverlay = !!measureStart && !!(measureEnd || measurePreview);
+    if ((!pipesData || !showPipes) && !hasSelectionOverlay && !hasManualPipes && !hasMeasureOverlay) return;
 
     const origin = viewer.GetOrigin?.() || { x: 0, y: 0 };
     const scene = viewer.GetScene?.();
@@ -858,7 +886,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       const mesh = new three.Mesh(
         geom,
         new three.MeshBasicMaterial({
-          color: new three.Color(0xDC2626), // solid red
+          color: new three.Color(pipeDiameterColor(diameter)),
           transparent: false,
           opacity: 1,
           depthTest: false,
@@ -1144,13 +1172,59 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
         1006,
       );
       if (previewMesh) {
-        // Slightly lighter red for preview to distinguish from committed pipes.
-        (previewMesh.material as any).color = new three.Color(0xF87171);
+        // Slightly transparent version of the diameter colour for the preview.
         (previewMesh.material as any).transparent = true;
-        (previewMesh.material as any).opacity = 0.75;
+        (previewMesh.material as any).opacity = 0.65;
         group.add(previewMesh);
       }
 
+
+    // Draw measure line and endpoint handles.
+    if (measureStart && (measureEnd || measurePreview)) {
+      const end = measureEnd || measurePreview;
+      if (end) {
+        const sx = measureStart.x - origin.x;
+        const sy = measureStart.y - origin.y;
+        const ex = end.x - origin.x;
+        const ey = end.y - origin.y;
+
+        const lineGeom = new three.BufferGeometry().setFromPoints([
+          new three.Vector3(sx, sy, 0.95),
+          new three.Vector3(ex, ey, 0.95),
+        ]);
+        const line = new three.Line(
+          lineGeom,
+          new three.LineBasicMaterial({
+            color: new three.Color(0x22D3EE),
+            transparent: true,
+            opacity: 0.95,
+            depthTest: false,
+            depthWrite: false,
+          }),
+        );
+        line.renderOrder = 1200;
+        group.add(line);
+
+        const markerR = 3.2;
+        const mkMat = new three.MeshBasicMaterial({
+          color: new three.Color(0x67E8F9),
+          transparent: true,
+          opacity: 0.95,
+          depthTest: false,
+          depthWrite: false,
+          side: three.DoubleSide,
+        });
+        const startMk = new three.Mesh(new three.CircleGeometry(markerR, 20), mkMat);
+        startMk.position.set(sx, sy, 0.96);
+        startMk.renderOrder = 1201;
+        group.add(startMk);
+
+        const endMk = new three.Mesh(new three.CircleGeometry(markerR, 20), mkMat.clone());
+        endMk.position.set(ex, ey, 0.96);
+        endMk.renderOrder = 1201;
+        group.add(endMk);
+      }
+    }
       // Dot at start anchor
       const anchorDot = new three.Mesh(
         new three.CircleGeometry(dotR * 0.5, 16),
@@ -1585,7 +1659,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   useEffect(() => {
     renderDetectors();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detectors, dxfUrl, worldToM, selectedDetectorId, selectedDetectorIds, pipesData, showPipes, sourceSelectMode, detectedSources, chosenSource, manualPipes, pipeDrawStart, pipeDrawPreview, equipmentLayerVisibility, selectedPipe]);
+  }, [detectors, dxfUrl, worldToM, selectedDetectorId, selectedDetectorIds, pipesData, showPipes, sourceSelectMode, detectedSources, chosenSource, manualPipes, pipeDrawStart, pipeDrawPreview, equipmentLayerVisibility, selectedPipe, measureStart, measureEnd, measurePreview]);
 
   function worldPointFromPointer(pointer: PointerInfo): { x: number; y: number } | null {
     const viewer = viewerRef.current;
@@ -1668,6 +1742,56 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       }
     }
     return bestDist2 <= 22 * 22 ? best : null;
+  }
+
+  function nearestMeasureAnchor(pointer: PointerInfo): { x: number; y: number } | null {
+    const anchors: Array<{ x: number; y: number }> = [];
+
+    const visibleDetectors = selectedFloorId
+      ? detectors.filter((d) => d.floor_plan_id === selectedFloorId)
+      : detectors;
+    for (const d of visibleDetectors) anchors.push({ x: d.x, y: d.y });
+
+    if (pipesData?.pipes) {
+      for (const p of pipesData.pipes) {
+        anchors.push({ x: p.from[0], y: p.from[1] });
+        anchors.push({ x: p.to[0], y: p.to[1] });
+      }
+    }
+    for (const p of manualPipes) {
+      anchors.push({ x: p.from[0], y: p.from[1] });
+      anchors.push({ x: p.to[0], y: p.to[1] });
+    }
+    if (pipesData?.sources) {
+      for (const s of pipesData.sources) anchors.push({ x: s.x, y: s.y });
+    }
+    for (const s of detectedSources) anchors.push({ x: s.x, y: s.y });
+    if (chosenSource) anchors.push({ x: chosenSource.x, y: chosenSource.y });
+
+    let best: { x: number; y: number } | null = null;
+    let bestDist2 = Number.POSITIVE_INFINITY;
+    for (const a of anchors) {
+      const p = screenPointForWorld(a.x, a.y, 0.8);
+      if (!p) continue;
+      const dx = p.x - pointer.clientX;
+      const dy = p.y - pointer.clientY;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestDist2) {
+        bestDist2 = d2;
+        best = a;
+      }
+    }
+    return bestDist2 <= 14 * 14 ? best : null;
+  }
+
+  function getMeasureDistanceMeters(
+    a: { x: number; y: number } | null,
+    b: { x: number; y: number } | null,
+  ): number | null {
+    if (!a || !b) return null;
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return Math.hypot(dx, dy) * worldToM;
   }
 
   function nearestDetectorId(pointer: PointerInfo): string | null {
@@ -2451,6 +2575,63 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     };
   }, [tool, pipeDrawStart, pipeDrawDiameter, canEdit]);
 
+  // Measure distance between any two points (with snapping to nearby elements).
+  useEffect(() => {
+    if (tool !== "measure") return;
+    const el = containerRef.current;
+    if (!el) return;
+
+    const pickPoint = (evt: PointerEvent): { x: number; y: number } | null => {
+      const pointer = { clientX: evt.clientX, clientY: evt.clientY };
+      const snapped = nearestMeasureAnchor(pointer);
+      if (snapped) return snapped;
+      return worldPointFromPointer(pointer);
+    };
+
+    const onPointerDown = (evt: PointerEvent) => {
+      const tgt = evt.target as Element | null;
+      if (tgt && tgt.closest && tgt.closest("[data-ui-overlay]")) return;
+      evt.preventDefault();
+      evt.stopPropagation();
+      const point = pickPoint(evt);
+      if (!point) return;
+
+      if (!measureStart || measureEnd) {
+        setMeasureStart(point);
+        setMeasureEnd(null);
+        setMeasurePreview(point);
+      } else {
+        setMeasureEnd(point);
+        setMeasurePreview(null);
+      }
+    };
+
+    const onPointerMove = (evt: PointerEvent) => {
+      if (!measureStart || measureEnd) return;
+      const point = pickPoint(evt);
+      if (point) setMeasurePreview(point);
+    };
+
+    const onKeyDown = (evt: KeyboardEvent) => {
+      if (evt.key === "Escape") {
+        setMeasureStart(null);
+        setMeasureEnd(null);
+        setMeasurePreview(null);
+      }
+    };
+
+    el.addEventListener("pointerdown", onPointerDown, true);
+    el.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      el.removeEventListener("pointerdown", onPointerDown, true);
+      el.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [tool, measureStart, measureEnd, detectors, manualPipes, pipesData, chosenSource, detectedSources, selectedFloorId]);
+
+  const measureDistanceM = getMeasureDistanceMeters(measureStart, measureEnd || measurePreview);
+
   return (
     <main
       style={{
@@ -2496,6 +2677,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
           </div>
           <div style={{ fontSize: 12, color: "#a6adc8" }}>
             {canEdit ? `Mode: ${tool.toUpperCase()}` : "View only"}
+            {measureDistanceM != null ? ` • Measure: ${measureDistanceM.toFixed(3)} m` : ""}
           </div>
         </div>
 
@@ -2526,6 +2708,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                     <button onClick={() => setTool("select")} style={{ ...btnStyle, background: tool === "select" ? "#585b70" : btnStyle.background }}>Select</button>
                     <button onClick={() => setTool("add")} style={{ ...btnStyle, background: tool === "add" ? "#585b70" : btnStyle.background }}>Add</button>
                     <button onClick={() => setTool("erase")} style={{ ...btnStyle, background: tool === "erase" ? "#585b70" : btnStyle.background }}>Erase</button>
+                    <button onClick={() => setTool("measure")} style={{ ...btnStyle, background: tool === "measure" ? "#585b70" : btnStyle.background }}>Measure</button>
                     <button
                       onClick={saveManualEdits}
                       disabled={!hasManualChanges || isSavingEdits}
@@ -2731,6 +2914,48 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                   </div>
                 </div>
               ) : null}
+
+              <div style={ribbonGroupStyle}>
+                <div style={ribbonGroupTitleStyle}>Measure</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 260 }}>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    <button
+                      onClick={() => setTool("measure")}
+                      style={{
+                        ...btnStyle,
+                        background: tool === "measure" ? "#0891b2" : btnStyle.background,
+                        borderColor: tool === "measure" ? "#0e7490" : "#45475a",
+                        color: tool === "measure" ? "#ecfeff" : btnStyle.color,
+                      }}
+                    >
+                      📏 Measure Distance
+                    </button>
+                    <button
+                      onClick={() => {
+                        setMeasureStart(null);
+                        setMeasureEnd(null);
+                        setMeasurePreview(null);
+                      }}
+                      style={btnStyle}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 11, color: "#a6adc8", lineHeight: 1.4 }}>
+                    {tool === "measure"
+                      ? (measureStart
+                        ? (measureEnd ? "Click again to start a new measurement. Esc clears."
+                          : "Click second point to finish. Snaps to nearby detectors/pipes/sources.")
+                        : "Click first point to start measuring.")
+                      : "Activate Measure, then click any two points."}
+                  </div>
+                  {measureDistanceM != null ? (
+                    <div style={{ fontSize: 12, color: "#67e8f9", fontWeight: 600 }}>
+                      Distance: {measureDistanceM.toFixed(3)} m
+                    </div>
+                  ) : null}
+                </div>
+              </div>
             </>
           ) : null}
 
@@ -2925,6 +3150,12 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                   ? (pipeDrawStart
                     ? `Drawing ${pipeDrawDiameter}mm pipe — click to set end. Click again to chain. Esc to stop.`
                     : `Draw ${pipeDrawDiameter}mm pipe — click to set start point.`)
+                  : tool === "measure"
+                    ? (measureStart
+                      ? (measureEnd
+                        ? `Measured ${measureDistanceM?.toFixed(3) ?? "0.000"} m. Click to start another measurement.`
+                        : "Measure mode: click second point. Snaps to nearby detectors/pipes/sources. Esc clears.")
+                      : "Measure mode: click first point.")
                   : "Select mode: click to select, Ctrl/Shift+click for multi-select, drag box to select many, drag selected to move."}
           </div>
         ) : null}

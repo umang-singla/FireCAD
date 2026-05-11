@@ -438,6 +438,29 @@ def _add_annotations_to_dxf(msp, annotations: list[dict], layer: str = DXF_LAYER
             continue
 
 
+# Per-diameter colours (RGB) — mirrors PIPE_DIAMETER_COLORS_RGB in sprinkler_routing.
+_PIPE_DIAMETER_COLORS_RGB: dict[int, tuple[int, int, int]] = {
+    20:  (139, 92, 246),
+    25:  (220, 38, 38),
+    32:  (217, 119, 6),
+    40:  (22, 163, 74),
+    50:  (37, 99, 235),
+    65:  (147, 51, 234),
+    80:  (234, 88, 12),
+    100: (8, 145, 178),
+    125: (219, 39, 119),
+    150: (120, 113, 108),
+    200: (100, 116, 139),
+}
+
+
+def _color_for_pipe_diam(d_mm: int) -> tuple[int, int, int]:
+    for t in sorted(_PIPE_DIAMETER_COLORS_RGB):
+        if d_mm <= t:
+            return _PIPE_DIAMETER_COLORS_RGB[t]
+    return _PIPE_DIAMETER_COLORS_RGB[200]
+
+
 def _legend_dtypes(detectors: list[dict]):
     # Keep mandatory fire-system rows visible even if no explicit detector of that type exists.
     order = ["smoke", "sprinkler", "sprinkler_pipe", "panel", "mcb", "hooter", "fire_hose", "internal_hydrant"]
@@ -471,8 +494,10 @@ def _add_legend_table(
     symbol_radius_world: float,
     text_height_world: float,
     world_bbox: dict | None = None,
+    pipe_diameters: list[int] | None = None,
 ):
     legend_rows = _legend_dtypes(detectors)
+    pipe_diam_rows: list[int] = sorted(set(pipe_diameters)) if pipe_diameters else []
 
     xs = [float(d["x"]) for d in detectors if "x" in d]
     ys = [float(d["y"]) for d in detectors if "y" in d]
@@ -497,7 +522,7 @@ def _add_legend_table(
     col_symbol_w = max(symbol_radius_world * 5.0, text_height_world * 6.5)
     col_desc_w = max(symbol_radius_world * 14.0, text_height_world * 20.0)
 
-    total_rows = 2 + len(legend_rows)
+    total_rows = 2 + len(legend_rows) + len(pipe_diam_rows)
     table_w = col_symbol_w + col_desc_w
     table_h = title_h + row_h * (total_rows - 1)
 
@@ -559,7 +584,7 @@ def _add_legend_table(
     h2 = msp.add_text("Description", dxfattribs=text_attr)
     h2.set_placement((split_x + text_height_world * 1.8, header_y), align=TextEntityAlignment.MIDDLE_LEFT)
 
-    # Data rows
+    # Data rows — device types
     symbol_r = min(symbol_radius_world * 0.85, row_h * 0.35)
     for i, dtype in enumerate(legend_rows):
         cy = top - title_h - row_h * (1.5 + i)
@@ -570,32 +595,38 @@ def _add_legend_table(
         row_text = msp.add_text(label, dxfattribs=text_attr)
         row_text.set_placement((split_x + text_height_world * 0.8, cy), align=TextEntityAlignment.MIDDLE_LEFT)
 
-def write_detectors_to_dxf(
-    base_dxf: str,
-    out_dxf: str,
+    # Data rows — pipe diameters (coloured horizontal line symbol)
+    base_i = len(legend_rows)
+    for j, d_mm in enumerate(pipe_diam_rows):
+        cy = top - title_h - row_h * (1.5 + base_i + j)
+        cx = left + col_symbol_w * 0.5
+        r, g, b = _color_for_pipe_diam(d_mm)
+        tc = (r << 16) | (g << 8) | b
+        seg_half = symbol_r * 1.2
+        seg = msp.add_line(
+            (cx - seg_half, cy),
+            (cx + seg_half, cy),
+            dxfattribs={"layer": DXF_LAYER_LEGEND, "lineweight": 50},
+        )
+        seg.dxf.true_color = tc
+        diam_label = f"\u00d8{d_mm}mm Pipe"
+        row_text = msp.add_text(diam_label, dxfattribs=text_attr)
+        row_text.set_placement((split_x + text_height_world * 0.8, cy), align=TextEntityAlignment.MIDDLE_LEFT)
+
+def _populate_doc_with_overlays(
+    doc,
     detectors: list[dict],
-    annotations: list[dict] | None = None,
-    world_to_m: float = 0.001,
-    world_bbox: dict | None = None,
-    symbol_radius_world: float | None = None,
-    text_height_world: float | None = None,
-):
-    """Export detector/sprinkler symbols into a DXF.
-
-    Symbol sizes are derived from the content bounding box so they stay
-    proportional.  Pass *world_bbox* (from floor-plan or mapping.json) to
-    avoid relying on detector spread alone.
+    annotations: list[dict] | None,
+    world_to_m: float,
+    world_bbox: dict | None,
+    symbol_radius_world: float,
+    text_height_world: float,
+    pipe_diameters: list[int] | None,
+) -> None:
+    """Write all detector symbols, annotations and legend into an already-open ezdxf document.
+    Does NOT save to disk — caller is responsible for doc.saveas().
     """
-    doc = ezdxf.readfile(base_dxf)
     msp = doc.modelspace()
-
-    # ── resolve sizes ──
-    if symbol_radius_world is None or text_height_world is None:
-        auto_r, auto_t = compute_symbol_sizes(world_to_m, detectors, world_bbox)
-        if symbol_radius_world is None:
-            symbol_radius_world = auto_r
-        if text_height_world is None:
-            text_height_world = auto_t
 
     for layer_name in [*LAYER_BY_DTYPE.values(), DXF_LAYER_LEGEND, DXF_LAYER_PIPES, DXF_LAYER_SOURCE, DXF_LAYER_ANNOTATIONS]:
         if layer_name not in doc.layers:
@@ -614,8 +645,35 @@ def write_detectors_to_dxf(
         symbol_radius_world=symbol_radius_world,
         text_height_world=text_height_world,
         world_bbox=world_bbox,
+        pipe_diameters=pipe_diameters,
     )
 
+
+def write_detectors_to_dxf(
+    base_dxf: str,
+    out_dxf: str,
+    detectors: list[dict],
+    annotations: list[dict] | None = None,
+    world_to_m: float = 0.001,
+    world_bbox: dict | None = None,
+    symbol_radius_world: float | None = None,
+    text_height_world: float | None = None,
+    pipe_diameters: list[int] | None = None,
+):
+    """Load *base_dxf*, add detector overlays in-memory, save to *out_dxf* (single read + write)."""
+    doc = ezdxf.readfile(base_dxf)
+
+    if symbol_radius_world is None or text_height_world is None:
+        auto_r, auto_t = compute_symbol_sizes(world_to_m, detectors, world_bbox)
+        if symbol_radius_world is None:
+            symbol_radius_world = auto_r
+        if text_height_world is None:
+            text_height_world = auto_t
+
+    _populate_doc_with_overlays(
+        doc, detectors, annotations, world_to_m, world_bbox,
+        symbol_radius_world, text_height_world, pipe_diameters,
+    )
     doc.saveas(out_dxf)
 
 
@@ -782,7 +840,7 @@ def write_combined_sheets_dxf(
 
     Changes to Model are automatically reflected in all layout viewports.
     """
-    import os, shutil, tempfile
+    import os
 
     sprinkler_pipes = sprinkler_pipes or []
     sprinkler_sources = sprinkler_sources or []
@@ -798,91 +856,93 @@ def write_combined_sheets_dxf(
                 return candidate
             i += 1
 
-    # ── Build a single DXF with everything in modelspace ──
-    tmpdir = tempfile.mkdtemp(prefix="mepit_combined_")
-    try:
-        tmp_dxf = os.path.join(tmpdir, "all_overlay.dxf")
-        shutil.copy2(base_dxf, tmp_dxf)
+    # ── Load DXF once and add all overlays in-memory ──
+    doc = _read_dxf_safe(base_dxf)
 
-        # Add all detector symbols (smoke, panel, hooter, mcp, sprinkler)
-        sym_r, txt_h = compute_symbol_sizes(world_to_m, detectors, world_bbox)
-        write_detectors_to_dxf(
-            tmp_dxf, tmp_dxf, detectors,
-            annotations=annotations,
+    # Compute symbol sizes up front (shared by detector + sprinkler overlays).
+    sym_r, txt_h = compute_symbol_sizes(world_to_m, detectors, world_bbox)
+
+    # Collect unique pipe diameters for the legend.
+    def _diam_mm_int(label: str) -> int:
+        s = str(label or "").strip().lower().replace(" ", "").replace("mm", "")
+        try:
+            return max(1, int(float(s)))
+        except Exception:
+            return 25
+    _pipe_diams: list[int] = sorted(set(_diam_mm_int(lbl) for _, lbl in sprinkler_pipes)) if sprinkler_pipes else []
+
+    # Add detector symbols, annotations and legend.
+    _populate_doc_with_overlays(
+        doc, detectors, annotations, world_to_m, world_bbox,
+        sym_r, txt_h, _pipe_diams or None,
+    )
+
+    # Add sprinkler pipes + sources (in-memory, no extra file I/O).
+    sprinkler_dets = [d for d in detectors
+                      if _normalize_dtype(d.get("dtype", "smoke")) == "sprinkler"]
+    if sprinkler_dets or sprinkler_pipes:
+        from app.pipeline.sprinkler_routing import _add_sprinklers_to_doc
+        _add_sprinklers_to_doc(
+            doc,
+            [(float(d["x"]), float(d["y"])) for d in sprinkler_dets],
+            sprinkler_pipes, sprinkler_sources,
             world_to_m=world_to_m, world_bbox=world_bbox,
             symbol_radius_world=sym_r, text_height_world=txt_h,
         )
 
-        # Add sprinkler pipes + sources
-        sprinkler_dets = [d for d in detectors
-                          if _normalize_dtype(d.get("dtype", "smoke")) == "sprinkler"]
-        if sprinkler_dets or sprinkler_pipes:
-            from app.pipeline.sprinkler_routing import write_sprinklers_to_dxf
-            write_sprinklers_to_dxf(
-                tmp_dxf, tmp_dxf,
-                [(float(d["x"]), float(d["y"])) for d in sprinkler_dets],
-                sprinkler_pipes, sprinkler_sources,
-                world_to_m=world_to_m, world_bbox=world_bbox,
-                symbol_radius_world=sym_r, text_height_world=txt_h,
+    extents = _modelspace_extents(doc)
+
+    # Ensure border/title layers
+    for lyr in [_LAYER_BORDER, _LAYER_TITLE]:
+        if lyr not in doc.layers:
+            doc.layers.new(lyr, dxfattribs={"color": 7})
+
+    # Create 3 layout tabs (Layout1 stays as-is). If a name already exists,
+    # suffix with _2, _3, ... instead of failing the export.
+    layout_original_name = _next_layout_name(doc, _LAYOUT_ORIGINAL)
+    psp_original = doc.layouts.new(layout_original_name)
+    layout_fire_name = _next_layout_name(doc, _LAYOUT_FIRE)
+    psp_fire = doc.layouts.new(layout_fire_name)
+    layout_sprinkler_name = _next_layout_name(doc, _LAYOUT_SPRINKLER)
+    psp_sprinkler = doc.layouts.new(layout_sprinkler_name)
+
+    # Page setup
+    for psp in [psp_original, psp_fire, psp_sprinkler]:
+        try:
+            psp.page_setup(
+                size=(_PAGE_W, _PAGE_H), margins=(0, 0, 0, 0), units="mm",
             )
-
-        # ── Open the fully-populated DXF and add layout tabs ──
-        doc = _read_dxf_safe(tmp_dxf)
-        extents = _modelspace_extents(doc)
-
-        # Ensure border/title layers
-        for lyr in [_LAYER_BORDER, _LAYER_TITLE]:
-            if lyr not in doc.layers:
-                doc.layers.new(lyr, dxfattribs={"color": 7})
-
-        # Create 3 layout tabs (Layout1 stays as-is). If a name already exists,
-        # suffix with _2, _3, ... instead of failing the export.
-        layout_original_name = _next_layout_name(doc, _LAYOUT_ORIGINAL)
-        psp_original = doc.layouts.new(layout_original_name)
-        layout_fire_name = _next_layout_name(doc, _LAYOUT_FIRE)
-        psp_fire = doc.layouts.new(layout_fire_name)
-        layout_sprinkler_name = _next_layout_name(doc, _LAYOUT_SPRINKLER)
-        psp_sprinkler = doc.layouts.new(layout_sprinkler_name)
-
-        # Page setup
-        for psp in [psp_original, psp_fire, psp_sprinkler]:
-            try:
-                psp.page_setup(
-                    size=(_PAGE_W, _PAGE_H), margins=(0, 0, 0, 0), units="mm",
-                )
-            except Exception:
-                pass
-
-        # ── Populate each sheet ──
-        sheets = [
-            (psp_original, "ORIGINAL FLOOR PLAN",
-             os.path.basename(base_dxf), _ALL_AI_LAYERS),
-            (psp_fire, "FIRE ALARM PLAN",
-             "Smoke Detectors, MCP, Hooter, FACP", _SPRINKLER_LAYERS),
-            (psp_sprinkler, "SPRINKLER PLAN",
-             "Sprinklers, Pipes & Sources", _FIRE_LAYERS),
-        ]
-
-        for psp, title, subtitle, freeze_layers in sheets:
-            _add_sheet_frame(psp, title, subtitle)
-            _add_viewport_with_frozen_layers(psp, doc, extents, freeze_layers)
-
-        # Make first layout active on open
-        try:
-            doc.layouts.set_active_layout(layout_original_name)
-        except Exception:
-            pass
-        try:
-            doc.header["$CTAB"] = layout_original_name
-            doc.header["$TILEMODE"] = 0
         except Exception:
             pass
 
-        doc.saveas(out_combined_dxf)
+    # ── Populate each sheet ──
+    sheets = [
+        (psp_original, "ORIGINAL FLOOR PLAN",
+         os.path.basename(base_dxf), _ALL_AI_LAYERS),
+        (psp_fire, "FIRE ALARM PLAN",
+         "Smoke Detectors, MCP, Hooter, FACP", _SPRINKLER_LAYERS),
+        (psp_sprinkler, "SPRINKLER PLAN",
+         "Sprinklers, Pipes & Sources", _FIRE_LAYERS),
+    ]
 
-        logger.info(
-            "write_combined_sheets_dxf saved=%s layouts=%s extents=%s",
-            out_combined_dxf, doc.layout_names(), extents,
-        )
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    for psp, title, subtitle, freeze_layers in sheets:
+        _add_sheet_frame(psp, title, subtitle)
+        _add_viewport_with_frozen_layers(psp, doc, extents, freeze_layers)
+
+    # Make first layout active on open
+    try:
+        doc.layouts.set_active_layout(layout_original_name)
+    except Exception:
+        pass
+    try:
+        doc.header["$CTAB"] = layout_original_name
+        doc.header["$TILEMODE"] = 0
+    except Exception:
+        pass
+
+    doc.saveas(out_combined_dxf)
+
+    logger.info(
+        "write_combined_sheets_dxf saved=%s layouts=%s extents=%s",
+        out_combined_dxf, doc.layout_names(), extents,
+    )
