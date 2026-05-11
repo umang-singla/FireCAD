@@ -146,6 +146,29 @@ DXF_LAYER_SOURCE = "AI_FIRE_SOURCE"
 # Labels used to detect pipe source locations inside the DXF
 SOURCE_LABELS = ["FHC", "PL-Service Water", "PL_Waste Pipe", "Sprinkler"]
 
+# Per-diameter colours (RGB) — must mirror PIPE_DIAMETER_COLOR_HEX in the frontend.
+PIPE_DIAMETER_COLORS_RGB: dict[int, tuple[int, int, int]] = {
+    20:  (139, 92, 246),   # violet
+    25:  (220, 38, 38),    # red
+    32:  (217, 119, 6),    # amber
+    40:  (22, 163, 74),    # green
+    50:  (37, 99, 235),    # blue
+    65:  (147, 51, 234),   # purple
+    80:  (234, 88, 12),    # orange
+    100: (8, 145, 178),    # cyan
+    125: (219, 39, 119),   # pink
+    150: (120, 113, 108),  # stone
+    200: (100, 116, 139),  # slate
+}
+
+
+def _color_for_pipe_diameter(d_mm: float) -> tuple[int, int, int]:
+    """Return the RGB colour tuple for the given pipe diameter (mm)."""
+    for threshold in sorted(PIPE_DIAMETER_COLORS_RGB):
+        if d_mm <= threshold:
+            return PIPE_DIAMETER_COLORS_RGB[threshold]
+    return PIPE_DIAMETER_COLORS_RGB[200]
+
 
 def _set_runtime_config(
     spacing_m: float,
@@ -715,46 +738,39 @@ def _get_grid_points(poly: Polygon, hazard_type: str = HAZARD_LH):
     if width < (1.0 / WORLD_TO_M) or height < (1.0 / WORLD_TO_M):
         return []
 
-    max_spacing_world = min(SPRINKLER_SPACING_M, params["max_spacing"]) / WORLD_TO_M
-    min_spacing_world = params["min_spacing"] / WORLD_TO_M
-    max_area_world = params["max_area"] / (WORLD_TO_M ** 2)
+    # Enforce user-configured spacing (default 3m) as the grid step.
+    # We intentionally do not tighten by max-area here, because that can
+    # force spacing below 3m. For this mode, 3m spacing takes precedence.
+    target_spacing_world = SPRINKLER_SPACING_M / WORLD_TO_M
     max_wall_world = params["max_wall"] / WORLD_TO_M
 
-    nx_pts = max(1, math.ceil(width / max_spacing_world))
-    ny_pts = max(1, math.ceil(height / max_spacing_world))
+    def _grid_1d(dim: float, spacing: float, wall: float) -> tuple[int, float, float]:
+        """Return (n, step, start_offset) for a 1-D sprinkler grid.
 
-    # Respect max coverage area per sprinkler.
-    while (width / nx_pts) * (height / ny_pts) > max_area_world:
-        if (width / nx_pts) > (height / ny_pts):
-            nx_pts += 1
-        else:
-            ny_pts += 1
+        Places sprinklers at exactly *spacing* apart.  The start offset is
+        chosen so that the distance from each wall to the nearest sprinkler
+        is <= *wall*.  Minimum n formula:
+            n = 1 + ceil(max(0, dim - 2*wall) / spacing)
+        which guarantees the centred offset fits within *wall*.
+        """
+        if dim <= 0:
+            return 1, 0.0, 0.0
+        n = max(1, math.ceil(max(0.0, dim - 2.0 * wall) / spacing) + 1)
+        offset = (dim - (n - 1) * spacing) / 2.0
+        if offset < 0:
+            # spacing > dim: single centred sprinkler
+            return 1, 0.0, dim / 2.0
+        step = spacing if n > 1 else 0.0
+        return n, step, offset
 
-    step_x, step_y = width / nx_pts, height / ny_pts
-
-    # Respect wall distance constraints.
-    while (step_x / 2.0) > max_wall_world:
-        nx_pts += 1
-        step_x = width / nx_pts
-    while (step_y / 2.0) > max_wall_world:
-        ny_pts += 1
-        step_y = height / ny_pts
-
-    # Enforce minimum spacing: reduce grid count so step never < 1.8 m.
-    max_nx = max(1, int(width / min_spacing_world))
-    max_ny = max(1, int(height / min_spacing_world))
-    if nx_pts > max_nx:
-        nx_pts = max_nx
-        step_x = width / nx_pts
-    if ny_pts > max_ny:
-        ny_pts = max_ny
-        step_y = height / ny_pts
+    nx_pts, step_x, start_x = _grid_1d(width, target_spacing_world, max_wall_world)
+    ny_pts, step_y, start_y = _grid_1d(height, target_spacing_world, max_wall_world)
 
     points = []
     for i in range(nx_pts):
         for j in range(ny_pts):
-            lx = minx + i * step_x + step_x / 2
-            ly = miny + j * step_y + step_y / 2
+            lx = minx + start_x + i * step_x
+            ly = miny + start_y + j * step_y
             p = Point(lx, ly)
             if rot_poly.contains(p):
                 world_p = rotate(p, angle_deg, origin=(cx, cy))
@@ -1364,9 +1380,9 @@ def align_to_global_lines(
 # ──────────────────────────────────────────────────────────────────
 # DXF export for sprinklers + pipes
 # ──────────────────────────────────────────────────────────────────
-def write_sprinklers_to_dxf(
-    base_dxf: str,
-    out_dxf: str,
+
+def _add_sprinklers_to_doc(
+    doc,
     sprinklers: List[Tuple[float, float]],
     pipes: list,
     sources: List[Tuple[float, float]],
@@ -1375,15 +1391,15 @@ def write_sprinklers_to_dxf(
     symbol_radius_world: float | None = None,
     text_height_world: float | None = None,
 ):
-    """Write sprinkler symbols, sized pipe segments, and source markers into a DXF."""
+    """Add sprinkler symbols, coloured pipe bands, and source markers to an already-open ezdxf document.
+    Does NOT save to disk — caller is responsible for doc.saveas().
+    """
     if not _EZDXF_OK:
-        logger.warning("ezdxf not available, skipping DXF export")
         return
 
     from app.pipeline.dxf_export import compute_symbol_sizes
 
     if symbol_radius_world is None or text_height_world is None:
-        # build lightweight detector list for bbox calculation
         sp_dets = [{"x": x, "y": y} for x, y in sprinklers] if sprinklers else []
         auto_r, auto_t = compute_symbol_sizes(world_to_m, sp_dets, world_bbox)
         if symbol_radius_world is None:
@@ -1391,7 +1407,6 @@ def write_sprinklers_to_dxf(
         if text_height_world is None:
             text_height_world = auto_t
 
-    doc = ezdxf.readfile(base_dxf)
     msp = doc.modelspace()
 
     for layer_name in [DXF_LAYER_SPRINKLER, DXF_LAYER_PIPES, DXF_LAYER_SOURCE]:
@@ -1408,94 +1423,50 @@ def write_sprinklers_to_dxf(
             return 25.0
 
     def _lineweight_for_diameter_mm(d_mm: float) -> int:
-        # DXF lineweight values are in 1/100 mm. Keep values from the
-        # common supported set so CAD viewers display them consistently.
-        if d_mm <= 25:
-            return 25
-        if d_mm <= 32:
-            return 35
-        if d_mm <= 40:
-            return 50
-        if d_mm <= 50:
-            return 70
-        if d_mm <= 65:
-            return 90
-        if d_mm <= 80:
-            return 106
-        if d_mm <= 100:
-            return 140
-        if d_mm <= 150:
-            return 200
+        if d_mm <= 25:  return 25
+        if d_mm <= 32:  return 35
+        if d_mm <= 40:  return 50
+        if d_mm <= 50:  return 70
+        if d_mm <= 65:  return 90
+        if d_mm <= 80:  return 106
+        if d_mm <= 100: return 140
+        if d_mm <= 150: return 200
         return 211
 
-    def _pipe_width_world_from_diameter_mm(d_mm: float) -> float:
-        # Diameter mm -> meters -> drawing units.
+    def _pipe_width_world(d_mm: float) -> float:
         w = (max(1.0, d_mm) / 1000.0) / max(1e-9, world_to_m)
-        # Keep a minimum visible width in drawings with large world units.
         return max(w, 0.008 / max(1e-9, world_to_m))
 
-    def _add_pipe_band(pt1: tuple[float, float], pt2: tuple[float, float], width_world: float):
+    def _add_pipe_band(pt1, pt2, width_world: float, rgb: tuple[int, int, int]):
         x1, y1 = float(pt1[0]), float(pt1[1])
         x2, y2 = float(pt2[0]), float(pt2[1])
-        dx = x2 - x1
-        dy = y2 - y1
-        seg_len = math.hypot(dx, dy)
+        seg_len = math.hypot(x2 - x1, y2 - y1)
         if seg_len <= 1e-9:
             return
-
         half_w = width_world * 0.5
-        nx = -dy / seg_len * half_w
-        ny = dx / seg_len * half_w
+        nx_ = -(y2 - y1) / seg_len * half_w
+        ny_ =  (x2 - x1) / seg_len * half_w
+        p1_ = (x1 + nx_, y1 + ny_)
+        p2_ = (x2 + nx_, y2 + ny_)
+        p3_ = (x2 - nx_, y2 - ny_)
+        p4_ = (x1 - nx_, y1 - ny_)
+        r, g, b = rgb
+        tc = (r << 16) | (g << 8) | b
+        hatch = msp.add_hatch(dxfattribs={"layer": DXF_LAYER_PIPES})
+        hatch.paths.add_polyline_path([p1_, p2_, p3_, p4_], is_closed=True)
+        hatch.set_solid_fill(rgb=(r, g, b))
+        border = msp.add_lwpolyline([p1_, p2_, p3_, p4_], close=True, dxfattribs={"layer": DXF_LAYER_PIPES})
+        border.dxf.true_color = tc
 
-        p1 = (x1 + nx, y1 + ny)
-        p2 = (x2 + nx, y2 + ny)
-        p3 = (x2 - nx, y2 - ny)
-        p4 = (x1 - nx, y1 - ny)
-
-        # Solid fill gives deterministic visual thickness across CAD viewers.
-        hatch = msp.add_hatch(color=1, dxfattribs={"layer": DXF_LAYER_PIPES})
-        hatch.paths.add_polyline_path([p1, p2, p3, p4], is_closed=True)
-        hatch.set_solid_fill(color=1, rgb=(255, 0, 0))
-
-        # Add crisp borders to keep edge definition when fills are subdued.
-        msp.add_lwpolyline([p1, p2, p3, p4], close=True, dxfattribs={"layer": DXF_LAYER_PIPES, "color": 1})
-
-    # Increase readability for pipe size labels in output drawings.
-    pipe_text_height = text_height_world * 1.10
-    # Pipes
+    # Pipes — coloured by diameter, no per-segment text labels
     for (pt1, pt2), label in pipes:
         d_mm = _diameter_mm(label)
-        lw = _lineweight_for_diameter_mm(d_mm)
-        band_w = _pipe_width_world_from_diameter_mm(d_mm)
-        _add_pipe_band(pt1, pt2, band_w)
-        # Export centerline geometry to keep visual alignment with editor.
-        # Wide LWPOLYLINE rendering can appear laterally biased in some CAD viewers.
-        msp.add_line(
-            pt1,
-            pt2,
-            dxfattribs={"layer": DXF_LAYER_PIPES, "color": 1, "lineweight": lw},
-        )
-        dx = pt2[0] - pt1[0]
-        dy = pt2[1] - pt1[1]
-        mid_x = (pt1[0] + pt2[0]) / 2.0
-        mid_y = (pt1[1] + pt2[1]) / 2.0
-        is_horizontal = abs(dx) > abs(dy)
-        offset_dist = pipe_text_height * 0.9
-        text_width_approx = len(label) * pipe_text_height * 0.7
-        if is_horizontal:
-            angle_deg = 0
-            insert_pt = (mid_x - text_width_approx / 2.0, mid_y + offset_dist)
-        else:
-            angle_deg = 90
-            insert_pt = (mid_x - offset_dist * 2.0, mid_y - text_width_approx / 2.0)
-        try:
-            txt = msp.add_text(
-                label,
-                dxfattribs={"layer": DXF_LAYER_PIPES, "height": pipe_text_height, "rotation": angle_deg, "color": 1},
-            )
-            txt.set_placement(insert_pt)
-        except Exception:
-            pass
+        rgb = _color_for_pipe_diameter(d_mm)
+        _add_pipe_band(pt1, pt2, _pipe_width_world(d_mm), rgb)
+        r, g, b = rgb
+        line = msp.add_line(pt1, pt2, dxfattribs={"layer": DXF_LAYER_PIPES,
+                                                    "lineweight": _lineweight_for_diameter_mm(d_mm)})
+        line.dxf.true_color = (r << 16) | (g << 8) | b
 
     # Sprinkler symbols
     layer_attrs = {"layer": DXF_LAYER_SPRINKLER, "color": 1}
@@ -1508,30 +1479,48 @@ def write_sprinklers_to_dxf(
             msp.add_line((wx - dx_s, wy - dy_s), (wx + dx_s, wy + dy_s), dxfattribs=layer_attrs)
 
     # Source markers
-    source_attrs = {"layer": DXF_LAYER_SOURCE}
     half_side = symbol_radius_world * 3.0
     for i, (sx, sy) in enumerate(sources):
         corners = [
-            (sx - half_side, sy - half_side),
-            (sx + half_side, sy - half_side),
-            (sx + half_side, sy + half_side),
-            (sx - half_side, sy + half_side),
+            (sx - half_side, sy - half_side), (sx + half_side, sy - half_side),
+            (sx + half_side, sy + half_side), (sx - half_side, sy + half_side),
             (sx - half_side, sy - half_side),
         ]
-        msp.add_lwpolyline(corners, dxfattribs=source_attrs)
+        msp.add_lwpolyline(corners, dxfattribs={"layer": DXF_LAYER_SOURCE})
         source_label = f"SOURCE-{i + 1}"
         src_text_h = text_height_world * 1.2
         src_text_w = len(source_label) * src_text_h * 0.7
-        insert_x = sx - src_text_w / 2.0
-        insert_y = sy - half_side - src_text_h * 1.5
         try:
             txt = msp.add_text(source_label, dxfattribs={"layer": DXF_LAYER_SOURCE, "height": src_text_h})
-            txt.set_placement((insert_x, insert_y))
+            txt.set_placement((sx - src_text_w / 2.0, sy - half_side - src_text_h * 1.5))
         except Exception:
             pass
 
+
+def write_sprinklers_to_dxf(
+    base_dxf: str,
+    out_dxf: str,
+    sprinklers: List[Tuple[float, float]],
+    pipes: list,
+    sources: List[Tuple[float, float]],
+    world_to_m: float = 0.001,
+    world_bbox: dict | None = None,
+    symbol_radius_world: float | None = None,
+    text_height_world: float | None = None,
+):
+    """Load *base_dxf*, add sprinkler overlays in-memory, save to *out_dxf* (single read + write)."""
+    if not _EZDXF_OK:
+        logger.warning("ezdxf not available, skipping DXF export")
+        return
+    doc = ezdxf.readfile(base_dxf)
+    _add_sprinklers_to_doc(
+        doc, sprinklers, pipes, sources,
+        world_to_m=world_to_m, world_bbox=world_bbox,
+        symbol_radius_world=symbol_radius_world, text_height_world=text_height_world,
+    )
     doc.saveas(out_dxf)
-    logger.info("write_sprinklers_to_dxf saved=%s sprinklers=%d pipes=%d sources=%d", out_dxf, len(sprinklers), len(pipes), len(sources))
+    logger.info("write_sprinklers_to_dxf saved=%s sprinklers=%d pipes=%d sources=%d",
+                out_dxf, len(sprinklers), len(pipes), len(sources))
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1631,6 +1620,37 @@ def place_sprinklers_from_rooms_json(
 
     # Global grid alignment
     all_points = align_to_global_lines(all_points, all_regions, tolerance_m=ALIGN_TOLERANCE_M)
+
+    # ── Cross-region minimum distance enforcement ──────────────────────────────
+    # Sub-polygon decomposition and HH-zone splitting can produce points from
+    # neighbouring regions that are closer than target spacing (default 3.0 m).
+    # Cull any point that is too close to an already-accepted
+    # point using a cell-grid for O(n) average performance.
+    _min_dist_world = SPRINKLER_SPACING_M / WORLD_TO_M
+    if len(all_points) > 1:
+        cell = _min_dist_world  # one cell per min-distance unit
+        occupied: dict[tuple[int, int], list[tuple[float, float]]] = {}
+        kept: List[Tuple[float, float]] = []
+
+        def _cell(px: float, py: float) -> tuple[int, int]:
+            return (int(math.floor(px / cell)), int(math.floor(py / cell)))
+
+        def _too_close(px: float, py: float) -> bool:
+            ci, cj = _cell(px, py)
+            for di in (-1, 0, 1):
+                for dj in (-1, 0, 1):
+                    for kp in occupied.get((ci + di, cj + dj), []):
+                        if math.hypot(px - kp[0], py - kp[1]) < _min_dist_world:
+                            return True
+            return False
+
+        for pt in all_points:
+            if not _too_close(pt[0], pt[1]):
+                kept.append(pt)
+                occupied.setdefault(_cell(pt[0], pt[1]), []).append(pt)
+
+        all_points = kept
+    # ──────────────────────────────────────────────────────────────────────────
 
     # Determine source
     min_x = min(p[0] for p in all_points)
