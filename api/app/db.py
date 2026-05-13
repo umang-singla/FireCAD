@@ -206,6 +206,41 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_activity_log_tenant ON activity_log(tenant_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_activity_log_created ON activity_log(created_at DESC)")
 
+    # ── BOQ (Bill of Quantities) ──
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS boq_items (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        section TEXT NOT NULL DEFAULT '21 — Fire Suppression',
+        item_type TEXT NOT NULL DEFAULT 'Material',
+        description TEXT NOT NULL,
+        qty REAL NOT NULL DEFAULT 1.0,
+        unit TEXT NOT NULL DEFAULT 'unit',
+        unit_price REAL NOT NULL DEFAULT 0.0,
+        notes TEXT,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at REAL,
+        updated_at REAL,
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_boq_items_project ON boq_items(project_id)")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS boq_meta (
+        project_id TEXT PRIMARY KEY,
+        client_name TEXT,
+        quote_title TEXT,
+        quote_number TEXT,
+        valid_from TEXT,
+        valid_until TEXT,
+        version INTEGER DEFAULT 1,
+        scope_notes TEXT,
+        updated_at REAL,
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+    )
+    """)
+
     con.commit()
     con.close()
 

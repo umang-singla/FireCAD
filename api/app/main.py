@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.routers import projects, detectors, auth, ws, teams, activity
+from app.routers import projects, detectors, auth, ws, teams, activity, boq
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -25,6 +25,7 @@ app.include_router(projects.router, prefix="/api")
 app.include_router(detectors.router, prefix="/api")
 app.include_router(teams.router, prefix="/api")
 app.include_router(activity.router, prefix="/api")
+app.include_router(boq.router, prefix="/api")
 
 # WebSocket (real-time pipeline status)
 app.include_router(ws.router)

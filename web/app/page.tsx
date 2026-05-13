@@ -15,6 +15,13 @@ type Project = {
   nbc_evaluation?: any;
 };
 
+type BOQMetaLite = {
+  quote_number?: string | null;
+  quote_title?: string | null;
+  client_name?: string | null;
+  valid_until?: string | null;
+};
+
 type NBCQuestion = {
   id: string;
   type: "select" | "number" | "boolean";
@@ -33,7 +40,7 @@ type NBCEquipment = {
 type NavKey =
   | "dashboard"
   | "projects"
-  | "tasks"
+  | "quotes"
   | "calendar"
   | "analytics"
   | "billing"
@@ -70,7 +77,7 @@ type IconName =
 const NAV_MAIN: Array<{ key: NavKey; label: string; icon: IconName }> = [
   { key: "dashboard", label: "Dashboard", icon: "dashboard" },
   { key: "projects", label: "Projects", icon: "projects" },
-  { key: "tasks", label: "Tasks", icon: "tasks" },
+  { key: "quotes", label: "Quotes / BOQ", icon: "receipt" },
   { key: "calendar", label: "Calendar", icon: "calendar" },
   { key: "analytics", label: "Analytics", icon: "analytics" },
   { key: "billing", label: "Billing", icon: "billing" },
@@ -118,6 +125,7 @@ export default function Dashboard() {
   const [tenantName, setTenantName] = useState("");
   const [tenantRole, setTenantRole] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
+  const [boqMetaByProject, setBoqMetaByProject] = useState<Record<string, BOQMetaLite>>({});
 
   // NBC Wizard state
   const [showWizard, setShowWizard] = useState(false);
@@ -155,6 +163,35 @@ export default function Dashboard() {
   useEffect(() => {
     loadProjects();
   }, []);
+
+  useEffect(() => {
+    if (active !== "quotes" || projects.length === 0) return;
+    let alive = true;
+    (async () => {
+      try {
+        const pairs = await Promise.all(
+          projects.map(async (p) => {
+            try {
+              const meta: BOQMetaLite = await apiFetch(`/api/projects/${p.id}/boq/meta`);
+              return [p.id, meta] as const;
+            } catch {
+              return [p.id, {} as BOQMetaLite] as const;
+            }
+          })
+        );
+        if (!alive) return;
+        const next: Record<string, BOQMetaLite> = {};
+        for (const [pid, meta] of pairs) next[pid] = meta;
+        setBoqMetaByProject(next);
+      } catch {
+        // Best-effort metadata load; quotes list still renders project rows.
+      }
+    })();
+
+    return () => {
+      alive = false;
+    };
+  }, [active, projects]);
 
   async function openWizard() {
     setShowWizard(true);
@@ -327,7 +364,7 @@ export default function Dashboard() {
             <input
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search task …"
+              placeholder={active === "quotes" ? "Search quote or project …" : "Search project …"}
               style={S.searchInput}
             />
           </div>
@@ -546,6 +583,77 @@ export default function Dashboard() {
           </>
         )}
 
+        {/* ═══════ TAB: QUOTES / BOQ ═══════ */}
+        {active === "quotes" && (
+          <>
+            <div style={S.titleRow}>
+              <div>
+                <h1 style={S.pageTitle}>Quotes / BOQ</h1>
+                <p style={S.pageSubtitle}>See all project BOQs and open them for editing.</p>
+              </div>
+            </div>
+
+            <div style={S.card}>
+              <div style={S.cardHeader}>
+                <div>
+                  <span style={S.cardTitle}>All Quotes</span>
+                  <p style={{ margin: "4px 0 0", fontSize: 12, color: C.textSecondary }}>
+                    Quote details are pulled from each project BOQ.
+                  </p>
+                </div>
+                <button type="button" onClick={loadProjects} disabled={isLoading} style={S.importBtn}>
+                  <Icon name="download" />
+                  <span>{isLoading ? "Loading…" : "Refresh"}</span>
+                </button>
+              </div>
+
+              <div style={S.tableScrollWrapper}>
+                <div style={{ ...S.tableHead, gridTemplateColumns: "1.2fr 1fr 120px 120px" }}>
+                  <span>Project / Quote</span>
+                  <span>Client</span>
+                  <span>Valid Until</span>
+                  <span style={{ textAlign: "right" }}>Action</span>
+                </div>
+
+                {projects.length === 0 ? (
+                  <div style={S.emptyRow}>No projects yet. Create a project to generate BOQ quotes.</div>
+                ) : (
+                  projects
+                    .filter((p) => {
+                      const q = searchQuery.trim().toLowerCase();
+                      if (!q) return true;
+                      const meta = boqMetaByProject[p.id] || {};
+                      return (
+                        p.name.toLowerCase().includes(q) ||
+                        (meta.quote_number || "").toLowerCase().includes(q) ||
+                        (meta.quote_title || "").toLowerCase().includes(q) ||
+                        (meta.client_name || "").toLowerCase().includes(q)
+                      );
+                    })
+                    .map((p, idx) => {
+                      const meta = boqMetaByProject[p.id] || {};
+                      return (
+                        <div key={p.id} style={{ ...S.tableRow, gridTemplateColumns: "1.2fr 1fr 120px 120px", background: idx % 2 === 0 ? C.card : "#FAFBFC" }}>
+                          <div>
+                            <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{p.name}</div>
+                            <div style={{ fontSize: 11, color: C.textSecondary, marginTop: 2 }}>
+                              {(meta.quote_number || "Q-DRAFT")} · {(meta.quote_title || "BOQ")}
+                            </div>
+                          </div>
+                          <div style={{ fontSize: 12, color: C.textSecondary }}>{meta.client_name || "—"}</div>
+                          <div style={{ fontSize: 12, color: C.textSecondary }}>{meta.valid_until || "—"}</div>
+                          <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                            <a href={`/p/${p.id}/boq`} style={S.openLink}>Edit BOQ <Icon name="chevronRight" /></a>
+                          </div>
+                        </div>
+                      );
+                    })
+                )}
+              </div>
+            </div>
+          </>
+        )}
+
         {/* ═══════ TAB: BILLING ═══════ */}
         {active === "billing" && <BillingTab />}
 
@@ -563,7 +671,7 @@ export default function Dashboard() {
         }} />}
 
         {/* ═══════ PLACEHOLDER TABS ═══════ */}
-        {!["dashboard", "projects", "billing", "team"].includes(active) && (
+        {!["dashboard", "projects", "quotes", "billing", "team"].includes(active) && (
           <div style={S.card}>
             <div style={{ padding: 40, textAlign: "center" }}>
               <div style={{ fontSize: 40, marginBottom: 12 }}>
