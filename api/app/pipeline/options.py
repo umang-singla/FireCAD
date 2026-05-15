@@ -1,16 +1,24 @@
 from dataclasses import dataclass
 import os
 
+# Single source of truth for detector / geometry defaults.
+# Change DETECTOR_SPACING_M in place_detectors_advanced.py and it propagates here.
+from app.pipeline.place_detectors_advanced import (
+    DETECTOR_SPACING_M as _DEFAULT_DETECTOR_SPACING_M,
+    WALL_BUFFER_M as _DEFAULT_WALL_BUFFER_M,
+    WORLD_TO_M as _DEFAULT_WORLD_TO_M,
+)
+
 @dataclass
 class PipelineOptions:
     target_long_side_px: int = 6000
     dpi: int = 600
     pad_frac: float = 0.01
-    detector_spacing_m: float = 5.0
-    wall_buffer_m: float = 0.5
+    detector_spacing_m: float = _DEFAULT_DETECTOR_SPACING_M
+    wall_buffer_m: float = _DEFAULT_WALL_BUFFER_M
     gemini_model: str = "gemini-3.1-flash-image-preview"
     use_gemini: bool = False
-    world_to_m: float = 0.001  # DXF units -> meters (default mm)
+    world_to_m: float = _DEFAULT_WORLD_TO_M  # DXF units -> meters (default mm)
 
     # Sprinkler settings
     sprinkler_spacing_m: float = 3.0
@@ -26,21 +34,20 @@ class PipelineOptions:
             target_long_side_px=int(os.getenv("TARGET_LONG_SIDE_PX", "6000")),
             dpi=int(os.getenv("DPI", "600")),
             pad_frac=float(os.getenv("PAD_FRAC", "0.01")),
-            detector_spacing_m=float(os.getenv("DETECTOR_SPACING_M", "5.0")),
-            wall_buffer_m=float(os.getenv("WALL_BUFFER_M", "0.5")),
+            detector_spacing_m=float(os.getenv("DETECTOR_SPACING_M", str(_DEFAULT_DETECTOR_SPACING_M))),
+            wall_buffer_m=float(os.getenv("WALL_BUFFER_M", str(_DEFAULT_WALL_BUFFER_M))),
             gemini_model=os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image-preview"),
             use_gemini=bool(os.getenv("GEMINI_API_KEY", "").strip()),
-            world_to_m=float(os.getenv("WORLD_TO_M", "0.001")),
+            world_to_m=float(os.getenv("WORLD_TO_M", str(_DEFAULT_WORLD_TO_M))),
             sprinkler_spacing_m=float(os.getenv("SPRINKLER_SPACING_M", "3.0")),
             enable_sprinklers=os.getenv("ENABLE_SPRINKLERS", "0").strip().lower() in ("1", "true", "yes"),
         )
 
     def merge_settings(self, settings: dict) -> "PipelineOptions":
-        # Allow UI to override these
-        if "detector_spacing_m" in settings:
-            self.detector_spacing_m = float(settings["detector_spacing_m"])
-        if "wall_buffer_m" in settings:
-            self.wall_buffer_m = float(settings["wall_buffer_m"])
+        # Backend-owned constants (detector_spacing_m, wall_buffer_m) are
+        # intentionally NOT overridable from the UI. They are defined in
+        # app.pipeline.place_detectors_advanced and propagated through this
+        # dataclass / env vars only. Any value the UI sends for them is ignored.
         if "target_long_side_px" in settings:
             self.target_long_side_px = int(settings["target_long_side_px"])
         if "gemini_model" in settings:

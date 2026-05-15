@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import Any, Dict, Optional
 from app.db import db, now, log_activity
 from app.storage import new_id, project_dir, relpath
+from app import gcs
 from app.schemas import ProjectOut, ProjectUpdateSettings
 from app.pipeline.run_pipeline import (
     run_pipeline_for_project,
@@ -62,11 +63,20 @@ def _normalize_data_path(p: str | None) -> str | None:
     return s
 
 
+# Project SELECT with derived floor_plans count, used by hot read paths so a
+# single round-trip returns everything the API serializer needs.
+_PROJECT_SELECT_WITH_COUNT = (
+    "SELECT p.*, "
+    "(SELECT COUNT(*) FROM floor_plans WHERE project_id=p.id) AS fp_count "
+    "FROM projects p"
+)
+
+
 def _authorize_project(con, project_id: str, user: dict):
     """Fetch a project row and verify the caller has access (owner or tenant member).
     Raises 404 if not found / not authorized.
     """
-    r = con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+    r = con.execute(f"{_PROJECT_SELECT_WITH_COUNT} WHERE p.id=?", (project_id,)).fetchone()
     if not r:
         raise HTTPException(404, "project not found")
     # Owner always has access
@@ -94,13 +104,13 @@ def list_projects(user=Depends(get_current_user)):
         if tid:
             # Show all projects belonging to the active tenant
             rows = con.execute(
-                "SELECT * FROM projects WHERE tenant_id=? ORDER BY updated_at DESC, created_at DESC",
+                f"{_PROJECT_SELECT_WITH_COUNT} WHERE p.tenant_id=? ORDER BY p.updated_at DESC, p.created_at DESC",
                 (tid,),
             ).fetchall()
         else:
             # Legacy fallback: user's own projects
             rows = con.execute(
-                "SELECT * FROM projects WHERE owner_id=? ORDER BY updated_at DESC, created_at DESC",
+                f"{_PROJECT_SELECT_WITH_COUNT} WHERE p.owner_id=? ORDER BY p.updated_at DESC, p.created_at DESC",
                 (user["id"],),
             ).fetchall()
     return [_project_row_to_out(r) for r in rows]
@@ -141,12 +151,16 @@ def _project_row_to_out(r) -> ProjectOut:
     sprinkler_pipes_path = os.path.join(project_dir(r["id"]), "sprinkler_pipes.json")
     add("sprinkler_pipes", sprinkler_pipes_path if os.path.exists(sprinkler_pipes_path) else None)
 
-    # Count floor plan blocks
-    with db() as con:
-        fp_count = con.execute(
-            "SELECT COUNT(*) FROM floor_plans WHERE project_id=?",
-            (r["id"],),
-        ).fetchone()[0]
+    # Floor plan block count: prefer pre-joined value, fall back for callers
+    # that select straight from `projects` without the derived column.
+    if "fp_count" in r.keys():
+        fp_count = int(r["fp_count"] or 0)
+    else:
+        with db() as con:
+            fp_count = con.execute(
+                "SELECT COUNT(*) FROM floor_plans WHERE project_id=?",
+                (r["id"],),
+            ).fetchone()[0]
 
     parsed_settings = json.loads(r["settings_json"] or "{}")
     return ProjectOut(
@@ -161,6 +175,24 @@ def _project_row_to_out(r) -> ProjectOut:
         input_filename=r["input_filename"],
         floor_plans_count=fp_count,
     )
+
+# ── Pipeline defaults (single source of truth lives in
+#    app.pipeline.place_detectors_advanced; exposed here so the UI can
+#    render coverage circles, etc. without hardcoding the constant). ──
+
+@router.get("/config/defaults")
+def config_defaults():
+    from app.pipeline.place_detectors_advanced import (
+        DETECTOR_SPACING_M,
+        WALL_BUFFER_M,
+        WORLD_TO_M,
+    )
+    return {
+        "detector_spacing_m": float(DETECTOR_SPACING_M),
+        "wall_buffer_m": float(WALL_BUFFER_M),
+        "world_to_m": float(WORLD_TO_M),
+    }
+
 
 # ── NBC rule engine endpoints ───────────────────────────────
 
@@ -285,6 +317,7 @@ def run_pipeline(project_id: str, bg: BackgroundTasks, user=Depends(get_current_
 
     opts = PipelineOptions.from_env().merge_settings(settings)
     bg.add_task(run_pipeline_for_project, project_id, opts)
+    bg.add_task(gcs.sync_project_to_gcs, project_id)
 
     with db() as con:
         r2 = _authorize_project(con, project_id, user)
@@ -386,6 +419,7 @@ def continue_floor_review(project_id: str, bg: BackgroundTasks, user=Depends(get
 
     opts = PipelineOptions.from_env().merge_settings(settings)
     bg.add_task(continue_pipeline_after_floor_review, project_id, opts)
+    bg.add_task(gcs.sync_project_to_gcs, project_id)
 
     with db() as con:
         r2 = _authorize_project(con, project_id, user)
@@ -418,6 +452,7 @@ def retry_mask_generation_endpoint(project_id: str, bg: BackgroundTasks, user=De
 
     opts = PipelineOptions.from_env().merge_settings(settings)
     bg.add_task(retry_mask_generation, project_id, opts)
+    bg.add_task(gcs.sync_project_to_gcs, project_id)
 
     with db() as con:
         r2 = _authorize_project(con, project_id, user)
@@ -601,6 +636,7 @@ def continue_pipeline(project_id: str, bg: BackgroundTasks, user=Depends(get_cur
 
     opts = PipelineOptions.from_env().merge_settings(settings)
     bg.add_task(continue_pipeline_after_alignment, project_id, opts)
+    bg.add_task(gcs.sync_project_to_gcs, project_id)
 
     with db() as con:
         r2 = _authorize_project(con, project_id, user)
@@ -767,6 +803,7 @@ def continue_after_rooms(project_id: str, bg: BackgroundTasks, user=Depends(get_
 
     opts = PipelineOptions.from_env().merge_settings(settings)
     bg.add_task(continue_pipeline_after_rooms, project_id, opts)
+    bg.add_task(gcs.sync_project_to_gcs, project_id)
 
     with db() as con:
         r2 = _authorize_project(con, project_id, user)

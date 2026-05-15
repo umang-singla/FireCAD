@@ -8,6 +8,15 @@ services:
       API_HOST: ${API_HOST:-0.0.0.0}
       API_PORT: ${API_PORT:-8000}
       DATA_DIR: ${DATA_DIR:-/data}
+      DB_ENGINE: ${DB_ENGINE:-postgres}
+      DB_HOST: ${DB_HOST:-}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:-firecad}
+      DB_USER: ${DB_USER:-}
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      DB_SSLMODE: ${DB_SSLMODE:-prefer}
+      CLOUD_SQL_CONNECTION_NAME: ${CLOUD_SQL_CONNECTION_NAME:-}
+      DATABASE_URL: ${DATABASE_URL:-}
       ODA_PATH: ${ODA_PATH:-/opt/oda/ODAFileConverter}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_IMAGE_MODEL: ${GEMINI_IMAGE_MODEL:-gemini-2.5-flash-image}
@@ -32,12 +41,28 @@ services:
       QCAD_JPEG_QUALITY: ${QCAD_JPEG_QUALITY:-95}
       QCAD_FLATTEN_WHITE: ${QCAD_FLATTEN_WHITE:-1}
       PAD_FRAC: ${PAD_FRAC:-0.01}
-      DETECTOR_SPACING_M: ${DETECTOR_SPACING_M:-5.0}
+      DETECTOR_SPACING_M: ${DETECTOR_SPACING_M:-7.0}
       WALL_BUFFER_M: ${WALL_BUFFER_M:-0.5}
+
+      # Google Cloud Storage (project artifacts).
+      # Hardcoded literal value: Docker Compose's ${VAR:-default} can be
+      # silently overridden by an empty entry in .env or the host shell,
+      # so we set it directly here.
+      GCS_BUCKET: mepit
+      GCS_PREFIX: ${GCS_PREFIX:-}
+      GCS_SIGNED_URL_TTL: ${GCS_SIGNED_URL_TTL:-3600}
+      GCS_SIGNER_SA_EMAIL: ${GCS_SIGNER_SA_EMAIL:-}
+      # For local dev point this at a service-account key JSON. On Cloud Run
+      # leave it unset and rely on the attached service account (ADC).
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/gcp-key.json
     ports:
       - "8000:8000"
     volumes:
       - ./data:/data
+      # Service-account key for GCS (local dev only). The file is mounted
+      # read-only at /secrets/gcp-key.json inside the container; on Cloud Run
+      # this mount is absent and the attached SA is used via ADC instead.
+      - ./gcp-key.json:/secrets/gcp-key.json:ro
       # QCAD is already baked into the image via COPY in Dockerfile.
       # Do NOT mount over /opt/qcad — it shadows the image contents
       # and breaks execution on Azure/cloud where the host path is absent.

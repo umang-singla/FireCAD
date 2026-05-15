@@ -76,13 +76,30 @@ def get_current_user(req: Request) -> dict:
     if not token:
         raise HTTPException(status_code=401, detail="Missing token")
 
+    # Single round-trip: validate session, fetch user, resolve fallback tenant
+    # via tenant_members, and pull the role in the active tenant — all at once.
     with db() as con:
         row = con.execute(
             """
-            SELECT u.id, u.name, u.email, u.active_tenant_id
+            SELECT
+                u.id                                   AS id,
+                u.name                                 AS name,
+                u.email                                AS email,
+                COALESCE(u.active_tenant_id, tm0.tenant_id) AS active_tenant_id,
+                tm_role.role                           AS tenant_role
             FROM sessions s
             JOIN users u ON u.id = s.user_id
+            LEFT JOIN LATERAL (
+                SELECT tenant_id FROM tenant_members
+                WHERE user_id = u.id
+                ORDER BY created_at ASC
+                LIMIT 1
+            ) tm0 ON u.active_tenant_id IS NULL
+            LEFT JOIN tenant_members tm_role
+              ON tm_role.user_id = u.id
+             AND tm_role.tenant_id = COALESCE(u.active_tenant_id, tm0.tenant_id)
             WHERE s.token = ? AND s.expires_at > ?
+            LIMIT 1
             """,
             (token, now()),
         ).fetchone()
@@ -90,31 +107,13 @@ def get_current_user(req: Request) -> dict:
     if not row:
         raise HTTPException(status_code=401, detail="Invalid/expired token")
 
-    user = {"id": row["id"], "name": row["name"], "email": row["email"],
-            "active_tenant_id": row["active_tenant_id"]}
-
-    # Resolve active tenant — pick the first one if none set
-    if not user["active_tenant_id"]:
-        with db() as con:
-            tm = con.execute(
-                "SELECT tenant_id FROM tenant_members WHERE user_id=? LIMIT 1",
-                (user["id"],),
-            ).fetchone()
-            if tm:
-                user["active_tenant_id"] = tm["tenant_id"]
-
-    # Load role in active tenant
-    if user["active_tenant_id"]:
-        with db() as con:
-            mr = con.execute(
-                "SELECT role FROM tenant_members WHERE tenant_id=? AND user_id=?",
-                (user["active_tenant_id"], user["id"]),
-            ).fetchone()
-            user["tenant_role"] = mr["role"] if mr else None
-    else:
-        user["tenant_role"] = None
-
-    return user
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "email": row["email"],
+        "active_tenant_id": row["active_tenant_id"],
+        "tenant_role": row["tenant_role"],
+    }
 
 
 def require_tenant_role(*allowed_roles: str):

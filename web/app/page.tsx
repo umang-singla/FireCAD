@@ -78,9 +78,6 @@ const NAV_MAIN: Array<{ key: NavKey; label: string; icon: IconName }> = [
   { key: "dashboard", label: "Dashboard", icon: "dashboard" },
   { key: "projects", label: "Projects", icon: "projects" },
   { key: "quotes", label: "Quotes / BOQ", icon: "receipt" },
-  { key: "calendar", label: "Calendar", icon: "calendar" },
-  { key: "analytics", label: "Analytics", icon: "analytics" },
-  { key: "billing", label: "Billing", icon: "billing" },
   { key: "team", label: "Team", icon: "team" },
 ];
 
@@ -342,15 +339,6 @@ export default function Dashboard() {
           ))}
         </nav>
 
-        {/* download CTA */}
-        <div style={S.downloadCta}>
-          <div style={S.downloadIcon}>
-            <Icon name="download" />
-          </div>
-          <div style={{ fontSize: 12, fontWeight: 600 }}>Download our</div>
-          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.65)" }}>Mobile App</div>
-          <button type="button" style={S.downloadBtn}>Download</button>
-        </div>
       </aside>
 
       {/* ── main content ── */}
@@ -654,9 +642,6 @@ export default function Dashboard() {
           </>
         )}
 
-        {/* ═══════ TAB: BILLING ═══════ */}
-        {active === "billing" && <BillingTab />}
-
         {/* ═══════ TAB: TEAM ═══════ */}
         {active === "team" && <TeamTab tenantRole={tenantRole} onTenantSwitch={async () => {
           // Refresh tenant info and project list after switching teams
@@ -671,7 +656,7 @@ export default function Dashboard() {
         }} />}
 
         {/* ═══════ PLACEHOLDER TABS ═══════ */}
-        {!["dashboard", "projects", "quotes", "billing", "team"].includes(active) && (
+        {!["dashboard", "projects", "quotes", "team"].includes(active) && (
           <div style={S.card}>
             <div style={{ padding: 40, textAlign: "center" }}>
               <div style={{ fontSize: 40, marginBottom: 12 }}>
