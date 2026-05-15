@@ -72,12 +72,14 @@ ENV PYTHONUNBUFFERED=1
 ENV DB_ENGINE=postgres
 ENV DB_PORT=5432
 ENV DB_NAME=firecad
+ENV DB_USER=admin
 ENV DB_SSLMODE=prefer
 ENV ODA_PATH=/opt/oda/ODAFileConverter
 ENV QCAD_DWG2BMP=/opt/qcad/dwg2bmp
 ENV USE_QCAD_DWG2BMP=1
 ENV LD_LIBRARY_PATH=/opt/qcad
 ENV GCS_BUCKET=mepit
+ENV CLOUD_SQL_CONNECTION_NAME=gen-lang-client-0918649486:us-central1:mepitdb
 
 EXPOSE 8000
 CMD ["python", "-m", "app.server"]
