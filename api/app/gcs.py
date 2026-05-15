@@ -132,6 +132,18 @@ def local_for_key(key: str) -> str:
     return os.path.join(DATA_DIR, key.replace("/", os.sep))
 
 
+def blob_exists(local_path: str) -> bool:
+    """Return True if the GCS object mirroring `local_path` exists in the bucket."""
+    if not enabled():
+        return False
+    try:
+        bucket = _get_bucket()
+        return bucket.blob(key_for_local(local_path)).exists()
+    except Exception as exc:
+        print(f"[gcs] blob_exists failed {local_path}: {exc!r}")
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Uploads
 # ---------------------------------------------------------------------------
