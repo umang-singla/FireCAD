@@ -33,6 +33,19 @@ router = APIRouter(tags=["projects"])
 MCP_HOOTER_PAIR_OFFSET_M = 0.45
 
 
+def _artifact_exists(path: str | None) -> bool:
+    """True if the file exists locally OR in GCS.
+
+    Avoids hiding artifacts that live in the bucket but haven't been pulled
+    into the local cache yet (cold-started Cloud Run instances, etc.).
+    """
+    if not path:
+        return False
+    if os.path.exists(path):
+        return True
+    return gcs.blob_exists(path)
+
+
 def _normalize_data_path(p: str | None) -> str | None:
     """Normalize persisted file paths to be rooted under DATA_DIR.
 
@@ -141,15 +154,15 @@ def _project_row_to_out(r) -> ProjectOut:
     add("aligned_mask", r["aligned_mask_path"])
     add("fixed_wall", r["fixed_wall_path"])
     add("rooms_json", r["rooms_json_path"])
-    add("rooms_debug", rooms_debug_path if os.path.exists(rooms_debug_path) else None)
+    add("rooms_debug", rooms_debug_path if _artifact_exists(rooms_debug_path) else None)
     add("output_dxf", r["output_dxf_path"])
     add("output_preview_png", r["output_preview_png_path"])
-    add("output_preview_mapping", preview_mapping_path if os.path.exists(preview_mapping_path) else None)
-    add("detectors_global_snap_debug", detectors_debug_path if os.path.exists(detectors_debug_path) else None)
-    add("detectors_global_snap_overlay", detectors_overlay_debug_path if os.path.exists(detectors_overlay_debug_path) else None)
+    add("output_preview_mapping", preview_mapping_path if _artifact_exists(preview_mapping_path) else None)
+    add("detectors_global_snap_debug", detectors_debug_path if _artifact_exists(detectors_debug_path) else None)
+    add("detectors_global_snap_overlay", detectors_overlay_debug_path if _artifact_exists(detectors_overlay_debug_path) else None)
 
     sprinkler_pipes_path = os.path.join(project_dir(r["id"]), "sprinkler_pipes.json")
-    add("sprinkler_pipes", sprinkler_pipes_path if os.path.exists(sprinkler_pipes_path) else None)
+    add("sprinkler_pipes", sprinkler_pipes_path if _artifact_exists(sprinkler_pipes_path) else None)
 
     # Floor plan block count: prefer pre-joined value, fall back for callers
     # that select straight from `projects` without the derived column.
@@ -1283,7 +1296,7 @@ def _floor_plan_row_to_dict(fp) -> dict:
         "files": {},
     }
     def add(k, p):
-        d["files"][k] = f"/files/{relpath(p)}" if p and os.path.exists(p) else None
+        d["files"][k] = f"/files/{relpath(p)}" if p and _artifact_exists(p) else None
     add("render_png", fp["render_png_path"])
     add("mapping_json", fp["mapping_json_path"])
     add("mask_png", fp["mask_png_path"])
@@ -1294,7 +1307,7 @@ def _floor_plan_row_to_dict(fp) -> dict:
     idx = fp["block_index"]
     pid = fp["project_id"]
     pipes_path = os.path.join(project_dir(pid), f"sprinkler_pipes_{idx}.json")
-    add("sprinkler_pipes", pipes_path if os.path.exists(pipes_path) else None)
+    add("sprinkler_pipes", pipes_path if _artifact_exists(pipes_path) else None)
     return d
 
 
