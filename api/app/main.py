@@ -1,9 +1,15 @@
 import os
+import re
 import subprocess
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+import time
 
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, RedirectResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+from app import gcs
 from app.routers import projects, detectors, auth, ws, teams, activity, boq
 
 DATA_DIR = os.getenv("DATA_DIR", "/data")
@@ -19,6 +25,70 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ---------------------------------------------------------------------------
+# GCS sync middleware
+#
+# We keep the local DATA_DIR as a working cache so existing pipeline code
+# (subprocess tools, PIL, OpenCV, ezdxf) stays unchanged. The middleware:
+#   * On GET requests that target a project, hydrates the local cache from
+#     GCS so the route sees the latest artifacts.
+#   * On mutating requests, uploads any files written under the project dir
+#     to GCS after the response is produced.
+# Disabled (no-op) when `GCS_BUCKET` is not configured.
+# ---------------------------------------------------------------------------
+
+_PROJECT_PATH_RE = re.compile(
+    r"/(?:api/)?(?:projects|detectors|boq|activity)/(?P<pid>[0-9a-fA-F-]{8,})"
+)
+_MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+class GCSSyncMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        pid: str | None = None
+        if gcs.enabled():
+            m = _PROJECT_PATH_RE.search(request.url.path)
+            if m:
+                pid = m.group("pid")
+
+        # Cache hydration policy: only download from GCS when the project dir
+        # is MISSING locally (cold-start on a fresh container). Once we have a
+        # local copy, do NOT re-pull — that races against the running pipeline
+        # which is actively writing the same files, and would overwrite
+        # half-written outputs with the previous run's stale GCS copy.
+        if pid and request.method == "GET":
+            local_project_dir = os.path.join(DATA_DIR, "projects", pid)
+            if not os.path.isdir(local_project_dir):
+                try:
+                    n = gcs.ensure_project_cached(pid)
+                    if n:
+                        print(f"[gcs] cold-start hydrated {n} files for project {pid}")
+                except Exception as exc:  # pragma: no cover - best-effort
+                    print(f"[gcs] ensure_project_cached({pid}) failed: {exc!r}")
+
+        start_ts = time.time()
+        response = await call_next(request)
+
+        # Upload anything written during this request (covers synchronous file
+        # writes like /upload and /aligned_mask). Long-running pipeline tasks
+        # are uploaded via a separate `gcs.sync_project_to_gcs` background task
+        # chained after them in the route handlers.
+        if pid and request.method in _MUTATING_METHODS:
+            try:
+                from app.storage import project_dir  # local import to avoid cycle
+                n = gcs.upload_dir(project_dir(pid), since_ts=start_ts - 2.0)
+                if n:
+                    print(f"[gcs] uploaded {n} files for project {pid}")
+            except Exception as exc:  # pragma: no cover - best-effort
+                print(f"[gcs] post-request upload for {pid} failed: {exc!r}")
+
+        return response
+
+
+app.add_middleware(GCSSyncMiddleware)
+
+
 # API
 app.include_router(auth.router, prefix="/api")
 app.include_router(projects.router, prefix="/api")
@@ -30,8 +100,35 @@ app.include_router(boq.router, prefix="/api")
 # WebSocket (real-time pipeline status)
 app.include_router(ws.router)
 
-# Static: project artifacts (render.png, mapping.json, etc.)
-app.mount("/files", StaticFiles(directory=DATA_DIR), name="files")
+
+# ---------------------------------------------------------------------------
+# /files/<rel>: serve project artifacts.
+#
+#   * When GCS is enabled and signing succeeds, redirect to a v4 signed URL
+#     so the browser streams directly from the bucket.
+#   * Otherwise, hydrate the local cache on demand and stream the file from
+#     disk. This keeps local development (and any deployment without GCS
+#     credentials) working unchanged.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/files/{rel_path:path}")
+def serve_file(rel_path: str):
+    rel = rel_path.replace("\\", "/").lstrip("/")
+    if ".." in rel.split("/"):
+        raise HTTPException(status_code=400, detail="invalid path")
+
+    if gcs.enabled():
+        url = gcs.signed_url_for_rel(rel)
+        if url:
+            return RedirectResponse(url, status_code=302)
+
+    local_path = os.path.join(DATA_DIR, rel.replace("/", os.sep))
+    if not os.path.isfile(local_path) and gcs.enabled():
+        gcs.ensure_rel_cached(rel)
+    if not os.path.isfile(local_path):
+        raise HTTPException(status_code=404, detail="file not found")
+    return FileResponse(local_path)
 
 
 @app.on_event("startup")
@@ -40,6 +137,14 @@ async def _capture_event_loop() -> None:
     import asyncio
     from app.ws_manager import manager  # noqa: F811
     manager.set_loop(asyncio.get_running_loop())
+
+
+@app.on_event("startup")
+def _gcs_startup_diagnostics() -> None:
+    try:
+        gcs.log_startup_status()
+    except Exception as exc:  # pragma: no cover
+        print(f"[gcs] startup diagnostics crashed: {exc!r}")
 
 
 @app.on_event("startup")

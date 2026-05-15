@@ -354,8 +354,9 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   })();
 
   const [settings, setSettings] = useState<any>({
-    detector_spacing_m: 5.0,
-    wall_buffer_m: 0.5,
+    // NOTE: detector_spacing_m and wall_buffer_m are backend-owned constants
+    // (see api/app/pipeline/place_detectors_advanced.py). The UI must not
+    // send them; the backend ignores them in PipelineOptions.merge_settings.
     target_long_side_px: 6000,
     gemini_model: "gemini-3.1-flash-image-preview",
     building_type: "residential",
@@ -363,7 +364,6 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
     units: "mm",
     typical_ceiling_height: 3.0,
     ceiling_height_unit: "m",
-
   });
 
   // Current pipeline stage for live progress display

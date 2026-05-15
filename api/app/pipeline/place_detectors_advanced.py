@@ -7,7 +7,7 @@ import cv2
 from shapely.geometry import Polygon, LineString, Point, LinearRing
 from shapely.validation import make_valid
 from shapely.affinity import rotate
-from shapely.ops import split
+from shapely.ops import split, unary_union
 
 # ============================================================
 # CONFIGURATION
@@ -269,35 +269,61 @@ def decompose_recursive(poly):
 # ============================================================
 
 def get_symmetric_grid_detectors(poly):
-    angle_rad, (cx, cy) = get_longest_wall_angle(poly)
-    angle_deg = math.degrees(angle_rad)
-
-    rot_poly = rotate(poly, -angle_deg, origin=(cx, cy))
-    minx, miny, maxx, maxy = rot_poly.bounds
+    # Lay the grid in the polygon's AXIS-ALIGNED bounding box (world frame).
+    # Earlier versions rotated by the "longest wall" angle, but for axis-aligned
+    # floor plans that rotation can be off by a small ε (whichever of the
+    # top/bottom edges is slightly longer wins), tilting the entire grid and
+    # making spacing in world X/Y look unequal even though it is correct in
+    # the rotated frame. Working directly in the world frame keeps adjacent
+    # detectors at exactly DETECTOR_SPACING_M apart along world X and world Y.
+    minx, miny, maxx, maxy = poly.bounds
 
     width = maxx - minx
     height = maxy - miny
 
     spacing_world = DETECTOR_SPACING_M / WORLD_TO_M
 
-    nx = max(1, math.ceil(width / spacing_world))
-    ny = max(1, math.ceil(height / spacing_world))
+    # Number of detectors along each axis. round() keeps adjacent detectors
+    # exactly `spacing_world` apart; any uncovered strip near the walls is
+    # filled by the BFS coverage-subtraction loop in `process_room`.
+    nx = max(1, int(round(width / spacing_world)))
+    ny = max(1, int(round(height / spacing_world)))
 
-    step_x = width / nx
-    step_y = height / ny
+    # Center the fixed-pitch grid inside the bounding box.
+    span_x = (nx - 1) * spacing_world
+    span_y = (ny - 1) * spacing_world
+    start_x = minx + (width - span_x) / 2.0
+    start_y = miny + (height - span_y) / 2.0
 
     detectors = []
     for i in range(nx):
         for j in range(ny):
-            lx = minx + (i * step_x) + (step_x / 2)
-            ly = miny + (j * step_y) + (step_y / 2)
+            lx = start_x + i * spacing_world
+            ly = start_y + j * spacing_world
 
             p = Point(lx, ly)
-            if rot_poly.contains(p):
-                world_p = rotate(p, angle_deg, origin=(cx, cy))
-                detectors.append((world_p.x, world_p.y))  # WORLD COORDS
+            if poly.contains(p):
+                detectors.append((lx, ly))  # WORLD COORDS
 
     return detectors
+
+
+def _extract_polygons(geom, min_area_world):
+    """Flatten a Shapely geometry into a list of Polygons above min area."""
+    out = []
+    if geom is None or geom.is_empty:
+        return out
+    if geom.geom_type == 'Polygon':
+        if geom.area >= min_area_world:
+            out.append(geom)
+    elif geom.geom_type == 'MultiPolygon':
+        for g in geom.geoms:
+            if g.area >= min_area_world:
+                out.append(g)
+    elif geom.geom_type == 'GeometryCollection':
+        for g in geom.geoms:
+            out.extend(_extract_polygons(g, min_area_world))
+    return out
 
 
 def process_room(room_poly):
@@ -317,18 +343,73 @@ def process_room(room_poly):
     sub_polys = decompose_recursive(clean_poly)
     min_area_world = MIN_REGION_AREA_M2 / (WORLD_TO_M ** 2)
 
-    for poly in sub_polys:
-        if poly.area < min_area_world:
-            continue
+    # Keep decomposed pieces as "regions" for the downstream wall-buffer alignment step.
+    regions = [p for p in sub_polys if p.area >= min_area_world]
+    if not regions:
+        return detectors, regions
 
-        regions.append(poly)
-        grid_points = get_symmetric_grid_detectors(poly)
+    coverage_radius_world = DETECTOR_SPACING_M / WORLD_TO_M
 
-        if not grid_points:
-            p = poly.representative_point()
-            grid_points = [(p.x, p.y)]
+    # --- Step 1: seed initial symmetric grid in the LARGEST sub-polygon only ---
+    seed_poly = max(regions, key=lambda p: p.area)
+    seed_points = get_symmetric_grid_detectors(seed_poly)
+    if not seed_points:
+        rp = seed_poly.representative_point()
+        seed_points = [(rp.x, rp.y)]
+    detectors.extend(seed_points)
 
-        detectors.extend(grid_points)
+    # --- Step 2..N: BFS-style coverage subtraction over the full clean polygon.
+    # We process ONE leftover sub-polygon per iteration (largest first), then
+    # immediately recompute coverage. This way every new detector is placed
+    # against the up-to-date coverage of all previously placed detectors, so
+    # the ≥ DETECTOR_SPACING_M separation is enforced by the geometry itself
+    # (no explicit pairwise distance filter needed). ---
+    MAX_ITERATIONS = 200  # safety cap; one piece per iter, so set generously
+    for _ in range(MAX_ITERATIONS):
+        # Union of coverage disks (radius = DETECTOR_SPACING_M) around all placed detectors.
+        coverage = unary_union(
+            [Point(x, y).buffer(coverage_radius_world) for (x, y) in detectors]
+        )
+        remaining = clean_poly.difference(coverage)
+        leftover_pieces = _extract_polygons(remaining, min_area_world)
+        if not leftover_pieces:
+            break
+
+        # Decompose every leftover piece (concave shapes from disk subtraction).
+        decomposed_leftovers = []
+        for piece in leftover_pieces:
+            piece_clean = piece.simplify(tolerance_world, preserve_topology=True)
+            if not piece_clean.is_valid:
+                piece_clean = make_valid(piece_clean)
+            for sub in _extract_polygons(piece_clean, min_area_world):
+                decomposed_leftovers.extend(
+                    p for p in decompose_recursive(sub) if p.area >= min_area_world
+                )
+
+        if not decomposed_leftovers:
+            break
+
+        # Pick the LARGEST uncovered sub-polygon and process only it this iteration.
+        # The next iteration will see the new coverage and pick the next largest piece.
+        target_piece = max(decomposed_leftovers, key=lambda p: p.area)
+
+        pts = get_symmetric_grid_detectors(target_piece)
+        if not pts:
+            rp = target_piece.representative_point()
+            pts = [(rp.x, rp.y)]
+
+        # Anti-stall guard: if every candidate in this piece is already inside
+        # the current coverage (e.g. piece is a thin sliver squeezed between
+        # existing disks), skip it so we don't loop forever on it.
+        accepted = [(cx, cy) for (cx, cy) in pts if not coverage.contains(Point(cx, cy))]
+        if not accepted:
+            # Drop this piece from consideration by treating it as covered:
+            # extend the coverage manually for the next iter — but simpler is
+            # to just stop, since the only remaining work is sub-spacing slivers.
+            break
+
+        detectors.extend(accepted)
+        regions.append(target_piece)
 
     return detectors, regions
 
@@ -770,7 +851,9 @@ def _set_runtime_config(spacing_m: float, wall_buffer_m: float, world_to_m: floa
 def place_detectors_for_room(poly_world: Polygon, spacing_m: float, wall_buffer_m: float, world_to_m: float):
     _set_runtime_config(spacing_m=spacing_m, wall_buffer_m=wall_buffer_m, world_to_m=world_to_m)
     detectors, regions = process_room(poly_world)
-    detectors = align_to_global_lines(detectors, regions, ALIGNMENT_TOLERANCE_M)
+    # NOTE: align_to_global_lines is intentionally skipped — it can pull detectors
+    # up to ALIGNMENT_TOLERANCE_M onto cross-room snap lines and destroy the
+    # exact DETECTOR_SPACING_M lattice produced by process_room.
     return detectors, regions
 
 
@@ -799,7 +882,10 @@ def place_detectors_from_rooms_json(
         all_regions.extend(regs)
 
     detectors_before_snap = list(all_detectors_world)
-    all_detectors_world = align_to_global_lines(all_detectors_world, all_regions, ALIGNMENT_TOLERANCE_M)
+    # NOTE: align_to_global_lines is intentionally skipped — it can pull detectors
+    # up to ALIGNMENT_TOLERANCE_M onto cross-room snap lines and destroy the
+    # exact DETECTOR_SPACING_M lattice produced by process_room.
+    # all_detectors_world = align_to_global_lines(all_detectors_world, all_regions, ALIGNMENT_TOLERANCE_M)
 
     if debug_png_path:
         visualize_global_snapping_debug(

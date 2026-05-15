@@ -249,6 +249,11 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     for (const opt of ADD_TYPE_OPTIONS) init[opt.value] = true;
     return init;
   });
+  // Translucent coverage-disk overlay for smoke detectors.
+  // Radius comes from the backend `/api/config/defaults` (DETECTOR_SPACING_M).
+  // Default to 7m as a safety fallback if the endpoint is unreachable.
+  const [showCoverageDisks, setShowCoverageDisks] = useState<boolean>(false);
+  const [detectorSpacingM, setDetectorSpacingM] = useState<number>(7.0);
   const canEdit = getTenantRole() !== "viewer";
   const hasPipeData = !!(pipesData && ((pipesData.pipes?.length || 0) > 0 || (pipesData.sources?.length || 0) > 0));
 
@@ -296,6 +301,19 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
         try {
           setWorldToM(resolveWorldToM(proj?.settings || {}));
         } catch { /* keep default */ }
+
+        // Pull backend-owned constants (detector spacing, etc.) so the
+        // coverage-disk overlay matches the placement algorithm exactly.
+        try {
+          const defRes = await fetch(apiUrl(`/api/config/defaults`), { headers });
+          if (defRes.ok) {
+            const defs = await defRes.json();
+            const sp = Number(defs?.detector_spacing_m);
+            if (!cancelled && Number.isFinite(sp) && sp > 0) {
+              setDetectorSpacingM(sp);
+            }
+          }
+        } catch { /* keep fallback */ }
 
         const inputDxf = proj?.files?.dxf;
         if (!inputDxf) {
@@ -1367,6 +1385,44 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       if (dtype === "smoke") {
         const s = smokeSymbolRadius;
 
+        // Optional translucent coverage disk (radius = DETECTOR_SPACING_M).
+        // Drawn UNDER the detector symbol so the symbol stays legible.
+        if (showCoverageDisks && detectorSpacingM > 0) {
+          const coverageR = detectorSpacingM * unitsPerMeter;
+          const coverageMesh = new three.Mesh(
+            new three.CircleGeometry(coverageR, 64),
+            new three.MeshBasicMaterial({
+              color,
+              transparent: true,
+              opacity: 0.12,
+              depthTest: false,
+              depthWrite: false,
+            }),
+          );
+          coverageMesh.position.set(x, y, 0.69);
+          coverageMesh.renderOrder = 1099;
+          group.add(coverageMesh);
+
+          // Thin outline so the boundary is visible even with low fill opacity.
+          const outlinePts: any[] = [];
+          for (let i = 0; i <= 64; i++) {
+            const t = (i / 64) * Math.PI * 2;
+            outlinePts.push(new three.Vector3(x + coverageR * Math.cos(t), y + coverageR * Math.sin(t), 0.70));
+          }
+          const outline = new three.Line(
+            new three.BufferGeometry().setFromPoints(outlinePts),
+            new three.LineBasicMaterial({
+              color,
+              transparent: true,
+              opacity: 0.45,
+              depthTest: false,
+              depthWrite: false,
+            }),
+          );
+          outline.renderOrder = 1100;
+          group.add(outline);
+        }
+
         const ringPts: any[] = [];
         for (let i = 0; i <= 48; i++) {
           const t = (i / 48) * Math.PI * 2;
@@ -1659,7 +1715,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   useEffect(() => {
     renderDetectors();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detectors, dxfUrl, worldToM, selectedDetectorId, selectedDetectorIds, pipesData, showPipes, sourceSelectMode, detectedSources, chosenSource, manualPipes, pipeDrawStart, pipeDrawPreview, equipmentLayerVisibility, selectedPipe, measureStart, measureEnd, measurePreview]);
+  }, [detectors, dxfUrl, worldToM, selectedDetectorId, selectedDetectorIds, pipesData, showPipes, sourceSelectMode, detectedSources, chosenSource, manualPipes, pipeDrawStart, pipeDrawPreview, equipmentLayerVisibility, selectedPipe, measureStart, measureEnd, measurePreview, showCoverageDisks, detectorSpacingM]);
 
   function worldPointFromPointer(pointer: PointerInfo): { x: number; y: number } | null {
     const viewer = viewerRef.current;
@@ -3415,6 +3471,44 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                     </span>
                     {pipeCount > 0 ? (
                       <span style={{ fontSize: 10, color: "#7f849c" }}>{pipeCount}</span>
+                    ) : null}
+                  </label>
+                );
+              })()}
+              {/* Smoke detector coverage circles overlay */}
+              {(() => {
+                const smokeCount = detectors.filter(
+                  (d) => String(d.dtype || "").toLowerCase() === "smoke",
+                ).length;
+                return (
+                  <label
+                    key="equip-coverage"
+                    style={{
+                      display: "flex", alignItems: "center", gap: 8,
+                      padding: "5px 12px", fontSize: 12, cursor: "pointer",
+                      opacity: smokeCount === 0 ? 0.5 : 1,
+                    }}
+                    title={`Translucent ${detectorSpacingM.toFixed(1)} m radius disk around each smoke detector`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={showCoverageDisks}
+                      onChange={(e) => setShowCoverageDisks(e.target.checked)}
+                      style={{ accentColor: "#cba6f7" }}
+                    />
+                    <span
+                      style={{
+                        width: 14, height: 14, borderRadius: "50%",
+                        border: `1px solid ${DTYPE_COLORS.smoke || "#ef4444"}`,
+                        flexShrink: 0,
+                        background: `${DTYPE_COLORS.smoke || "#ef4444"}33`,
+                      }}
+                    />
+                    <span style={{ flex: 1, color: "#cdd6f4" }}>
+                      Coverage circles ({detectorSpacingM.toFixed(0)} m)
+                    </span>
+                    {smokeCount > 0 ? (
+                      <span style={{ fontSize: 10, color: "#7f849c" }}>{smokeCount}</span>
                     ) : null}
                   </label>
                 );

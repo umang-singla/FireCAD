@@ -79,7 +79,7 @@ jobs:
               QCAD_JPEG_QUALITY=95 \
               QCAD_FLATTEN_WHITE=1 \
               PAD_FRAC=0.01 \
-              DETECTOR_SPACING_M=5.0 \
+              DETECTOR_SPACING_M=7.0 \
               WALL_BUFFER_M=0.5 \
             --secure-environment-variables \
               GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}

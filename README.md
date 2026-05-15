@@ -87,6 +87,16 @@ For "ship in 1 hour" use a VM:
 3. `docker compose up -d --build`
 4. put a reverse proxy (Caddy/Nginx) in front if needed
 
+### Cloud Run + Cloud SQL
+If you deploy the API to Cloud Run and use Cloud SQL Postgres, set these env vars on the service:
+- `DB_ENGINE=postgres`
+- `CLOUD_SQL_CONNECTION_NAME=<project:region:instance>` or `DB_HOST=<public-ip>`
+- `DB_NAME=<database-name>`
+- `DB_USER=<database-user>`
+- `DB_PASSWORD=<database-password>`
+
+Cloud Run should also have the Cloud SQL instance attached and the service account should have `roles/cloudsql.client`.
+
 ---
 
 ## 6) Repo layout
