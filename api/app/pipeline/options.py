@@ -16,6 +16,9 @@ class PipelineOptions:
     pad_frac: float = 0.01
     detector_spacing_m: float = _DEFAULT_DETECTOR_SPACING_M
     wall_buffer_m: float = _DEFAULT_WALL_BUFFER_M
+    # Heat detectors are placed in rooms excluded from smoke coverage
+    # (kitchens, toilets, parking, etc.). They use a tighter spacing per code.
+    heat_detector_spacing_m: float = 5.0
     gemini_model: str = "gemini-3.1-flash-image-preview"
     use_gemini: bool = False
     world_to_m: float = _DEFAULT_WORLD_TO_M  # DXF units -> meters (default mm)
@@ -36,6 +39,7 @@ class PipelineOptions:
             pad_frac=float(os.getenv("PAD_FRAC", "0.01")),
             detector_spacing_m=float(os.getenv("DETECTOR_SPACING_M", str(_DEFAULT_DETECTOR_SPACING_M))),
             wall_buffer_m=float(os.getenv("WALL_BUFFER_M", str(_DEFAULT_WALL_BUFFER_M))),
+            heat_detector_spacing_m=float(os.getenv("HEAT_DETECTOR_SPACING_M", "5.0")),
             gemini_model=os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image-preview"),
             use_gemini=bool(os.getenv("GEMINI_API_KEY", "").strip()),
             world_to_m=float(os.getenv("WORLD_TO_M", str(_DEFAULT_WORLD_TO_M))),

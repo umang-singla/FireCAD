@@ -17,7 +17,7 @@ from app.pipeline.wall_fix import fix_walls
 from app.pipeline.rooms_from_image import extract_rooms
 from app.pipeline.dxf_export import write_combined_sheets_dxf
 from app.pipeline.place_detectors_advanced import place_detectors_from_rooms_json
-from app.pipeline.dxf_text_filter import filter_rooms_by_dxf_text
+from app.pipeline.dxf_text_filter import filter_rooms_by_dxf_text, split_rooms_by_dxf_text
 from app.pipeline.sprinkler_routing import (
     place_sprinklers_from_rooms_json,
 )
@@ -489,7 +489,14 @@ def _run_post_room_review_steps(
             rooms = rooms_data.get("rooms", rooms_data) if isinstance(rooms_data, dict) else rooms_data
 
             # Filter rooms by DXF text labels
-            rooms = filter_rooms_by_dxf_text(rooms, dxf_path, exclude_keywords=opts.room_exclude_keywords)
+            fp_dir = os.path.dirname(fp_render) if fp_render else pdir
+            label_debug = os.path.join(fp_dir, f"block_{idx}_room_labels_debug.png")
+            rooms, excluded_rooms = split_rooms_by_dxf_text(
+                rooms, dxf_path,
+                debug_png_path=label_debug,
+                base_png_path=fp_render or os.path.join(pdir, "render.png"),
+                mapping_json_path=fp_mapping or mapping_json,
+            )
 
             if not rooms:
                 continue
@@ -514,6 +521,28 @@ def _run_post_room_review_steps(
                 _replace_detectors_of_types(con, project_id, fp_dets, ["smoke"], floor_plan_id=fp_id)
             all_dets.extend(fp_dets)
             stage_done(f"place_detectors_block_{idx}", stage_ts, detectors=len(fp_dets))
+
+            # Heat detectors in excluded rooms (kitchens, parking, etc.) with tighter spacing
+            if excluded_rooms:
+                stage_ts = time.perf_counter()
+                stage_start(f"place_heat_detectors_block_{idx}")
+                heat_placed, _heat_regions = place_detectors_from_rooms_json(
+                    excluded_rooms,
+                    opts.heat_detector_spacing_m,
+                    opts.wall_buffer_m,
+                    opts.world_to_m,
+                    mapping_json_path=fp_mapping or mapping_json,
+                    base_png_path=fp_render or os.path.join(pdir, "render.png"),
+                )
+                fp_heat_dets = [
+                    {"id": str(uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0,
+                     "dtype": "heat", "locked": 0, "floor_plan_id": fp_id}
+                    for (x, y) in heat_placed
+                ]
+                with db() as con:
+                    _replace_detectors_of_types(con, project_id, fp_heat_dets, ["heat"], floor_plan_id=fp_id)
+                all_dets.extend(fp_heat_dets)
+                stage_done(f"place_heat_detectors_block_{idx}", stage_ts, detectors=len(fp_heat_dets))
 
             # Sprinkler placement per floor plan (optional)
             if opts.enable_sprinklers and dxf_path and os.path.exists(dxf_path):
@@ -547,8 +576,14 @@ def _run_post_room_review_steps(
 
         stage_ts = time.perf_counter()
         stage_start("filter_rooms")
-        rooms = filter_rooms_by_dxf_text(rooms, dxf_path, exclude_keywords=opts.room_exclude_keywords)
-        stage_done("filter_rooms", stage_ts, rooms_after_filter=len(rooms))
+        label_debug = os.path.join(pdir, "room_labels_debug.png")
+        rooms, excluded_rooms = split_rooms_by_dxf_text(
+            rooms, dxf_path,
+            debug_png_path=label_debug,
+            base_png_path=os.path.join(pdir, "render.png"),
+            mapping_json_path=mapping_json,
+        )
+        stage_done("filter_rooms", stage_ts, rooms_after_filter=len(rooms), excluded=len(excluded_rooms), debug=label_debug)
 
         stage_ts = time.perf_counter()
         stage_start("place_detectors")
@@ -564,6 +599,27 @@ def _run_post_room_review_steps(
         with db() as con:
             _replace_detectors_of_types(con, project_id, all_dets, ["smoke"])
         stage_done("place_detectors", stage_ts, detectors=len(all_dets))
+
+        # Heat detectors in excluded rooms (kitchens, parking, etc.) with tighter spacing
+        if excluded_rooms:
+            stage_ts = time.perf_counter()
+            stage_start("place_heat_detectors")
+            heat_placed, _heat_regions = place_detectors_from_rooms_json(
+                excluded_rooms,
+                opts.heat_detector_spacing_m,
+                opts.wall_buffer_m,
+                opts.world_to_m,
+                mapping_json_path=mapping_json,
+                base_png_path=os.path.join(pdir, "render.png"),
+            )
+            heat_dets = [
+                {"id": str(uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0, "dtype": "heat", "locked": 0}
+                for (x, y) in heat_placed
+            ]
+            with db() as con:
+                _replace_detectors_of_types(con, project_id, heat_dets, ["heat"])
+            all_dets.extend(heat_dets)
+            stage_done("place_heat_detectors", stage_ts, detectors=len(heat_dets))
 
         if opts.enable_sprinklers:
             stage_ts = time.perf_counter()
