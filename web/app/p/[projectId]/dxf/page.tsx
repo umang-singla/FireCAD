@@ -67,6 +67,7 @@ type PipesData = {
 
 const EQUIPMENT_BUTTONS: { key: string; label: string; color: string }[] = [
   { key: "smoke",      label: "Smoke Detectors", color: "#ef4444" },
+  { key: "heat",       label: "Heat Detectors",  color: "#eab308" },
   { key: "sprinkler",  label: "Sprinkler",       color: "#ef4444" },
   { key: "fire_hose",  label: "External Hydrant",color: "#ef4444" },
   { key: "mcp_hooter", label: "MCP + Hooter",    color: "#a855f7" },
@@ -74,6 +75,7 @@ const EQUIPMENT_BUTTONS: { key: string; label: string; color: string }[] = [
 
 const ADD_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "smoke", label: "Smoke" },
+  { value: "heat", label: "Heat" },
   { value: "sprinkler", label: "Sprinkler" },
   { value: "fire_hose", label: "External Hydrant" },
   { value: "internal_hydrant", label: "Internal Hydrant" },
@@ -86,6 +88,7 @@ const ADD_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
 
 const DTYPE_COLORS: Record<string, string> = {
   smoke:      "#ef4444",
+  heat:       "#eab308",
   sprinkler:  "#ef4444",
   fire_hose:  "#ef4444",
   internal_hydrant: "#d946ef",
@@ -102,6 +105,7 @@ const DTYPE_COLORS: Record<string, string> = {
 // represents its coverage radius (~1.8 m) as is standard on fire plans.
 const DTYPE_RADIUS_M: Record<string, number> = {
   smoke:            0.10,
+  heat:             0.10,
   sprinkler:        0.40,
   fire_hose:        0.50,
   internal_hydrant: 0.50,
@@ -254,6 +258,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   // Default to 7m as a safety fallback if the endpoint is unreachable.
   const [showCoverageDisks, setShowCoverageDisks] = useState<boolean>(false);
   const [detectorSpacingM, setDetectorSpacingM] = useState<number>(7.0);
+  const [heatDetectorSpacingM, setHeatDetectorSpacingM] = useState<number>(5.0);
   const canEdit = getTenantRole() !== "viewer";
   const hasPipeData = !!(pipesData && ((pipesData.pipes?.length || 0) > 0 || (pipesData.sources?.length || 0) > 0));
 
@@ -311,6 +316,10 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
             const sp = Number(defs?.detector_spacing_m);
             if (!cancelled && Number.isFinite(sp) && sp > 0) {
               setDetectorSpacingM(sp);
+            }
+            const hsp = Number(defs?.heat_detector_spacing_m);
+            if (!cancelled && Number.isFinite(hsp) && hsp > 0) {
+              setHeatDetectorSpacingM(hsp);
             }
           }
         } catch { /* keep fallback */ }
@@ -1359,6 +1368,101 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
           { x, y: y - s },
           { x, y: y + s },
         ], DTYPE_COLORS.sprinkler, 0.72, 1, false);
+
+        if (isSelected) {
+          const selectedPts: any[] = [];
+          const selectedR = s * 1.35;
+          for (let i = 0; i <= 64; i++) {
+            const t = (i / 64) * Math.PI * 2;
+            selectedPts.push(new three.Vector3(x + selectedR * Math.cos(t), y + selectedR * Math.sin(t), 0.72));
+          }
+          const selectedGeom = new three.BufferGeometry().setFromPoints(selectedPts);
+          const selected = new three.Line(
+            selectedGeom,
+            new three.LineBasicMaterial({
+              color: new three.Color("#ffffff"), transparent: true, opacity: 1,
+              depthTest: false, depthWrite: false,
+            }),
+          );
+          selected.renderOrder = 1102;
+          group.add(selected);
+        }
+        continue;
+      }
+
+      // Heat detector symbol: circle with an "H" inside (yellow).
+      if (dtype === "heat") {
+        const s = smokeSymbolRadius;
+
+        // Optional translucent coverage disk (radius = HEAT_DETECTOR_SPACING_M, default 5 m).
+        if (showCoverageDisks && heatDetectorSpacingM > 0) {
+          const coverageR = heatDetectorSpacingM * unitsPerMeter;
+          const hColorFill = DTYPE_COLORS.heat || "#eab308";
+          const coverageMesh = new three.Mesh(
+            new three.CircleGeometry(coverageR, 64),
+            new three.MeshBasicMaterial({
+              color: hColorFill,
+              transparent: true,
+              opacity: 0.12,
+              depthTest: false,
+              depthWrite: false,
+            }),
+          );
+          coverageMesh.position.set(x, y, 0.69);
+          coverageMesh.renderOrder = 1099;
+          group.add(coverageMesh);
+
+          const outlinePts: any[] = [];
+          for (let i = 0; i <= 64; i++) {
+            const t = (i / 64) * Math.PI * 2;
+            outlinePts.push(new three.Vector3(x + coverageR * Math.cos(t), y + coverageR * Math.sin(t), 0.70));
+          }
+          const outline = new three.Line(
+            new three.BufferGeometry().setFromPoints(outlinePts),
+            new three.LineBasicMaterial({
+              color: hColorFill,
+              transparent: true,
+              opacity: 0.45,
+              depthTest: false,
+              depthWrite: false,
+            }),
+          );
+          outline.renderOrder = 1100;
+          group.add(outline);
+        }
+
+        const ringPts: any[] = [];
+        for (let i = 0; i <= 48; i++) {
+          const t = (i / 48) * Math.PI * 2;
+          ringPts.push(new three.Vector3(x + s * Math.cos(t), y + s * Math.sin(t), 0.71));
+        }
+        const ring = new three.Line(
+          new three.BufferGeometry().setFromPoints(ringPts),
+          new three.LineBasicMaterial({
+            color: new three.Color(DTYPE_COLORS.heat || "#eab308"),
+            transparent: true,
+            opacity: 0.95,
+            depthTest: false,
+            depthWrite: false,
+          }),
+        );
+        ring.renderOrder = 1101;
+        group.add(ring);
+
+        const hColor = DTYPE_COLORS.heat || "#eab308";
+        // Letter "H": two verticals + crossbar.
+        addPolyline([
+          { x: x - s * 0.34, y: y - s * 0.56 },
+          { x: x - s * 0.34, y: y + s * 0.56 },
+        ], hColor, 0.72, 1, false);
+        addPolyline([
+          { x: x + s * 0.34, y: y - s * 0.56 },
+          { x: x + s * 0.34, y: y + s * 0.56 },
+        ], hColor, 0.72, 1, false);
+        addPolyline([
+          { x: x - s * 0.34, y: y },
+          { x: x + s * 0.34, y: y },
+        ], hColor, 0.72, 1, false);
 
         if (isSelected) {
           const selectedPts: any[] = [];

@@ -203,9 +203,9 @@ type Detector = {
   floor_plan_id?: string | null;
 };
 
-type ObjectType = "smoke" | "panel" | "hooter" | "mcb" | "sprinkler" | "fire_hose" | "internal_hydrant" | "beam_detector" | "reflector";
+type ObjectType = "smoke" | "heat" | "panel" | "hooter" | "mcb" | "sprinkler" | "fire_hose" | "internal_hydrant" | "beam_detector" | "reflector";
 
-const OBJECT_TYPES: ObjectType[] = ["smoke", "panel", "hooter", "mcb", "sprinkler", "fire_hose", "internal_hydrant", "beam_detector", "reflector"];
+const OBJECT_TYPES: ObjectType[] = ["smoke", "heat", "panel", "hooter", "mcb", "sprinkler", "fire_hose", "internal_hydrant", "beam_detector", "reflector"];
 
 type Mapping = {
   width_px: number;
@@ -666,10 +666,18 @@ export default function ProjectPage({ params }: { params: Promise<{ projectId: s
   }
 
   async function runPipeline() {
-    await saveSettings();
-    setPipelineStage(null);
-    await authFetch(`/api/projects/${projectId}/run`, { method:"POST" });
-    await refresh();
+    try {
+      await saveSettings();
+      setPipelineStage(null);
+      const res = await authFetch(`/api/projects/${projectId}/run`, { method: "POST" });
+      // eslint-disable-next-line no-console
+      console.log("[runPipeline] POST /run status", res.status);
+      await refresh();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[runPipeline] failed", err);
+      alert(`Failed to start pipeline:\n${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   async function retryMaskGenerationStep() {
@@ -6379,7 +6387,17 @@ function renderPlacedObject(dtype: string, cx: number, cy: number, mapping: Mapp
     );
   }
 
-  if (key === "smoke" || key === "heat") {
+  if (key === "heat") {
+    const radiusPx = scaledDeviceRadiusPx(mapping, worldToM, cx, cy, 9);
+    return (
+      <>
+        <circle cx={cx} cy={cy} r={radiusPx} fill="none" stroke="#eab308" strokeWidth={2.2} />
+        <text x={cx} y={cy + 3} textAnchor="middle" fontSize={10} fontWeight={700} fill="#eab308">H</text>
+      </>
+    );
+  }
+
+  if (key === "smoke") {
     const radiusPx = scaledDeviceRadiusPx(mapping, worldToM, cx, cy, 9);
     return (
       <>
@@ -6630,7 +6648,22 @@ function drawPlacedObjectOnCanvas(ctx: CanvasRenderingContext2D, dtype: string, 
     return;
   }
 
-  if (key === "smoke" || key === "heat") {
+  if (key === "heat") {
+    const radiusPx = scaledDeviceRadiusPx(mapping, worldToM, cx, cy, 9);
+    ctx.beginPath();
+    ctx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
+    ctx.strokeStyle = "#eab308";
+    ctx.lineWidth = 2.2;
+    ctx.stroke();
+    ctx.fillStyle = "#eab308";
+    ctx.font = "700 11px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("H", cx, cy + 0.5);
+    return;
+  }
+
+  if (key === "smoke") {
     const radiusPx = scaledDeviceRadiusPx(mapping, worldToM, cx, cy, 9);
     ctx.beginPath();
     ctx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
@@ -6665,6 +6698,8 @@ function objectLabel(dtype: ObjectType): string {
   if (dtype === "internal_hydrant") return "Internal Hydrant";
   if (dtype === "beam_detector") return "Beam Det.";
   if (dtype === "reflector") return "Reflector";
+  if (dtype === "heat") return "Heat";
+  if (dtype === "smoke") return "Smoke";
   return dtype.charAt(0).toUpperCase() + dtype.slice(1);
 }
 

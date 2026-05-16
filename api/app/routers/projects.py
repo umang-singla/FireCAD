@@ -136,7 +136,7 @@ def _project_row_to_out(r) -> ProjectOut:
             return
         p_norm = _normalize_data_path(p)
         try:
-            files[k] = f"/files/{relpath(p_norm)}" if p_norm else None
+            files[k] = f"/files/{relpath(p_norm)}" if p_norm and _artifact_exists(p_norm) else None
         except Exception:
             # Never fail project fetch due to malformed persisted file path.
             files[k] = None
@@ -200,8 +200,11 @@ def config_defaults():
         WALL_BUFFER_M,
         WORLD_TO_M,
     )
+    from app.pipeline.options import PipelineOptions
+    opts = PipelineOptions.from_env()
     return {
         "detector_spacing_m": float(DETECTOR_SPACING_M),
+        "heat_detector_spacing_m": float(opts.heat_detector_spacing_m),
         "wall_buffer_m": float(WALL_BUFFER_M),
         "world_to_m": float(WORLD_TO_M),
     }
@@ -1512,7 +1515,7 @@ def auto_place_floor_plan(project_id: str, fp_id: str, payload: dict = None, use
     import uuid as _uuid
 
     equipment_type = (payload or {}).get("equipment_type", "smoke") if payload else "smoke"
-    ALLOWED_TYPES = {"smoke", "sprinkler", "fire_hose", "panel", "hooter", "mcb", "mcp_hooter"}
+    ALLOWED_TYPES = {"smoke", "heat", "sprinkler", "fire_hose", "panel", "hooter", "mcb", "mcp_hooter"}
     if equipment_type not in ALLOWED_TYPES:
         equipment_type = "smoke"
 
@@ -1570,25 +1573,86 @@ def auto_place_floor_plan(project_id: str, fp_id: str, payload: dict = None, use
                 "dtype": "hooter", "locked": 0, "floor_plan_id": fp_id,
             })
     else:
-        placed, _regions = place_detectors_from_rooms_json(
-            rooms,
-            opts.detector_spacing_m,
-            opts.wall_buffer_m,
-            opts.world_to_m,
-            mapping_json_path=fp_mapping,
-            base_png_path=fp_render,
+        # equipment_type is "smoke" or "heat".
+        # Partition rooms via the DXF-text classifier so toilets, kitchens,
+        # plant rooms, garages, etc. get HEAT and life-safety areas get SMOKE.
+        # A debug PNG is written alongside the floor-plan render showing every
+        # room polygon colour-coded by its classification with its DXF labels.
+        from app.pipeline.dxf_text_filter import split_rooms_by_dxf_text
+        dxf_path = r["dxf_path"] if "dxf_path" in r.keys() else None
+        fp_dir = os.path.dirname(fp_render) if fp_render else None
+        label_debug = (
+            os.path.join(fp_dir, f"block_{fp['block_index']}_room_labels_debug.png")
+            if fp_dir else None
         )
+        try:
+            smoke_rooms, heat_rooms = split_rooms_by_dxf_text(
+                rooms,
+                dxf_path or "",
+                debug_png_path=label_debug,
+                base_png_path=fp_render,
+                mapping_json_path=fp_mapping,
+            )
+        except Exception:
+            import logging as _logging
+            _logging.getLogger("mepit.routers.projects").exception(
+                "auto_place: split_rooms_by_dxf_text failed; falling back to all-smoke",
+            )
+            smoke_rooms, heat_rooms = list(rooms), []
+
+        if equipment_type == "heat":
+            target_rooms = heat_rooms
+            spacing = opts.heat_detector_spacing_m
+        else:
+            target_rooms = smoke_rooms
+            spacing = opts.detector_spacing_m
+
+        if not target_rooms:
+            placed = []
+        else:
+            placed, _regions = place_detectors_from_rooms_json(
+                target_rooms,
+                spacing,
+                opts.wall_buffer_m,
+                opts.world_to_m,
+                mapping_json_path=fp_mapping,
+                base_png_path=fp_render,
+            )
         new_dets = [
             {"id": str(_uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0,
              "dtype": equipment_type, "locked": 0, "floor_plan_id": fp_id}
             for (x, y) in placed
         ]
 
+        # When the user clicked "smoke", also place heat detectors in
+        # heat-classified rooms (kitchens, toilets, plant rooms, garages, ...)
+        # so those rooms aren't left without coverage.
+        if equipment_type == "smoke" and heat_rooms:
+            heat_placed, _ = place_detectors_from_rooms_json(
+                heat_rooms,
+                opts.heat_detector_spacing_m,
+                opts.wall_buffer_m,
+                opts.world_to_m,
+                mapping_json_path=fp_mapping,
+                base_png_path=fp_render,
+            )
+            new_dets.extend(
+                {"id": str(_uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0,
+                 "dtype": "heat", "locked": 0, "floor_plan_id": fp_id}
+                for (x, y) in heat_placed
+            )
+
     with db() as con:
         # Delete only detectors of this type for this floor plan
         if equipment_type == "mcp_hooter":
             con.execute(
                 "DELETE FROM detectors WHERE project_id=? AND dtype IN ('mcb','hooter') AND floor_plan_id=?",
+                (project_id, fp_id),
+            )
+        elif equipment_type == "smoke":
+            # Smoke placement also (re)places heat detectors in heat rooms.
+            con.execute(
+                "DELETE FROM detectors WHERE project_id=? AND dtype IN ('smoke','heat') AND floor_plan_id=?",
                 (project_id, fp_id),
             )
         else:

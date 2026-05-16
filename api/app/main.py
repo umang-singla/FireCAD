@@ -118,16 +118,32 @@ def serve_file(rel_path: str):
     if ".." in rel.split("/"):
         raise HTTPException(status_code=400, detail="invalid path")
 
-    if gcs.enabled():
+    local_path = os.path.join(DATA_DIR, rel.replace("/", os.sep))
+    local_exists = os.path.isfile(local_path)
+
+    # Prefer GCS only when the blob actually exists. Otherwise the browser
+    # would follow a signed URL straight to a 404 on the bucket.
+    if gcs.enabled() and gcs.blob_exists(local_path):
         url = gcs.signed_url_for_rel(rel)
         if url:
             return RedirectResponse(url, status_code=302)
 
-    local_path = os.path.join(DATA_DIR, rel.replace("/", os.sep))
-    if not os.path.isfile(local_path) and gcs.enabled():
+    # Local fallback. Hydrate from GCS if we don't have it cached yet.
+    if not local_exists and gcs.enabled():
         gcs.ensure_rel_cached(rel)
-    if not os.path.isfile(local_path):
+        local_exists = os.path.isfile(local_path)
+
+    if not local_exists:
         raise HTTPException(status_code=404, detail="file not found")
+
+    # Opportunistically push the local file to GCS so subsequent requests
+    # can use the fast signed-URL path.
+    if gcs.enabled():
+        try:
+            gcs.upload_path(local_path)
+        except Exception:  # noqa: BLE001 — never block the response on a sync failure
+            pass
+
     return FileResponse(local_path)
 
 

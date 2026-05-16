@@ -11,6 +11,7 @@ logger = logging.getLogger("mepit.pipeline.dxf_export")
 _SYMBOL_FRAC = 0.005
 
 DXF_LAYER_SMOKE = "AI_SMOKE_DETECTORS"
+DXF_LAYER_HEAT = "AI_HEAT_DETECTORS"
 DXF_LAYER_PANEL = "AI_PANEL"
 DXF_LAYER_HOOTER = "AI_HOOTER"
 DXF_LAYER_MCB = "AI_MCB"
@@ -24,6 +25,7 @@ DXF_LAYER_ANNOTATIONS = "AI_ANNOTATIONS"
 
 LAYER_BY_DTYPE = {
     "smoke": DXF_LAYER_SMOKE,
+    "heat": DXF_LAYER_HEAT,
     "panel": DXF_LAYER_PANEL,
     "hooter": DXF_LAYER_HOOTER,
     "mcb": DXF_LAYER_MCB,
@@ -34,6 +36,7 @@ LAYER_BY_DTYPE = {
 
 LABEL_BY_DTYPE = {
     "smoke": "Smoke",
+    "heat": "Heat",
     "panel": "FACP",
     "facp": "FACP",
     "hooter": "Hooter",
@@ -152,6 +155,13 @@ def _add_smoke_symbol(msp, x: float, y: float, radius: float, layer: str):
     # Keep text inside circle using the same rule from your reference snippet.
     symbol_height = radius * 1.2
     _add_centered_text(msp, "S", x, y, symbol_height, layer, color=1)
+
+
+def _add_heat_symbol(msp, x: float, y: float, radius: float, layer: str):
+    """Heat detector symbol: circle with centered 'H' (color 2 = yellow)."""
+    msp.add_circle((x, y), radius=radius, dxfattribs={"layer": layer, "color": 2})
+    symbol_height = radius * 1.2
+    _add_centered_text(msp, "H", x, y, symbol_height, layer, color=2)
 
 
 def _add_sprinkler_symbol(msp, x: float, y: float, radius: float, layer: str):
@@ -323,6 +333,8 @@ def _add_symbol_for_dtype(msp, dtype: str, x: float, y: float, radius: float):
     layer = LAYER_BY_DTYPE.get(key, DXF_LAYER_SMOKE)
     if key == "smoke":
         _add_smoke_symbol(msp, x, y, radius, layer)
+    elif key == "heat":
+        _add_heat_symbol(msp, x, y, radius, layer)
     elif key == "sprinkler":
         _add_sprinkler_symbol(msp, x, y, radius, layer)
     elif key == "panel":
@@ -463,7 +475,7 @@ def _color_for_pipe_diam(d_mm: int) -> tuple[int, int, int]:
 
 def _legend_dtypes(detectors: list[dict]):
     # Keep mandatory fire-system rows visible even if no explicit detector of that type exists.
-    order = ["smoke", "sprinkler", "sprinkler_pipe", "panel", "mcb", "hooter", "fire_hose", "internal_hydrant"]
+    order = ["smoke", "heat", "sprinkler", "sprinkler_pipe", "panel", "mcb", "hooter", "fire_hose", "internal_hydrant"]
     present = set()
     for d in detectors:
         dtype = _normalize_dtype(d.get("dtype", "smoke"))
@@ -682,7 +694,7 @@ def write_detectors_to_dxf(
 # ──────────────────────────────────────────────────────────────────
 
 # Fire-alarm device types (everything except sprinkler)
-_FIRE_ALARM_DTYPES = {"smoke", "panel", "mcb", "hooter"}
+_FIRE_ALARM_DTYPES = {"smoke", "heat", "panel", "mcb", "hooter"}
 
 # Layout/sheet names
 _LAYOUT_ORIGINAL = "01_ORIGINAL_PLAN"
