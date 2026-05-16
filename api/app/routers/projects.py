@@ -156,6 +156,17 @@ def _project_row_to_out(r) -> ProjectOut:
     add("rooms_json", r["rooms_json_path"])
     add("rooms_debug", rooms_debug_path if _artifact_exists(rooms_debug_path) else None)
     add("output_dxf", r["output_dxf_path"])
+    # DWG sibling of the combined DXF, derived from disk presence (no DB column).
+    _combined_dwg = None
+    try:
+        _odxf = r["output_dxf_path"]
+        if _odxf:
+            _cand = os.path.splitext(_odxf)[0] + ".dwg"
+            if _artifact_exists(_cand):
+                _combined_dwg = _cand
+    except Exception:
+        _combined_dwg = None
+    add("output_dwg", _combined_dwg)
     add("output_preview_png", r["output_preview_png_path"])
     add("output_preview_mapping", preview_mapping_path if _artifact_exists(preview_mapping_path) else None)
     add("detectors_global_snap_debug", detectors_debug_path if _artifact_exists(detectors_debug_path) else None)
@@ -1261,6 +1272,18 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
             world_to_m=opts.world_to_m,
             world_bbox=world_bbox,
         )
+
+        # Also produce a DWG sibling of the combined DXF for users who need DWG.
+        # Failure here is non-fatal: the DXF is still saved.
+        try:
+            from app.pipeline.oda_convert import dxf_to_dwg
+            out_combined_dwg = os.path.splitext(out_combined)[0] + ".dwg"
+            dxf_to_dwg(out_combined, out_combined_dwg)
+        except Exception as _dwg_err:
+            import logging as _lg
+            _lg.getLogger("mepit.api").warning(
+                "DWG export skipped: %s", _dwg_err,
+            )
 
         # No PNG preview rendering needed - frontend handles DXF visualization
         con.execute(

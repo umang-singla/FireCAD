@@ -245,6 +245,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   const [pipesModified, setPipesModified] = useState<boolean>(false);
   // Export
   const [isExportingDxf, setIsExportingDxf] = useState(false);
+  const [isExportingDwg, setIsExportingDwg] = useState(false);
   // Equipment-layer visibility (virtual layers for detector dtypes + pipes).
   // Keys are detector dtype values (smoke, sprinkler, ...) plus the special
   // key "pipes" for sprinkler pipe routing. Defaults to all visible.
@@ -2679,6 +2680,108 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     }
   }
 
+  // ── Export DWG ──
+  // Same flow as exportDxf, but downloads the DWG sibling produced by the
+  // backend (via ODA File Converter) after /save.
+  async function exportDwg() {
+    if (!projectId) return;
+    setIsExportingDwg(true);
+    try {
+      const token = getToken();
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) headers.Authorization = `Bearer ${token}`;
+
+      if (hasManualChanges) {
+        const bulkRes = await fetch(apiUrl(`/api/projects/${projectId}/bulk_save`), {
+          method: "PUT",
+          headers,
+          body: JSON.stringify({
+            detectors: detectors.map((d) => ({
+              id: d.id,
+              x: d.x,
+              y: d.y,
+              z: Number(d.z) || 0,
+              rotation_deg: Number(d.rotation_deg) || 0,
+              dtype: d.dtype,
+              locked: !!d.locked,
+              floor_plan_id: d.floor_plan_id ?? null,
+            })),
+          }),
+        });
+        if (!bulkRes.ok) {
+          const text = await bulkRes.text();
+          throw new Error(text || `Failed to save edits (${bulkRes.status})`);
+        }
+        const bulkPayload = await bulkRes.json();
+        if (Array.isArray(bulkPayload?.detectors)) {
+          setDetectors(bulkPayload.detectors as Detector[]);
+        }
+        setHasManualChanges(false);
+      }
+
+      if (manualPipes.length > 0 || pipesModified) {
+        try {
+          const mergedPipes = [
+            ...((pipesData?.pipes ?? []).map((p) => ({
+              from: p.from,
+              to: p.to,
+              diameter: p.diameter,
+            }))),
+            ...manualPipes.map((p) => ({
+              from: p.from,
+              to: p.to,
+              diameter: p.diameter,
+            })),
+          ];
+          await fetch(apiUrl(`/api/projects/${projectId}/sprinkler_pipes`), {
+            method: "PUT",
+            headers,
+            body: JSON.stringify({
+              pipes: mergedPipes,
+              sources: pipesData?.sources ?? [],
+            }),
+          });
+          setPipesModified(false);
+        } catch (e) {
+          console.warn("Failed to upload manual pipes prior to DWG export:", e);
+        }
+      }
+
+      const saveRes = await fetch(apiUrl(`/api/projects/${projectId}/save`), {
+        method: "POST",
+        headers,
+      });
+      if (!saveRes.ok) {
+        const text = await saveRes.text();
+        throw new Error(text || `Failed to generate output DWG (${saveRes.status})`);
+      }
+      const proj = await saveRes.json();
+      const outputDwg = proj?.files?.output_dwg as string | undefined;
+      if (!outputDwg) {
+        throw new Error(
+          "Backend did not produce a DWG (ODA File Converter may be unavailable).",
+        );
+      }
+
+      const fileRes = await fetch(apiUrl(outputDwg), { headers: token ? { Authorization: `Bearer ${token}` } : undefined });
+      if (!fileRes.ok) {
+        throw new Error(`Failed to download output DWG (${fileRes.status})`);
+      }
+      const blob = await fileRes.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${projectName || "drawing"}_with_equipment.dwg`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: any) {
+      console.error("DWG export failed", e);
+      setManualEditMsg(e?.message || "Failed to export DWG.");
+    } finally {
+      setIsExportingDwg(false);
+    }
+  }
+
   // ── Manual pipe draw pointer handler ──
   useEffect(() => {
     if (tool !== "draw-pipe") return;
@@ -2963,6 +3066,20 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                     }}
                   >
                     {isExportingDxf ? "Exporting..." : "⬇ Export DXF"}
+                  </button>
+                  <button
+                    onClick={exportDwg}
+                    disabled={!dxfUrl || isExportingDwg}
+                    style={{
+                      ...btnStyle,
+                      background: "#0ea5e9",
+                      borderColor: "#0284c7",
+                      color: "#fff",
+                      opacity: (!dxfUrl || isExportingDwg) ? 0.6 : 1,
+                      cursor: (!dxfUrl || isExportingDwg) ? "not-allowed" : "pointer",
+                    }}
+                  >
+                    {isExportingDwg ? "Converting..." : "⬇ Export DWG"}
                   </button>
                 </div>
               </div>
