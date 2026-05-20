@@ -102,7 +102,7 @@ const DTYPE_COLORS: Record<string, string> = {
   fire_hose:  "#ef4444",
   internal_hydrant: "#d946ef",
   beam_detector: "#ff00cc",
-  reflector: "#2563eb",
+  reflector: "#2D6A4F",
   mcb:        "#a855f7",
   hooter:     "#ec4899",
   panel:      "#14b8a6",
@@ -3987,8 +3987,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       style={{
         position: "fixed", inset: 0,
         display: "flex", flexDirection: "column",
-        fontFamily: "'Segoe UI', system-ui, sans-serif",
-        background: "#1e1e2e", color: "#cdd6f4",
+        fontFamily: "'Segoe UI', 'Helvetica Neue', system-ui, sans-serif",
+        background: SD.bg, color: SD.text,
         overflow: "hidden",
       }}
     >
@@ -3996,8 +3996,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
         style={{
           display: "flex",
           flexDirection: "column",
-          borderBottom: "1px solid #313244",
-          background: "#181825",
+          borderBottom: `1px solid ${SD.border}`,
+          background: SD.surface,
           flexShrink: 0,
           zIndex: 10,
         }}
@@ -4007,76 +4007,87 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
-            padding: "8px 16px 6px",
-            borderBottom: "1px solid #242438",
+            padding: "4px 12px",
+            borderBottom: `1px solid ${SD.divider}`,
+            background: SD.surfaceAlt,
+            minHeight: 32,
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <a
               href={`/p/${projectId}`}
-              style={{ color: "#cba6f7", textDecoration: "none", fontSize: 13 }}
+              style={{ color: SD.accent, textDecoration: "none", fontSize: 12 }}
             >
-              ← Back to editor
+              ← Back
             </a>
-            <h1 style={{ fontSize: 15, fontWeight: 600, color: "#cba6f7", margin: 0 }}>
-              📐 DXF Editor
-            </h1>
-            {projectName ? (
-              <span style={{ fontSize: 12, color: "#a6adc8" }}>— {projectName}</span>
-            ) : null}
+            <span style={{ color: SD.divider }}>│</span>
+            <span style={{ fontSize: 13, fontWeight: 600, color: SD.text }}>
+              {projectName || "Untitled Drawing"}
+            </span>
+            <span style={{ fontSize: 11, color: SD.textMuted }}>
+              {canEdit ? `· ${tool.toUpperCase()}` : "· View only"}
+              {measureDistanceM != null ? ` · ${measureDistanceM.toFixed(3)} m` : ""}
+            </span>
           </div>
-          <div style={{ fontSize: 12, color: "#a6adc8" }}>
-            {canEdit ? `Mode: ${tool.toUpperCase()}` : "View only"}
-            {measureDistanceM != null ? ` • Measure: ${measureDistanceM.toFixed(3)} m` : ""}
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <button
+              style={{ ...btnStyle, padding: "3px 10px", fontSize: 11 }}
+              onClick={saveManualEdits}
+              disabled={!hasManualChanges || isSavingEdits}
+              title="Save"
+            >
+              {isSavingEdits ? "Saving…" : hasManualChanges ? "Save" : "Saved"}
+            </button>
+            <button
+              style={{ ...btnStyle, padding: "3px 10px", fontSize: 11 }}
+              onClick={exportDxf}
+              disabled={!dxfUrl || isExportingDxf}
+              title="Export DXF"
+            >
+              {isExportingDxf ? "Exporting…" : "↓ DXF"}
+            </button>
+            <button
+              style={{ ...btnStyle, padding: "3px 10px", fontSize: 11 }}
+              onClick={exportDwg}
+              disabled={!dxfUrl || isExportingDwg}
+              title="Export DWG"
+            >
+              {isExportingDwg ? "…" : "↓ DWG"}
+            </button>
+            <div style={{
+              width: 26, height: 26, borderRadius: "50%",
+              background: SD.accent, color: "#fff",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 11, fontWeight: 700,
+            }}>
+              U
+            </div>
           </div>
         </div>
 
-        <div style={{ display: "flex", gap: 4, padding: "6px 16px 0" }}>
-          <button onClick={() => setRibbonTab("home")} style={ribbonTabBtn(ribbonTab === "home")}>Home</button>
-          <button onClick={() => setRibbonTab("insert")} style={ribbonTabBtn(ribbonTab === "insert")}>Insert</button>
+        <div style={{
+          display: "flex", gap: 0,
+          padding: "0 12px",
+          background: SD.surfaceAlt,
+          borderBottom: `1px solid ${SD.border}`,
+        }}>
+          <button onClick={() => setRibbonTab("home")} style={ribbonTabBtn(ribbonTab === "home")}>Edit</button>
+          <button onClick={() => setRibbonTab("insert")} style={ribbonTabBtn(ribbonTab === "insert")}>Pipes</button>
           <button onClick={() => setRibbonTab("automation")} style={ribbonTabBtn(ribbonTab === "automation")}>Automation</button>
-          <button onClick={() => setRibbonTab("view")} style={ribbonTabBtn(ribbonTab === "view")}>View</button>
         </div>
 
         <div
           style={{
             display: "flex",
-            gap: 10,
+            gap: 0,
             alignItems: "stretch",
-            padding: "8px 16px 10px",
-            background: "#1d1d31",
-            borderTop: "1px solid #242438",
+            padding: "4px 8px",
+            background: SD.surface,
+            minHeight: 70,
           }}
         >
           {ribbonTab === "home" ? (
             <>
-              {canEdit ? (
-                <div style={ribbonGroupStyle}>
-                  <div style={ribbonGroupTitleStyle}>Tools</div>
-                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                    <button onClick={() => setTool("pan")} style={{ ...btnStyle, background: tool === "pan" ? "#585b70" : btnStyle.background }}>Pan</button>
-                    <button onClick={() => setTool("select")} style={{ ...btnStyle, background: tool === "select" ? "#585b70" : btnStyle.background }}>Select</button>
-                    <button onClick={() => setTool("add")} style={{ ...btnStyle, background: tool === "add" ? "#585b70" : btnStyle.background }}>Add</button>
-                    <button onClick={() => setTool("erase")} style={{ ...btnStyle, background: tool === "erase" ? "#585b70" : btnStyle.background }}>Erase</button>
-                    <button onClick={() => setTool("measure")} style={{ ...btnStyle, background: tool === "measure" ? "#585b70" : btnStyle.background }}>Measure</button>
-                    <button
-                      onClick={saveManualEdits}
-                      disabled={!hasManualChanges || isSavingEdits}
-                      style={{
-                        ...btnStyle,
-                        background: "#22c55e",
-                        borderColor: "#16a34a",
-                        color: "#08130b",
-                        opacity: (!hasManualChanges || isSavingEdits) ? 0.6 : 1,
-                        cursor: (!hasManualChanges || isSavingEdits) ? "not-allowed" : "pointer",
-                      }}
-                    >
-                      {isSavingEdits ? "Saving..." : "Save"}
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-
               {canEdit ? (
                 <div style={ribbonGroupStyle}>
                   <div style={ribbonGroupTitleStyle}>Placement</div>
@@ -4085,9 +4096,9 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                       value={addType}
                       onChange={(e) => setAddType(e.target.value)}
                       style={{
-                        background: "#313244",
-                        color: "#cdd6f4",
-                        border: "1px solid #45475a",
+                        background: "#E8EAED",
+                        color: "#1A1A2E",
+                        border: "1px solid #E8EAED",
                         borderRadius: 6,
                         padding: "6px 10px",
                         fontSize: 13,
@@ -4113,8 +4124,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                       disabled={!hasManualChanges || isSavingEdits}
                       style={{
                         ...btnStyle,
-                        background: "#22c55e",
-                        borderColor: "#16a34a",
+                        background: "#2D6A4F",
+                        borderColor: "#2D6A4F",
                         color: "#08130b",
                         opacity: (!hasManualChanges || isSavingEdits) ? 0.6 : 1,
                         cursor: (!hasManualChanges || isSavingEdits) ? "not-allowed" : "pointer",
@@ -4123,19 +4134,11 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                       {isSavingEdits ? "Saving..." : hasManualChanges ? "Save Edits" : "Saved"}
                     </button>
                     {selectedDetectorIds.length > 0 ? (
-                      <span style={{ fontSize: 11, color: "#a6adc8" }}>Selected: {selectedDetectorIds.length}</span>
+                      <span style={{ fontSize: 11, color: "#6B7280" }}>Selected: {selectedDetectorIds.length}</span>
                     ) : null}
                   </div>
                 </div>
               ) : null}
-
-              <div style={ribbonGroupStyle}>
-                <div style={ribbonGroupTitleStyle}>Quick View</div>
-                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  <button onClick={fitView} style={btnStyle}>⊡ Fit</button>
-                  <button onClick={() => setShowLayers((v) => !v)} style={btnStyle}>☰ Layers ({layers.length})</button>
-                </div>
-              </div>
 
               <div style={ribbonGroupStyle}>
                 <div style={ribbonGroupTitleStyle}>Export</div>
@@ -4145,8 +4148,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                     disabled={!dxfUrl || isExportingDxf}
                     style={{
                       ...btnStyle,
-                      background: "#7c3aed",
-                      borderColor: "#6d28d9",
+                      background: "#2D6A4F",
+                      borderColor: "#1F4A37",
                       color: "#fff",
                       opacity: (!dxfUrl || isExportingDxf) ? 0.6 : 1,
                       cursor: (!dxfUrl || isExportingDxf) ? "not-allowed" : "pointer",
@@ -4159,8 +4162,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                     disabled={!dxfUrl || isExportingDwg}
                     style={{
                       ...btnStyle,
-                      background: "#0ea5e9",
-                      borderColor: "#0284c7",
+                      background: "#2D6A4F",
+                      borderColor: "#1F4A37",
                       color: "#fff",
                       opacity: (!dxfUrl || isExportingDwg) ? 0.6 : 1,
                       cursor: (!dxfUrl || isExportingDwg) ? "not-allowed" : "pointer",
@@ -4178,48 +4181,16 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
             <>
               {canEdit ? (
                 <div style={ribbonGroupStyle}>
-                  <div style={ribbonGroupTitleStyle}>Insert Equipment</div>
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(84px, 1fr))", gap: 8, minWidth: 520 }}>
-                    {ADD_TYPE_OPTIONS.map((opt) => (
-                      <button
-                        key={opt.value}
-                        onClick={() => {
-                          setAddType(opt.value);
-                          setTool("add");
-                        }}
-                        style={{
-                          ...insertToolTileStyle,
-                          borderColor: addType === opt.value ? "#89b4fa" : "#45475a",
-                          background: addType === opt.value ? "#3a3a5c" : "#313244",
-                        }}
-                      >
-                        <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", height: 28, marginBottom: 4 }}>
-                          {renderInsertToolPreview(opt.value)}
-                        </span>
-                        <span style={{ fontSize: 11, textAlign: "center", lineHeight: 1.15 }}>{opt.label}</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <div style={ribbonGroupStyle}>
-                  <div style={ribbonGroupTitleStyle}>Insert</div>
-                  <div style={{ fontSize: 12, color: "#a6adc8" }}>Viewer role cannot insert symbols.</div>
-                </div>
-              )}
-
-              {canEdit ? (
-                <div style={ribbonGroupStyle}>
                   <div style={ribbonGroupTitleStyle}>Draw Pipe</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 8, minWidth: 240 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                      <span style={{ fontSize: 12, color: "#a6adc8" }}>Diameter:</span>
+                      <span style={{ fontSize: 12, color: "#6B7280" }}>Diameter:</span>
                       <select
                         value={pipeDrawDiameter}
                         onChange={(e) => setPipeDrawDiameter(Number(e.target.value))}
                         style={{
-                          background: "#313244", color: "#cdd6f4",
-                          border: "1px solid #45475a", borderRadius: 6,
+                          background: "#E8EAED", color: "#1A1A2E",
+                          border: "1px solid #E8EAED", borderRadius: 6,
                           padding: "5px 8px", fontSize: 13,
                         }}
                       >
@@ -4240,7 +4211,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                         style={{
                           ...btnStyle,
                           background: tool === "draw-pipe" ? "#3b82f6" : btnStyle.background,
-                          borderColor: tool === "draw-pipe" ? "#2563eb" : "#45475a",
+                          borderColor: tool === "draw-pipe" ? "#2D6A4F" : "#E8EAED",
                           color: tool === "draw-pipe" ? "#fff" : btnStyle.color,
                         }}
                       >
@@ -4248,7 +4219,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                       </button>
                     </div>
                     {tool === "draw-pipe" ? (
-                      <div style={{ fontSize: 11, color: "#93c5fd", lineHeight: 1.4 }}>
+                      <div style={{ fontSize: 11, color: "#2D6A4F", lineHeight: 1.4 }}>
                         {pipeDrawStart
                           ? "Click to end segment. Click again to chain. Esc to finish."
                           : "Click on drawing to start a pipe segment."}
@@ -4256,14 +4227,14 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                     ) : null}
                     {manualPipes.length > 0 ? (
                       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <span style={{ fontSize: 11, color: "#a6adc8" }}>{manualPipes.length} manual pipe{manualPipes.length !== 1 ? "s" : ""}</span>
+                        <span style={{ fontSize: 11, color: "#6B7280" }}>{manualPipes.length} manual pipe{manualPipes.length !== 1 ? "s" : ""}</span>
                         <button
                           onClick={() => {
                             setManualPipes([]);
                             setPipeDrawStart(null);
                             setPipeDrawPreview(null);
                           }}
-                          style={{ ...btnStyle, background: "#991b1b", borderColor: "#7f1d1d", color: "#fff", padding: "3px 8px", fontSize: 11 }}
+                          style={{ ...btnStyle, background: "#B42318", borderColor: "#7A1810", color: "#fff", padding: "3px 8px", fontSize: 11 }}
                         >
                           Clear
                         </button>
@@ -4288,7 +4259,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                       style={{
                         ...btnStyle,
                         background: tool === "measure" ? "#0891b2" : btnStyle.background,
-                        borderColor: tool === "measure" ? "#0e7490" : "#45475a",
+                        borderColor: tool === "measure" ? "#0e7490" : "#E8EAED",
                         color: tool === "measure" ? "#ecfeff" : btnStyle.color,
                       }}
                     >
@@ -4305,7 +4276,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                       Clear
                     </button>
                   </div>
-                  <div style={{ fontSize: 11, color: "#a6adc8", lineHeight: 1.4 }}>
+                  <div style={{ fontSize: 11, color: "#6B7280", lineHeight: 1.4 }}>
                     {tool === "measure"
                       ? (measureStart
                         ? (measureEnd ? "Click again to start a new measurement. Esc clears."
@@ -4330,7 +4301,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                   <div style={ribbonGroupTitleStyle}>Auto-place Equipment</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 320 }}>
                     {!selectedFloorId ? (
-                      <div style={{ fontSize: 11, color: "#6c7086" }}>
+                      <div style={{ fontSize: 11, color: "#9AA1AC" }}>
                         Select a floor first to run automation.
                       </div>
                     ) : null}
@@ -4357,9 +4328,9 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                               display: "flex", alignItems: "center", gap: 8,
                               padding: "8px 10px", fontSize: 12,
                               borderRadius: 6,
-                              border: "1px solid #45475a",
-                              background: isPlacing ? "#3a3a5c" : "#1e1e2e",
-                              color: disabled && !isPlacing ? "#6c7086" : "#cdd6f4",
+                              border: "1px solid #E8EAED",
+                              background: isPlacing ? "#E7F1EC" : "#F0F2F5",
+                              color: disabled && !isPlacing ? "#9AA1AC" : "#1A1A2E",
                               cursor: disabled ? "not-allowed" : "pointer",
                               opacity: disabled && !isPlacing ? 0.6 : 1,
                               textAlign: "left",
@@ -4372,7 +4343,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                               }}
                             />
                             <span style={{ flex: 1 }}>{btn.label}</span>
-                            <span style={{ fontSize: 10, color: "#6c7086" }}>
+                            <span style={{ fontSize: 10, color: "#9AA1AC" }}>
                               {isPlacing ? "Placing..." : placed > 0 ? `${placed} placed` : ""}
                             </span>
                           </button>
@@ -4380,7 +4351,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                       });
                     })()}
                     {autoPlaceMsg ? (
-                      <div style={{ fontSize: 11, color: "#a6adc8", paddingTop: 2, lineHeight: 1.4 }}>
+                      <div style={{ fontSize: 11, color: "#6B7280", paddingTop: 2, lineHeight: 1.4 }}>
                         {autoPlaceMsg}
                       </div>
                     ) : null}
@@ -4389,7 +4360,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
               ) : (
                 <div style={ribbonGroupStyle}>
                   <div style={ribbonGroupTitleStyle}>Automation</div>
-                  <div style={{ fontSize: 12, color: "#a6adc8" }}>Viewer role cannot run automation.</div>
+                  <div style={{ fontSize: 12, color: "#6B7280" }}>Viewer role cannot run automation.</div>
                 </div>
               )}
 
@@ -4401,7 +4372,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                     disabled={!canEdit || isRoutingPipes || isDetectingSources || isClearingPipes}
                     style={{
                       ...btnStyle,
-                      background: sourceSelectMode ? "#f59e0b" : "#dc2626",
+                      background: sourceSelectMode ? "#D97706" : "#B42318",
                       borderColor: "#b91c1c",
                       color: "#fff",
                       opacity: !canEdit || isRoutingPipes || isDetectingSources || isClearingPipes ? 0.6 : 1,
@@ -4415,8 +4386,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                     disabled={!canEdit || !sourceSelectMode || !chosenSource || isRoutingPipes || isDetectingSources || isClearingPipes}
                     style={{
                       ...btnStyle,
-                      background: sourceSelectMode && chosenSource ? "#16a34a" : btnStyle.background,
-                      borderColor: sourceSelectMode && chosenSource ? "#15803d" : "#45475a",
+                      background: sourceSelectMode && chosenSource ? "#2D6A4F" : btnStyle.background,
+                      borderColor: sourceSelectMode && chosenSource ? "#15803d" : "#E8EAED",
                       color: sourceSelectMode && chosenSource ? "#fff" : btnStyle.color,
                       opacity: !canEdit || !sourceSelectMode || !chosenSource || isRoutingPipes || isDetectingSources || isClearingPipes ? 0.6 : 1,
                       cursor: !canEdit || !sourceSelectMode || !chosenSource || isRoutingPipes || isDetectingSources || isClearingPipes ? "not-allowed" : "pointer",
@@ -4429,8 +4400,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                     disabled={!canEdit || !hasPipeData || isRoutingPipes || isDetectingSources || isClearingPipes}
                     style={{
                       ...btnStyle,
-                      background: "#991b1b",
-                      borderColor: "#7f1d1d",
+                      background: "#B42318",
+                      borderColor: "#7A1810",
                       color: "#fff",
                       opacity: !canEdit || !hasPipeData || isRoutingPipes || isDetectingSources || isClearingPipes ? 0.6 : 1,
                       cursor: !canEdit || !hasPipeData || isRoutingPipes || isDetectingSources || isClearingPipes ? "not-allowed" : "pointer",
@@ -4439,7 +4410,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                   >
                     {isClearingPipes ? "Clearing..." : selectedFloorId ? "Clear Pipes (Block)" : "Clear Pipes"}
                   </button>
-                  <span style={{ fontSize: 11, color: "#a6adc8" }}>
+                  <span style={{ fontSize: 11, color: "#6B7280" }}>
                     {pipesData?.pipes?.length ? `${pipesData.pipes.length} segment${pipesData.pipes.length === 1 ? "" : "s"}` : "No pipes yet"}
                   </span>
                 </div>
@@ -4447,45 +4418,210 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
             </>
           ) : null}
 
-          {ribbonTab === "view" ? (
-            <>
-              <div style={ribbonGroupStyle}>
-                <div style={ribbonGroupTitleStyle}>Panels</div>
-                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  <button onClick={() => setShowLayers((v) => !v)} style={btnStyle}>☰ Layers ({layers.length})</button>
-                  <button onClick={() => setShowBlocks((v) => !v)} style={btnStyle}>▦ Blocks ({blocks.length})</button>
-                  {floorPlans.length > 0 ? (
-                    <button
-                      onClick={() => setShowFloors((v) => !v)}
-                      style={{
-                        ...btnStyle,
-                        background: showFloors ? "#3a3a5c" : btnStyle.background,
-                        borderColor: showFloors ? "#89b4fa" : "#45475a",
-                      }}
-                    >
-                      🏢 Floors ({floorPlans.length})
-                    </button>
-                  ) : null}
-                </div>
-              </div>
-
-              <div style={ribbonGroupStyle}>
-                <div style={ribbonGroupTitleStyle}>Display</div>
-                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  <button onClick={fitView} style={btnStyle}>⊡ Fit</button>
-                  <button onClick={() => setBgIdx((i) => (i + 1) % bgColors.length)} style={btnStyle}>◑ BG</button>
-                </div>
-              </div>
-
-            </>
-          ) : null}
         </div>
       </header>
 
-      <div
-        ref={containerRef}
-        style={{ flex: 1, position: "relative", overflow: "hidden" }}
-      >
+      {/* SmartDraw-style body: left sidebar + center workspace */}
+      <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
+        {/* ── Left sidebar ───────────────────────────────── */}
+        <aside style={sidebarStyle}>
+          <div style={{ overflowY: "auto", flex: 1 }}>
+            {/* Tools */}
+            <div style={sidebarSectionTitleStyle}>
+              <span>Tools</span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 4, padding: 8 }}>
+              {([
+                { key: "pan", label: "Pan", icon: "✋" },
+                { key: "select", label: "Select", icon: "↖" },
+                { key: "add", label: "Place", icon: "✛" },
+                { key: "draw-pipe", label: "Line", icon: "╱" },
+                { key: "measure", label: "Measure", icon: "📏" },
+                { key: "erase", label: "Erase", icon: "✕" },
+              ] as const).map((t) => {
+                const active = tool === t.key;
+                return (
+                  <button
+                    key={t.key}
+                    disabled={!canEdit && t.key !== "pan" && t.key !== "measure"}
+                    onClick={() => setTool(t.key as any)}
+                    title={t.label}
+                    style={{
+                      display: "flex", flexDirection: "column",
+                      alignItems: "center", justifyContent: "center",
+                      gap: 2,
+                      padding: "8px 4px",
+                      background: active ? SD.active : SD.surface,
+                      border: `1px solid ${active ? SD.activeBorder : SD.border}`,
+                      borderRadius: 4,
+                      cursor: "pointer",
+                      color: SD.text,
+                      fontSize: 10,
+                      minHeight: 48,
+                    }}
+                  >
+                    <span style={{ fontSize: 16, lineHeight: 1 }}>{t.icon}</span>
+                    <span>{t.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Panel toggles */}
+            <div style={{ padding: "4px 8px 8px", display: "flex", flexDirection: "column", gap: 4 }}>
+              <button
+                onClick={() => setShowLayers((v) => !v)}
+                style={{
+                  ...sidebarItemStyle,
+                  padding: "6px 10px",
+                  border: `1px solid ${SD.border}`,
+                  borderRadius: 4,
+                  background: showLayers ? SD.active : SD.surface,
+                  fontWeight: 500,
+                }}
+              >
+                <span style={{ fontSize: 14 }}>☰</span>
+                <span>Layers ({layers.length})</span>
+              </button>
+              <button
+                onClick={() => setShowBlocks((v) => !v)}
+                style={{
+                  ...sidebarItemStyle,
+                  padding: "6px 10px",
+                  border: `1px solid ${SD.border}`,
+                  borderRadius: 4,
+                  background: showBlocks ? SD.active : SD.surface,
+                  fontWeight: 500,
+                }}
+              >
+                <span style={{ fontSize: 14 }}>▦</span>
+                <span>Blocks ({blocks.length})</span>
+              </button>
+            </div>
+
+            {/* Equipment Symbols */}
+            <div style={sidebarSectionTitleStyle}>
+              <span>Symbols</span>
+            </div>
+            <div style={{ padding: "8px 10px" }}>
+              <input
+                type="text"
+                placeholder="Search symbols…"
+                style={{
+                  width: "100%",
+                  padding: "5px 8px",
+                  fontSize: 12,
+                  border: `1px solid ${SD.border}`,
+                  borderRadius: 4,
+                  outline: "none",
+                  background: SD.surface,
+                  color: SD.text,
+                }}
+                onChange={() => {}}
+              />
+            </div>
+            {canEdit ? (
+              <div style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(3, 1fr)",
+                gap: 4,
+                padding: "0 8px 8px",
+              }}>
+                {ADD_TYPE_OPTIONS.map((opt) => {
+                  const active = addType === opt.value && tool === "add";
+                  return (
+                    <button
+                      key={opt.value}
+                      onClick={() => { setAddType(opt.value); setTool("add"); }}
+                      title={opt.label}
+                      style={{
+                        ...insertToolTileStyle,
+                        minHeight: 56,
+                        borderColor: active ? SD.activeBorder : SD.border,
+                        background: active ? SD.active : SD.surface,
+                      }}
+                    >
+                      <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", height: 24 }}>
+                        {renderInsertToolPreview(opt.value)}
+                      </span>
+                      <span style={{ fontSize: 9, textAlign: "center", lineHeight: 1.15 }}>{opt.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
+
+          </div>
+        </aside>
+
+        {/* ── Center workspace ───────────────────────────── */}
+        <section style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, background: SD.bg }}>
+          {/* Page tabs */}
+          <div style={pageTabsStyle}>
+            <div style={{
+              padding: "4px 14px",
+              fontSize: 11,
+              background: SD.surface,
+              border: `1px solid ${SD.border}`,
+              borderBottom: "none",
+              borderTopLeftRadius: 3,
+              borderTopRightRadius: 3,
+              color: SD.text,
+              fontWeight: 600,
+            }}>Page 1</div>
+            <button style={{
+              padding: "4px 10px",
+              fontSize: 11,
+              background: "transparent",
+              border: "none",
+              color: SD.textSubtle,
+              cursor: "pointer",
+            }}>+</button>
+          </div>
+
+          {/* Rulers + canvas */}
+          <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+            {/* Top ruler row (corner + horizontal) */}
+            <div style={{ display: "flex", flexShrink: 0 }}>
+              <div style={{ width: 18, height: 18, background: SD.surfaceAlt, borderRight: `1px solid ${SD.border}`, borderBottom: `1px solid ${SD.border}` }} />
+              <div style={{ ...rulerHStyle, flex: 1 }}>
+                {Array.from({ length: 60 }).map((_, i) => (
+                  <div key={i} style={{
+                    position: "absolute",
+                    left: `${i * 40}px`,
+                    top: 0,
+                    bottom: 0,
+                    width: 1,
+                    background: i % 5 === 0 ? SD.borderStrong : SD.border,
+                  }}>
+                    {i % 5 === 0 ? (
+                      <span style={{ position: "absolute", top: 1, left: 2, fontSize: 8 }}>{i}</span>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
+              <div style={rulerVStyle}>
+                {Array.from({ length: 60 }).map((_, i) => (
+                  <div key={i} style={{
+                    position: "absolute",
+                    top: `${i * 40}px`,
+                    left: 0,
+                    right: 0,
+                    height: 1,
+                    background: i % 5 === 0 ? SD.borderStrong : SD.border,
+                  }}>
+                    {i % 5 === 0 ? (
+                      <span style={{ position: "absolute", left: 1, top: 1, fontSize: 8, writingMode: "vertical-rl" }}>{i}</span>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+              <div
+                ref={containerRef}
+                style={{ flex: 1, position: "relative", overflow: "hidden", background: SD.bg }}
+              >
 
         {canEdit && (tool !== "pan" || sourceSelectMode) ? (
           <div style={{
@@ -4494,12 +4630,12 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
             left: "50%",
             transform: "translateX(-50%)",
             zIndex: 14,
-            background: "rgba(24,24,37,0.88)",
-            border: "1px solid #45475a",
+            background: "rgba(255,255,255,0.96)",
+            border: "1px solid #E8EAED",
             borderRadius: 8,
             padding: "6px 10px",
             fontSize: 12,
-            color: "#cdd6f4",
+            color: "#1A1A2E",
             pointerEvents: "none",
           }}>
             {sourceSelectMode
@@ -4532,7 +4668,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
               top: marqueeRect.top,
               width: marqueeRect.width,
               height: marqueeRect.height,
-              border: "1px dashed #f59e0b",
+              border: "1px dashed #D97706",
               background: "rgba(245, 158, 11, 0.12)",
               zIndex: 13,
               pointerEvents: "none",
@@ -4557,11 +4693,11 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                 left: 16,
                 zIndex: 15,
                 background: "rgba(24,24,37,0.96)",
-                border: "1px solid #45475a",
+                border: "1px solid #E8EAED",
                 borderRadius: 8,
                 padding: "10px 12px",
                 fontSize: 12,
-                color: "#cdd6f4",
+                color: "#1A1A2E",
                 display: "flex",
                 flexDirection: "column",
                 gap: 8,
@@ -4583,14 +4719,14 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                 >×</button>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <label style={{ color: "#a6adc8" }}>Diameter:</label>
+                <label style={{ color: "#6B7280" }}>Diameter:</label>
                 <select
                   value={mm}
                   onChange={(e) => changeSelectedPipeDiameter(Number(e.target.value))}
                   disabled={!canEdit}
                   style={{
-                    background: "#313244", color: "#cdd6f4",
-                    border: "1px solid #45475a", borderRadius: 6,
+                    background: "#E8EAED", color: "#1A1A2E",
+                    border: "1px solid #E8EAED", borderRadius: 6,
                     padding: "4px 8px", fontSize: 12,
                   }}
                 >
@@ -4608,8 +4744,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                   disabled={!canEdit}
                   style={{
                     flex: 1,
-                    background: "#991b1b", borderColor: "#7f1d1d",
-                    color: "#fff", border: "1px solid #7f1d1d",
+                    background: "#B42318", borderColor: "#7A1810",
+                    color: "#fff", border: "1px solid #7A1810",
                     borderRadius: 6, padding: "5px 10px", fontSize: 12,
                     cursor: canEdit ? "pointer" : "not-allowed",
                     opacity: canEdit ? 1 : 0.5,
@@ -4632,11 +4768,11 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
               transform: "translateX(-50%)",
               zIndex: 14,
               background: "rgba(24,24,37,0.94)",
-              border: "1px solid #45475a",
+              border: "1px solid #E8EAED",
               borderRadius: 8,
               padding: "6px 10px",
               fontSize: 12,
-              color: "#cdd6f4",
+              color: "#1A1A2E",
             }}
           >
             {pipeMsg}
@@ -4654,8 +4790,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
           <div style={overlayStyle}>
             <div style={spinnerStyle} />
             <div style={{ marginTop: 12, fontSize: 13 }}>{progress.phase}</div>
-            <div style={{ marginTop: 10, width: 280, height: 6, background: "#313244", borderRadius: 3, overflow: "hidden" }}>
-              <div style={{ height: "100%", width: `${progress.pct}%`, background: "#cba6f7", transition: "width 0.2s" }} />
+            <div style={{ marginTop: 10, width: 280, height: 6, background: "#E8EAED", borderRadius: 3, overflow: "hidden" }}>
+              <div style={{ height: "100%", width: `${progress.pct}%`, background: "#2D6A4F", transition: "width 0.2s" }} />
             </div>
           </div>
         ) : null}
@@ -4664,8 +4800,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
           <div
             style={{
               position: "absolute", bottom: 16, left: "50%", transform: "translateX(-50%)",
-              background: "#45273a", border: "1px solid #f38ba8", borderRadius: 8,
-              padding: "8px 16px", fontSize: 13, color: "#f38ba8", zIndex: 20,
+              background: "#45273a", border: "1px solid #B42318", borderRadius: 8,
+              padding: "8px 16px", fontSize: 13, color: "#B42318", zIndex: 20,
               maxWidth: "80%",
             }}
           >
@@ -4677,23 +4813,23 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
           <div
             style={{
               position: "absolute", top: 8, right: 8,
-              background: "#181825", border: "1px solid #313244",
+              background: "#ffffff", border: "1px solid #E8EAED",
               borderRadius: 8, maxHeight: "70vh", overflowY: "auto",
               minWidth: 220, maxWidth: 300, zIndex: 15,
             }}
           >
             <h3 style={{
-              padding: "10px 12px", fontSize: 13, color: "#cba6f7",
-              borderBottom: "1px solid #313244", margin: 0,
-              position: "sticky", top: 0, background: "#181825",
+              padding: "10px 12px", fontSize: 13, color: "#2D6A4F",
+              borderBottom: "1px solid #E8EAED", margin: 0,
+              position: "sticky", top: 0, background: "#ffffff",
             }}>
               Layers
             </h3>
             {/* Equipment (virtual) layers ─ detectors per dtype + sprinkler pipes */}
             <div style={{
               padding: "6px 12px 4px", fontSize: 10, fontWeight: 700,
-              color: "#a6adc8", textTransform: "uppercase", letterSpacing: 0.5,
-              borderBottom: "1px solid #313244",
+              color: "#6B7280", textTransform: "uppercase", letterSpacing: 0.5,
+              borderBottom: "1px solid #E8EAED",
             }}>
               Equipment
             </div>
@@ -4719,19 +4855,19 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                           [opt.value]: e.target.checked,
                         }))
                       }
-                      style={{ accentColor: "#cba6f7" }}
+                      style={{ accentColor: "#2D6A4F" }}
                     />
                     <span
                       style={{
                         width: 14, height: 14, borderRadius: 3,
-                        border: "1px solid #45475a", flexShrink: 0,
+                        border: "1px solid #E8EAED", flexShrink: 0,
                         background: DTYPE_COLORS[opt.value] || "#22d3ee",
                       }}
                     />
                     <span
                       style={{
                         overflow: "hidden", textOverflow: "ellipsis",
-                        whiteSpace: "nowrap", color: "#cdd6f4", flex: 1,
+                        whiteSpace: "nowrap", color: "#1A1A2E", flex: 1,
                       }}
                       title={opt.label}
                     >
@@ -4765,16 +4901,16 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                           pipes: e.target.checked,
                         }))
                       }
-                      style={{ accentColor: "#cba6f7" }}
+                      style={{ accentColor: "#2D6A4F" }}
                     />
                     <span
                       style={{
                         width: 14, height: 14, borderRadius: 3,
-                        border: "1px solid #45475a", flexShrink: 0,
-                        background: "#DC2626",
+                        border: "1px solid #E8EAED", flexShrink: 0,
+                        background: "#B42318",
                       }}
                     />
-                    <span style={{ flex: 1, color: "#cdd6f4" }} title="Sprinkler Pipes">
+                    <span style={{ flex: 1, color: "#1A1A2E" }} title="Sprinkler Pipes">
                       Sprinkler Pipes
                     </span>
                     {pipeCount > 0 ? (
@@ -4802,7 +4938,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                       type="checkbox"
                       checked={showCoverageDisks}
                       onChange={(e) => setShowCoverageDisks(e.target.checked)}
-                      style={{ accentColor: "#cba6f7" }}
+                      style={{ accentColor: "#2D6A4F" }}
                     />
                     <span
                       style={{
@@ -4812,7 +4948,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                         background: `${DTYPE_COLORS.smoke || "#ef4444"}33`,
                       }}
                     />
-                    <span style={{ flex: 1, color: "#cdd6f4" }}>
+                    <span style={{ flex: 1, color: "#1A1A2E" }}>
                       Coverage circles ({detectorSpacingM.toFixed(0)} m)
                     </span>
                     {smokeCount > 0 ? (
@@ -4827,8 +4963,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
             {layers.length > 0 ? (
               <div style={{
                 padding: "6px 12px 4px", fontSize: 10, fontWeight: 700,
-                color: "#a6adc8", textTransform: "uppercase", letterSpacing: 0.5,
-                borderTop: "1px solid #313244", borderBottom: "1px solid #313244",
+                color: "#6B7280", textTransform: "uppercase", letterSpacing: 0.5,
+                borderTop: "1px solid #E8EAED", borderBottom: "1px solid #E8EAED",
                 marginTop: 4,
               }}>
                 Drawing Layers
@@ -4847,19 +4983,19 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                     type="checkbox"
                     checked={l.visible}
                     onChange={(e) => toggleLayer(l.name, e.target.checked)}
-                    style={{ accentColor: "#cba6f7" }}
+                    style={{ accentColor: "#2D6A4F" }}
                   />
                   <span
                     style={{
                       width: 14, height: 14, borderRadius: 3,
-                      border: "1px solid #45475a", flexShrink: 0,
+                      border: "1px solid #E8EAED", flexShrink: 0,
                       background: colorToHex(l.color),
                     }}
                   />
                   <span
                     style={{
                       overflow: "hidden", textOverflow: "ellipsis",
-                      whiteSpace: "nowrap", color: "#cdd6f4",
+                      whiteSpace: "nowrap", color: "#1A1A2E",
                     }}
                     title={l.displayName}
                   >
@@ -4876,15 +5012,15 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
             style={{
               position: "absolute", top: 8,
               right: showLayers ? 316 : 8,
-              background: "#181825", border: "1px solid #313244",
+              background: "#ffffff", border: "1px solid #E8EAED",
               borderRadius: 8, maxHeight: "70vh", overflowY: "auto",
               minWidth: 240, maxWidth: 320, zIndex: 15,
             }}
           >
             <div style={{
-              padding: "10px 12px", fontSize: 13, color: "#cba6f7",
-              borderBottom: "1px solid #313244",
-              position: "sticky", top: 0, background: "#181825",
+              padding: "10px 12px", fontSize: 13, color: "#2D6A4F",
+              borderBottom: "1px solid #E8EAED",
+              position: "sticky", top: 0, background: "#ffffff",
               display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8,
             }}>
               <span>Blocks</span>
@@ -4892,8 +5028,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                 <button
                   onClick={() => { setSelectedBlock(null); clearHighlight(); }}
                   style={{
-                    background: "transparent", color: "#f38ba8",
-                    border: "1px solid #45475a", borderRadius: 4,
+                    background: "transparent", color: "#B42318",
+                    border: "1px solid #E8EAED", borderRadius: 4,
                     padding: "2px 8px", fontSize: 11, cursor: "pointer",
                   }}
                 >
@@ -4903,7 +5039,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
             </div>
             <div>
               {blocks.length === 0 ? (
-                <div style={{ padding: "10px 12px", fontSize: 12, color: "#6c7086" }}>
+                <div style={{ padding: "10px 12px", fontSize: 12, color: "#9AA1AC" }}>
                   No blocks defined in this drawing.
                 </div>
               ) : blocks.map((b) => {
@@ -4916,9 +5052,9 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                       display: "flex", alignItems: "center", justifyContent: "space-between",
                       gap: 8, width: "100%",
                       padding: "6px 12px", fontSize: 12, cursor: "pointer",
-                      background: active ? "#45475a" : "transparent",
-                      color: active ? "#f9e2af" : "#cdd6f4",
-                      border: "none", borderBottom: "1px solid #1e1e2e",
+                      background: active ? "#E8EAED" : "transparent",
+                      color: active ? "#1A1A2E" : "#1A1A2E",
+                      border: "none", borderBottom: "1px solid #F0F2F5",
                       textAlign: "left",
                     }}
                     title={b.name}
@@ -4930,7 +5066,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                       {b.name}
                     </span>
                     <span style={{
-                      fontSize: 11, color: active ? "#f9e2af" : "#6c7086",
+                      fontSize: 11, color: active ? "#1A1A2E" : "#9AA1AC",
                       flexShrink: 0,
                     }}>
                       ×{b.count}
@@ -4942,123 +5078,105 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
           </div>
         ) : null}
 
-        {showFloors && floorPlans.length > 0 ? (
-          <div
-            style={{
-              position: "absolute", top: 8, left: 8,
-              background: "#181825", border: "1px solid #313244",
-              borderRadius: 8, maxHeight: "70vh", overflowY: "auto",
-              minWidth: 220, maxWidth: 280, zIndex: 15,
-            }}
-          >
-            <div style={{
-              padding: "10px 12px", fontSize: 13, color: "#89b4fa",
-              borderBottom: "1px solid #313244",
-              position: "sticky", top: 0, background: "#181825",
-              display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8,
-            }}>
-              <span>Floor Plans</span>
-              {selectedFloorId ? (
-                <button
-                  onClick={() => { setSelectedFloorId(null); clearHighlight(); fitView(); }}
-                  style={{
-                    background: "transparent", color: "#f38ba8",
-                    border: "1px solid #45475a", borderRadius: 4,
-                    padding: "2px 8px", fontSize: 11, cursor: "pointer",
-                  }}
-                >
-                  Clear
-                </button>
-              ) : null}
-            </div>
-            <div style={{
-              padding: "8px 12px", borderBottom: "1px solid #313244",
-              display: "flex", flexDirection: "column", gap: 4,
-              background: "#181825",
-            }}>
-              <div style={{
-                display: "flex", justifyContent: "space-between",
-                fontSize: 11, color: "#a6adc8",
-              }}>
-                <span>Highlight opacity</span>
-                <span style={{ color: "#89b4fa", fontVariantNumeric: "tabular-nums" }}>
-                  {Math.round(floorOpacity * 100)}%
-                </span>
               </div>
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.01}
-                value={floorOpacity}
-                onChange={(e) => setFloorOpacity(Number(e.target.value))}
-                style={{ width: "100%", accentColor: "#89b4fa" }}
-              />
-            </div>
-            <div>
-              {floorPlans.map((fp) => {
-                const active = selectedFloorId === fp.id;
-                const bb = fp.world_bbox;
-                const dims = bb
-                  ? `${Math.round(bb.xmax - bb.xmin)} × ${Math.round(bb.ymax - bb.ymin)}`
-                  : "—";
-                return (
-                  <button
-                    key={fp.id}
-                    onClick={() => selectFloorPlan(fp)}
-                    style={{
-                      display: "flex", alignItems: "center", justifyContent: "space-between",
-                      gap: 8, width: "100%",
-                      padding: "8px 12px", fontSize: 12, cursor: "pointer",
-                      background: active ? "#3a3a5c" : "transparent",
-                      color: active ? "#89b4fa" : "#cdd6f4",
-                      border: "none", borderBottom: "1px solid #1e1e2e",
-                      textAlign: "left",
-                    }}
-                    title={`Block ${fp.block_index + 1} — ${fp.status}`}
-                  >
-                    <span style={{ flex: 1, fontWeight: active ? 600 : 400 }}>
-                      Block {fp.block_index + 1}
-                    </span>
-                    <span style={{
-                      fontSize: 10, color: active ? "#89b4fa" : "#6c7086",
-                      flexShrink: 0,
-                    }}>
-                      {dims}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Floor utilities */}
-            <div style={{
-              padding: "10px 12px", borderTop: "1px solid #313244",
-              display: "flex", flexDirection: "column", gap: 8,
-              background: "#181825",
-            }}>
-              {manualEditMsg ? (
-                <div style={{
-                  fontSize: 11,
-                  color: "#89b4fa",
-                  lineHeight: 1.4,
-                  marginBottom: 2,
-                }}>
-                  {manualEditMsg}
-                </div>
-              ) : null}
             </div>
           </div>
-        ) : null}
+
+          {/* Bottom status bar */}
+          <div style={bottomBarStyle}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ color: SD.textSubtle, fontSize: 11 }}>Layer:</span>
+              <select
+                style={{
+                  fontSize: 11,
+                  padding: "1px 4px",
+                  border: `1px solid ${SD.border}`,
+                  borderRadius: 3,
+                  background: SD.surface,
+                  color: SD.text,
+                  outline: "none",
+                }}
+                value={selectedFloorId ?? ""}
+                onChange={(e) => {
+                  const id = e.target.value;
+                  if (!id) { setSelectedFloorId(null); clearHighlight(); fitView(); }
+                  else {
+                    const fp = floorPlans.find(f => f.id === id);
+                    if (fp) selectFloorPlan(fp);
+                  }
+                }}
+              >
+                <option value="">Layer-1 (Default)</option>
+                {floorPlans.map((fp) => (
+                  <option key={fp.id} value={fp.id}>Block {fp.block_index + 1}</option>
+                ))}
+              </select>
+            </div>
+            <div style={{ flex: 1 }} />
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <button
+                onClick={fitView}
+                style={{ ...btnStyle, padding: "1px 8px", fontSize: 11 }}
+                title="Fit"
+              >Fit</button>
+              <span style={{ color: SD.textSubtle, fontSize: 11 }}>—</span>
+              <input
+                type="range"
+                min={10}
+                max={400}
+                defaultValue={100}
+                onChange={() => {}}
+                style={{ width: 120, accentColor: SD.accent }}
+                title="Zoom"
+              />
+              <span style={{ color: SD.textSubtle, fontSize: 11, fontVariantNumeric: "tabular-nums", minWidth: 36, textAlign: "right" }}>
+                100%
+              </span>
+              <button
+                onClick={() => setBgIdx((i) => (i + 1) % bgColors.length)}
+                style={{ ...btnStyle, padding: "1px 8px", fontSize: 11 }}
+                title="Background"
+              >BG</button>
+            </div>
+          </div>
+        </section>
       </div>
     </main>
   );
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// SmartDraw-style light theme tokens
+// ──────────────────────────────────────────────────────────────────────────────
+const SD = {
+  bg: "#F0F2F5",            // page bg — matches workspace
+  surface: "#FFFFFF",       // panels / ribbon / sidebar
+  surfaceAlt: "#F7F8FA",    // subtle alt surface
+  hover: "#EEF2EE",
+  active: "#E7F1EC",        // selected tool — soft green tint
+  activeBorder: "#2D6A4F",
+  border: "#E8EAED",        // standard app border
+  borderStrong: "#D1D5DB",
+  divider: "#EEF2EE",
+  text: "#1A1A2E",          // primary text
+  textSubtle: "#6B7280",    // secondary text
+  textMuted: "#9AA1AC",
+  accent: "#2D6A4F",        // forest green app accent
+  accentDark: "#1F4A37",
+  danger: "#B42318",
+  success: "#2D6A4F",
+  warning: "#D97706",
+  yellow: "#FDE68A",        // Buy button (warm amber, app-style)
+  yellowDark: "#B45309",
+  shadow: "0 1px 2px rgba(0,0,0,0.04), 0 2px 8px rgba(0,0,0,0.06)",
+  shadowLg: "0 4px 14px rgba(0,0,0,0.08), 0 2px 6px rgba(0,0,0,0.06)",
+};
+
 const btnStyle: React.CSSProperties = {
-  background: "#313244", color: "#cdd6f4",
-  border: "1px solid #45475a", borderRadius: 6,
-  padding: "6px 14px", fontSize: 13, cursor: "pointer",
+  background: SD.surface, color: SD.text,
+  border: `1px solid ${SD.border}`, borderRadius: 4,
+  padding: "5px 10px", fontSize: 12, cursor: "pointer",
+  lineHeight: 1.2,
 };
 
 const insertToolTileStyle: React.CSSProperties = {
@@ -5067,17 +5185,18 @@ const insertToolTileStyle: React.CSSProperties = {
   alignItems: "center",
   justifyContent: "center",
   gap: 2,
-  minHeight: 70,
-  border: "1px solid #45475a",
-  borderRadius: 6,
-  color: "#cdd6f4",
+  minHeight: 64,
+  border: `1px solid ${SD.border}`,
+  borderRadius: 4,
+  background: SD.surface,
+  color: SD.text,
   cursor: "pointer",
   padding: "6px 4px",
 };
 
 function renderInsertToolPreview(dtype: string): React.ReactNode {
-  const stroke = "#d6dbff";
-  const fill = "#d6dbff";
+  const stroke = "#1A1A2E";
+  const fill = "#1A1A2E";
 
   if (dtype === "smoke") {
     return (
@@ -5181,16 +5300,19 @@ function renderInsertToolPreview(dtype: string): React.ReactNode {
 
 function ribbonTabBtn(active: boolean): React.CSSProperties {
   return {
-    background: active ? "#1d1d31" : "transparent",
-    color: active ? "#f5e0dc" : "#a6adc8",
-    border: "1px solid #313244",
-    borderBottom: active ? "1px solid #1d1d31" : "1px solid #313244",
-    borderTopLeftRadius: 6,
-    borderTopRightRadius: 6,
-    padding: "6px 12px",
+    background: active ? SD.surface : "transparent",
+    color: active ? SD.text : SD.textSubtle,
+    border: "none",
+    borderTop: active ? `2px solid ${SD.accent}` : "2px solid transparent",
+    borderRight: active ? `1px solid ${SD.border}` : "1px solid transparent",
+    borderLeft: active ? `1px solid ${SD.border}` : "1px solid transparent",
+    borderBottom: active ? `1px solid ${SD.surface}` : `1px solid transparent`,
+    marginBottom: -1,
+    padding: "6px 16px",
     fontSize: 12,
-    fontWeight: 600,
+    fontWeight: active ? 600 : 500,
     cursor: "pointer",
+    letterSpacing: 0.1,
   };
 }
 
@@ -5198,35 +5320,123 @@ const ribbonGroupStyle: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
   justifyContent: "space-between",
-  gap: 6,
-  minHeight: 56,
-  padding: "6px 10px",
-  border: "1px solid #313244",
-  borderRadius: 8,
-  background: "rgba(24,24,37,0.55)",
+  gap: 4,
+  minHeight: 54,
+  padding: "4px 10px",
+  borderRight: `1px solid ${SD.divider}`,
+  background: "transparent",
 };
 
 const ribbonGroupTitleStyle: React.CSSProperties = {
   fontSize: 10,
-  letterSpacing: 0.4,
-  textTransform: "uppercase",
-  color: "#a6adc8",
+  letterSpacing: 0.3,
+  textTransform: "none",
+  color: SD.textMuted,
+  textAlign: "center",
+  marginTop: 2,
 };
 
 const overlayStyle: React.CSSProperties = {
   position: "absolute", inset: 0,
   display: "flex", flexDirection: "column",
   alignItems: "center", justifyContent: "center",
-  background: "rgba(17,17,27,0.92)", zIndex: 15,
-  color: "#a6adc8",
+  background: "rgba(255,255,255,0.92)", zIndex: 15,
+  color: SD.textSubtle,
 };
 
 const spinnerStyle: React.CSSProperties = {
   width: 44, height: 44,
-  border: "4px solid #313244",
-  borderTopColor: "#cba6f7",
+  border: `4px solid ${SD.divider}`,
+  borderTopColor: SD.accent,
   borderRadius: "50%",
   animation: "dxfspin 0.8s linear infinite",
+};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SmartDraw sidebar / chrome styles
+// ──────────────────────────────────────────────────────────────────────────────
+const sidebarStyle: React.CSSProperties = {
+  width: 232,
+  flexShrink: 0,
+  background: SD.surface,
+  borderRight: `1px solid ${SD.border}`,
+  display: "flex",
+  flexDirection: "column",
+  overflow: "hidden",
+};
+
+const sidebarSectionTitleStyle: React.CSSProperties = {
+  fontSize: 11,
+  fontWeight: 600,
+  color: SD.text,
+  background: SD.surfaceAlt,
+  padding: "6px 12px",
+  borderTop: `1px solid ${SD.divider}`,
+  borderBottom: `1px solid ${SD.divider}`,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  userSelect: "none",
+};
+
+const sidebarItemStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  width: "100%",
+  padding: "5px 12px",
+  fontSize: 12,
+  color: SD.text,
+  background: "transparent",
+  border: "none",
+  cursor: "pointer",
+  textAlign: "left",
+};
+
+const bottomBarStyle: React.CSSProperties = {
+  height: 28,
+  flexShrink: 0,
+  borderTop: `1px solid ${SD.border}`,
+  background: SD.surface,
+  display: "flex",
+  alignItems: "center",
+  padding: "0 12px",
+  gap: 12,
+  fontSize: 11,
+  color: SD.textSubtle,
+};
+
+const pageTabsStyle: React.CSSProperties = {
+  height: 26,
+  flexShrink: 0,
+  borderBottom: `1px solid ${SD.border}`,
+  background: SD.surfaceAlt,
+  display: "flex",
+  alignItems: "flex-end",
+  paddingLeft: 8,
+  gap: 1,
+};
+
+const rulerHStyle: React.CSSProperties = {
+  height: 18,
+  flexShrink: 0,
+  background: SD.surfaceAlt,
+  borderBottom: `1px solid ${SD.border}`,
+  position: "relative",
+  overflow: "hidden",
+  fontSize: 9,
+  color: SD.textMuted,
+};
+
+const rulerVStyle: React.CSSProperties = {
+  width: 18,
+  flexShrink: 0,
+  background: SD.surfaceAlt,
+  borderRight: `1px solid ${SD.border}`,
+  position: "relative",
+  overflow: "hidden",
+  fontSize: 9,
+  color: SD.textMuted,
 };
 
 if (typeof document !== "undefined" && !document.getElementById("dxfspin-kf")) {
