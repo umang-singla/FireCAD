@@ -1,0 +1,10 @@
+(node:53892) ExperimentalWarning: `--experimental-loader` may be removed in the future; instead use `register()`:
+--import 'data:text/javascript,import { register } from "node:module"; import { pathToFileURL } from "node:url"; register("./web/scripts/esm-loader.mjs", pathToFileURL("./"));'
+(Use `node --trace-warnings ...` to show where the warning was created)
+[harness] EXCEPTION on entity #5301 INSERT (handle=291A9): harness: --max-entity 5300 reached
+[harness] EXCEPTION on entity #5301 INSERT (handle=29108): harness: --max-entity 5300 reached
+[harness] ✗ FAILED at entity #5301 (HATCH handle=29147): Error: harness: --max-entity 5300 reached
+    at DxfScene.patched (file:///D:/free-cad/web/scripts/debug-dxf-viewer.mjs:128:13)
+    at DxfScene.Build (file:///D:/free-cad/web/node_modules/dxf-viewer/src/DxfScene.js:180:26)
+    at async DxfWorker._Load (file:///D:/free-cad/web/node_modules/dxf-viewer/src/DxfWorker.js:161:9)
+    at async file:///D:/free-cad/web/scripts/debug-dxf-viewer.mjs:145:18

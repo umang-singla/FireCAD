@@ -2,6 +2,7 @@
 
 import { use, useEffect, useRef, useState } from "react";
 import { getToken, getTenantRole } from "../../../lib/auth";
+import { attachHatchOverlay, disposeHatchOverlay, syncHatchOverlayVisibility } from "../../../../lib/hatchOverlay";
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
 
@@ -52,10 +53,18 @@ type PointerInfo = {
   clientY: number;
 };
 
+/** Endpoint anchor — links a pipe end to a detector (sprinkler), source, or another pipe end
+ *  so that moving any of those objects drags every connected joint with it. */
+type PipeEndpointAnchor =
+  | { kind: "detector"; id: string }
+  | { kind: "source"; index: number };
+
 type PipeSegment = {
   from: [number, number];
   to: [number, number];
   diameter: string;
+  fromAnchor?: PipeEndpointAnchor;
+  toAnchor?: PipeEndpointAnchor;
 };
 
 type PipeSource = { x: number; y: number };
@@ -190,6 +199,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   const highlightGroupRef = useRef<any>(null);
   const detectorsGroupRef = useRef<any>(null);
   const pipesGroupRef = useRef<any>(null);
+  const hatchOverlayRef = useRef<any>(null);
 
   const [dxfUrl, setDxfUrl] = useState<string | null>(null);
   const [projectName, setProjectName] = useState<string>("");
@@ -212,7 +222,49 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   const [selectedDetectorIds, setSelectedDetectorIds] = useState<string[]>([]);
   const [draggingDetectorId, setDraggingDetectorId] = useState<string | null>(null);
   const [marqueeRect, setMarqueeRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
-  const groupDragRef = useRef<{ ids: string[]; startWorld: { x: number; y: number }; startById: Record<string, { x: number; y: number }> } | null>(null);
+  /** Drag-group context. Captured at pointerdown so every pointermove uses the original
+   *  positions instead of compounding deltas. `pipeStarts` and `manualStarts` record the
+   *  initial endpoints of any pipe whose end is anchored to a dragged detector or sits
+   *  coincident with one — those endpoints follow the drag delta verbatim, keeping joints
+   *  tight even when several pipes share the same node. */
+  const groupDragRef = useRef<{
+    ids: string[];
+    startWorld: { x: number; y: number };
+    startById: Record<string, { x: number; y: number }>;
+    pipeStarts: Map<number, { from: [number, number]; to: [number, number]; followFrom: boolean; followTo: boolean }>;
+    manualStarts: Map<number, { from: [number, number]; to: [number, number]; followFrom: boolean; followTo: boolean }>;
+  } | null>(null);
+  /** Active drag of a pipe endpoint (or joint = several coincident endpoints). Captures
+   *  every pipe end at the joint as well as any detector(s) sharing the same position, so
+   *  moving the joint moves all of them as one rigid unit. */
+  const pipeEndpointDragRef = useRef<{
+    startWorld: { x: number; y: number };
+    /** Endpoint references that follow the drag. Keys for the snapshot maps are
+     *  `${kind}:${index}:${end}` so a single pipe can contribute both ends if both are
+     *  coincident (rare but possible for zero-length segments). */
+    endpoints: Array<{ kind: "auto" | "manual"; index: number; end: "from" | "to" }>;
+    /** Initial positions of every pipe involved, keyed by `${kind}:${index}`. */
+    pipeStarts: Map<string, { from: [number, number]; to: [number, number] }>;
+    /** Detectors coincident with the joint at grab time. */
+    detectorIds: string[];
+    detectorStarts: Record<string, { x: number; y: number }>;
+    moved: boolean;
+  } | null>(null);
+  /** Active drag of an entire pipe body (translate both endpoints together). Anchors are
+   *  cleared on translate since a pipe moved as a whole can no longer assume its
+   *  endpoints stay glued to the original detectors. */
+  const pipeBodyDragRef = useRef<{
+    ref: { kind: "auto" | "manual"; index: number };
+    startWorld: { x: number; y: number };
+    startClient: { x: number; y: number };
+    startFrom: [number, number];
+    startTo: [number, number];
+    moved: boolean;
+  } | null>(null);
+  /** Coalesces per-frame state updates during pipe drags so we don't fire setState 60+×/sec.
+   *  The pending payload is applied inside a requestAnimationFrame callback; subsequent
+   *  pointermove events replace `pending` until the frame runs. */
+  const pipeDragRafRef = useRef<{ raf: number; pending: (() => void) | null } | null>(null);
   const marqueeRef = useRef<{ startX: number; startY: number; additive: boolean } | null>(null);
   const [isSavingEdits, setIsSavingEdits] = useState(false);
   const [manualEditMsg, setManualEditMsg] = useState<string | null>(null);
@@ -235,12 +287,21 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   const [pipeDrawDiameter, setPipeDrawDiameter] = useState<number>(25);
   const [pipeDrawStart, setPipeDrawStart] = useState<{ x: number; y: number } | null>(null);
   const [pipeDrawPreview, setPipeDrawPreview] = useState<{ x: number; y: number } | null>(null);
-  const [manualPipes, setManualPipes] = useState<{ from: [number, number]; to: [number, number]; diameter: string }[]>([]);
+  /** Anchor descriptor for the pending pipe-draw start point. Kept in a ref so onPointerDown
+   *  reads the latest value without the effect re-subscribing on every change. */
+  const pipeDrawStartAnchorRef = useRef<PipeEndpointAnchor | undefined>(undefined);
+  const [manualPipes, setManualPipes] = useState<PipeSegment[]>([]);
   const [measureStart, setMeasureStart] = useState<{ x: number; y: number } | null>(null);
   const [measureEnd, setMeasureEnd] = useState<{ x: number; y: number } | null>(null);
   const [measurePreview, setMeasurePreview] = useState<{ x: number; y: number } | null>(null);
   // Selected pipe (kind: "auto" → backend-routed, "manual" → drawn locally)
   const [selectedPipe, setSelectedPipe] = useState<{ kind: "auto" | "manual"; index: number } | null>(null);
+  /** Snap indicator(s) shown while editing pipes. A single endpoint/joint drag pushes
+   *  one entry; a full pipe-body translate pushes two (one per endpoint). When `snapped`
+   *  is true the dot fills solid black with a halo — same UX as the line-tool anchor.
+   *  When `split` is true the indicator additionally draws a red square outline to
+   *  signal a mid-segment "tee-in" snap. */
+  const [pipeEditSnap, setPipeEditSnap] = useState<Array<{ x: number; y: number; snapped: boolean; split?: boolean }> | null>(null);
   // Tracks whether the user has edited (deleted/resized) auto-routed pipes since last save.
   const [pipesModified, setPipesModified] = useState<boolean>(false);
   // Export
@@ -417,6 +478,21 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
         sceneOptions: {
           wireframeMesh: true,
           suppressPaperSpace: false,
+          // Cap spline-edge subdivisions inside hatch boundaries so CloudConvert
+          // files (hundreds of control points per edge) don't explode to 100k+
+          // boundary vertices and stall the per-line clipping pass. Combined with
+          // the precomputed-edge-wrapper optimization in HatchCalculator, this
+          // lets full hatch rendering complete in seconds instead of minutes.
+          hatchMaxSplineSubdivisions: 64,
+          hatchMaxBoundaryVertices: 5000,
+          // dxf-render parity caps: per-pattern parallel-line cap (lQ=1000) +
+          // running per-hatch global segment counter (st=50000). With these in
+          // place the real per-line pattern code can run safely on huge files —
+          // worst case is a partially-filled hatch, never a freeze.
+          hatchMaxLinesPerPattern: 1000,
+          hatchMaxSegmentsPerHatch: 50000,
+          // Stencil flat-fill is no longer needed; let real patterns render.
+          hatchStencilFill: false,
         },
       });
       viewerRef.current = viewer;
@@ -513,22 +589,58 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
         }
       });
 
+      // Skip font glyph tessellation for large DXFs. dxf-viewer renders text
+      // by tessellating every glyph through opentype.js on the main thread,
+      // which can hang for minutes (and OOM the WebGL renderer) on files with
+      // thousands of MTEXT/ATTRIB/DIMENSION entities inside nested blocks.
+      // For large files we pass fonts: [] so text falls back to placeholders
+      // and the geometry loads in seconds.
+      const DXF_FONT_SKIP_BYTES = 0; // 5 MB
+      let skipFonts = false;
+      try {
+        const headRes = await fetch(apiUrl(dxfUrl), {
+          method: "HEAD",
+          headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : undefined,
+        });
+        const lenStr = headRes.headers.get("content-length");
+        const len = lenStr ? parseInt(lenStr, 10) : 0;
+        if (len && len >= DXF_FONT_SKIP_BYTES) {
+          skipFonts = true;
+          console.warn(
+            `[dxf-viewer] DXF is ${(len / 1024 / 1024).toFixed(1)} MB — ` +
+              `skipping font tessellation (text shown as placeholders).`,
+          );
+        }
+      } catch {
+        // HEAD failed (CORS, signed URL, etc.) — proceed with fonts enabled.
+      }
+
       try {
         await viewer.Load({
           url: dxfUrl,
-          fonts: FONTS,
+          fonts: skipFonts ? [] : FONTS,
           progressCbk: (phase: string, processed: number, total: number) => {
             if (cancelled) return;
             const label =
               phase === "fetch" ? "Fetching…" :
               phase === "parse" ? "Parsing…" :
               phase === "prepare" ? "Preparing…" :
-              phase === "font" ? "Loading fonts…" : phase;
+              phase === "font" ? (skipFonts ? "Skipping fonts…" : "Loading fonts…") : phase;
             const pct = total && total > 0 ? Math.round((processed / total) * 100) : 100;
             setProgress({ phase: label, pct });
           },
           workerFactory: null,
         });
+        /* Pattern-fill overlay: render captured hatch fills via shader-textured
+         * meshes (proper visuals instead of the flat-color earcut prototype). */
+        try {
+          if (threeRef.current) {
+            const grp = attachHatchOverlay(viewer, threeRef.current);
+            hatchOverlayRef.current = grp;
+          }
+        } catch (overlayErr) {
+          console.warn("[hatch-overlay] failed to attach", overlayErr);
+        }
       } catch (err: any) {
         if (!cancelled) setError(err?.message || "Failed to load DXF.");
       } finally {
@@ -540,6 +652,10 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       if (viewerRef.current) {
         try { viewerRef.current.Destroy?.(); } catch {}
         viewerRef.current = null;
+      }
+      if (hatchOverlayRef.current) {
+        try { disposeHatchOverlay(hatchOverlayRef.current); } catch {}
+        hatchOverlayRef.current = null;
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -586,6 +702,52 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     }
   }
 
+  /* Backfill pipe-endpoint anchors so backend-routed pipes (which only carry raw {x,y}
+   * endpoints) follow a sprinkler when it's dragged. Any endpoint that lands within a
+   * tiny world-space tolerance of a detector position is treated as anchored to that
+   * detector. Runs whenever detector or pipe data is (re)loaded; idempotent. */
+  useEffect(() => {
+    if (!pipesData || !detectors.length) return;
+    const ANCHOR_TOL = 0.5;          // world units (DXF) — generous enough to absorb mm-level rounding
+    const TOL2 = ANCHOR_TOL * ANCHOR_TOL;
+    function anchorFor(end: [number, number]): PipeEndpointAnchor | undefined {
+      let best: { id: string; d2: number } | null = null;
+      for (const d of detectors) {
+        const dx = d.x - end[0], dy = d.y - end[1];
+        const d2 = dx * dx + dy * dy;
+        if (d2 <= TOL2 && (!best || d2 < best.d2)) best = { id: d.id, d2 };
+      }
+      return best ? { kind: "detector", id: best.id } : undefined;
+    }
+    let changed = false;
+    const nextPipes = pipesData.pipes.map((seg) => {
+      const nf = seg.fromAnchor ?? anchorFor(seg.from);
+      const nt = seg.toAnchor   ?? anchorFor(seg.to);
+      if (nf !== seg.fromAnchor || nt !== seg.toAnchor) {
+        changed = true;
+        return { ...seg, fromAnchor: nf, toAnchor: nt };
+      }
+      return seg;
+    });
+    if (changed) {
+      setPipesData((prev) => (prev ? { ...prev, pipes: nextPipes } : prev));
+    }
+    /* Same backfill for manual pipes drawn before this feature shipped. */
+    let manualChanged = false;
+    const nextManual = manualPipes.map((seg) => {
+      const nf = seg.fromAnchor ?? anchorFor(seg.from);
+      const nt = seg.toAnchor   ?? anchorFor(seg.to);
+      if (nf !== seg.fromAnchor || nt !== seg.toAnchor) {
+        manualChanged = true;
+        return { ...seg, fromAnchor: nf, toAnchor: nt };
+      }
+      return seg;
+    });
+    if (manualChanged) {
+      setManualPipes(nextManual);
+    }
+  }, [pipesData, detectors, manualPipes]);
+
   // Live-update floor-plan highlight opacity when the slider changes.
   useEffect(() => {
     const viewer = viewerRef.current;
@@ -610,6 +772,9 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     if (!viewer) return;
     viewer.ShowLayer?.(name, visible);
     setLayers((prev) => prev.map((l) => (l.name === name ? { ...l, visible } : l)));
+    // Keep hatch overlay meshes (which live outside dxf-viewer's batch system)
+    // in lockstep with the viewer's layer visibility.
+    try { syncHatchOverlayVisibility(viewer, hatchOverlayRef.current); } catch {}
   }
 
   function clearHighlight() {
@@ -877,6 +1042,19 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     const _wtm = Number.isFinite(worldToM) && worldToM > 0 ? worldToM : 1.0;
     const _upm = 1.0 / _wtm;
     const dotR = Math.max((DTYPE_RADIUS_M["smoke"] ?? 0.10) * _upm * 0.85, _upm * 0.08);
+
+    /* Pixel ↔ world conversion at the current zoom, so screen-anchored UI elements
+     * (snap dots, endpoint grip badges) stay readable independent of drawing scale. */
+    let worldPerPx = _upm * 0.01;  // fallback: 1cm per pixel
+    try {
+      const cam: any = viewer.GetCamera?.();
+      const renderer: any = viewer.GetRenderer?.();
+      const dom: HTMLCanvasElement | undefined = renderer?.domElement;
+      if (cam?.isOrthographicCamera && dom?.clientWidth) {
+        const visibleW = (cam.right - cam.left) / (cam.zoom || 1);
+        if (visibleW > 0) worldPerPx = visibleW / dom.clientWidth;
+      }
+    } catch {}
 
     // Helper: build a solid-red rectangle mesh between two points sized by diameter.
     function buildPipeMesh(
@@ -1189,6 +1367,72 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       }
     }
 
+    /* ── Pipe-end grip handles (CAD-style joints) ────────────────────────────────
+     * Always-visible markers at every pipe endpoint when the user is in select
+     * mode. Each unique joint position aggregates one marker; the colour encodes
+     * the joint's state:
+     *   • free  (single pipe, no attachment) → blue circle
+     *   • joint (≥2 pipe ends share point)   → larger solid blue circle
+     *   • bound (an end is anchored to a sprinkler/source) → green circle
+     * Skipped while a pipe drag is in flight to keep the frame budget tight. */
+    const dragActive = !!(pipeEndpointDragRef.current || pipeBodyDragRef.current || groupDragRef.current);
+    if (tool === "select" && equipmentLayerVisibility.pipes !== false && !dragActive) {
+      type JointInfo = { x: number; y: number; count: number; bound: boolean };
+      const joints = new Map<string, JointInfo>();
+      const JOINT_KEY_PREC = 4;
+      function add(end: [number, number], bound: boolean) {
+        const k = `${end[0].toFixed(JOINT_KEY_PREC)},${end[1].toFixed(JOINT_KEY_PREC)}`;
+        const cur = joints.get(k);
+        if (cur) { cur.count++; cur.bound = cur.bound || bound; }
+        else joints.set(k, { x: end[0], y: end[1], count: 1, bound });
+      }
+      if (pipesData?.pipes) {
+        for (const seg of pipesData.pipes) {
+          add(seg.from, !!seg.fromAnchor);
+          add(seg.to,   !!seg.toAnchor);
+        }
+      }
+      for (const seg of manualPipes) {
+        add(seg.from, !!seg.fromAnchor);
+        add(seg.to,   !!seg.toAnchor);
+      }
+
+      const baseR = Math.max(dotR * 0.55, _upm * 0.07, worldPerPx * 3.5);
+      for (const j of joints.values()) {
+        const px = j.x - origin.x;
+        const py = j.y - origin.y;
+        const isJoint = j.count >= 2;
+        const color = j.bound ? 0x10B981 : (isJoint ? 0x2563EB : 0x60A5FA);
+        const r = (isJoint || j.bound) ? baseR * 1.1 : baseR * 0.9;
+
+        /* White halo for contrast on dark backgrounds. */
+        const halo = new three.Mesh(
+          new three.CircleGeometry(r * 1.55, 22),
+          new three.MeshBasicMaterial({
+            color: new three.Color(0xffffff),
+            transparent: true, opacity: 0.9,
+            depthTest: false, depthWrite: false, side: three.DoubleSide,
+          }),
+        );
+        halo.position.set(px, py, 0.56);
+        halo.renderOrder = 1190;
+        group.add(halo);
+
+        /* Solid coloured dot. */
+        const dot = new three.Mesh(
+          new three.CircleGeometry(r, 22),
+          new three.MeshBasicMaterial({
+            color: new three.Color(color),
+            transparent: true, opacity: 1,
+            depthTest: false, depthWrite: false, side: three.DoubleSide,
+          }),
+        );
+        dot.position.set(px, py, 0.57);
+        dot.renderOrder = 1191;
+        group.add(dot);
+      }
+    }
+
     // ── Draw preview rectangle while placing a pipe ──
     if (pipeDrawStart && pipeDrawPreview) {
       const fs = [pipeDrawStart.x - origin.x, pipeDrawStart.y - origin.y];
@@ -1243,12 +1487,12 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
           side: three.DoubleSide,
         });
         const startMk = new three.Mesh(new three.CircleGeometry(markerR, 20), mkMat);
-        startMk.position.set(sx, sy, 0.96);
+        startMk.position.set(sx, sy, 0.58);
         startMk.renderOrder = 1201;
         group.add(startMk);
 
         const endMk = new three.Mesh(new three.CircleGeometry(markerR, 20), mkMat.clone());
-        endMk.position.set(ex, ey, 0.96);
+        endMk.position.set(ex, ey, 0.58);
         endMk.renderOrder = 1201;
         group.add(endMk);
       }
@@ -1264,6 +1508,133 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       anchorDot.position.set(fs[0], fs[1], 0.53);
       anchorDot.renderOrder = 1007;
       group.add(anchorDot);
+    }
+
+    /* Selected-pipe endpoint markers — when a pipe is selected draw a prominent blue
+     * dot (matching the pipe-draw anchor style) at each endpoint so the user sees them
+     * as grab handles they can extend/move. White halo for contrast on any background. */
+    if (selectedPipe) {
+      const sel = selectedPipe.kind === "auto"
+        ? pipesData?.pipes?.[selectedPipe.index]
+        : manualPipes[selectedPipe.index];
+      if (sel) {
+        const ends: Array<[number, number]> = [sel.from, sel.to];
+        /* Aim for ~12 px radius on screen — large enough to read clearly at any zoom. */
+        const r = Math.max(dotR * 1.0, _upm * 0.14, worldPerPx * 12);
+        for (const [wx, wy] of ends) {
+          const ex = wx - origin.x;
+          const ey = wy - origin.y;
+          /* White halo so the blue dot stays visible on any background. */
+          const halo = new three.Mesh(
+            new three.CircleGeometry(r * 1.5, 32),
+            new three.MeshBasicMaterial({
+              color: new three.Color(0xffffff),
+              transparent: true, opacity: 1.0,
+              depthTest: false, depthWrite: false, side: three.DoubleSide,
+            }),
+          );
+          halo.position.set(ex, ey, 0.55);
+          halo.renderOrder = 1310;
+          group.add(halo);
+          /* Solid blue dot — same hue as the draw-time start anchor (0x3b82f6). */
+          const dot = new three.Mesh(
+            new three.CircleGeometry(r, 32),
+            new three.MeshBasicMaterial({
+              color: new three.Color(0x3b82f6),
+              transparent: true, opacity: 1.0,
+              depthTest: false, depthWrite: false, side: three.DoubleSide,
+            }),
+          );
+          dot.position.set(ex, ey, 0.55);
+          dot.renderOrder = 1311;
+          group.add(dot);
+        }
+      }
+    }
+
+    /* Pipe-edit snap indicator — mirrors the draw-time anchor dot. Filled black while
+     * locked onto a snap target, hollow grey while free-floating, so the user sees the
+     * same feedback as the line tool's anchor marker. */
+    if (pipeEditSnap && pipeEditSnap.length > 0) {
+      for (const hint of pipeEditSnap) {
+        const ex = hint.x - origin.x;
+        const ey = hint.y - origin.y;
+        const r = Math.max(dotR * 0.9, _upm * 0.11, worldPerPx * 4);
+        /* White halo so the black dot stays visible against any background. */
+        const halo = new three.Mesh(
+          new three.CircleGeometry(r * 1.6, 28),
+          new three.MeshBasicMaterial({
+            color: new three.Color(0xffffff),
+            transparent: true, opacity: 0.9,
+            depthTest: false, depthWrite: false, side: three.DoubleSide,
+          }),
+        );
+        halo.position.set(ex, ey, 0.59);
+        halo.renderOrder = 1209;
+        group.add(halo);
+        const snapDot = new three.Mesh(
+          new three.CircleGeometry(r, 28),
+          new three.MeshBasicMaterial({
+            color: new three.Color(hint.snapped ? 0x000000 : 0x6b7280),
+            transparent: true,
+            opacity: hint.snapped ? 1.0 : 0.9,
+            depthTest: false, depthWrite: false, side: three.DoubleSide,
+          }),
+        );
+        snapDot.position.set(ex, ey, 0.6);
+        snapDot.renderOrder = 1210;
+        group.add(snapDot);
+        if (hint.snapped) {
+          const ring = new three.Mesh(
+            new three.RingGeometry(r * 1.35, r * 1.85, 32),
+            new three.MeshBasicMaterial({
+              color: new three.Color(0x000000),
+              transparent: true, opacity: 0.95,
+              depthTest: false, depthWrite: false, side: three.DoubleSide,
+            }),
+          );
+          ring.position.set(ex, ey, 0.61);
+          ring.renderOrder = 1211;
+          group.add(ring);
+          /* AutoCAD-style red square "object snap" indicator. A solid red frame around
+           * the black dot — extra-thick + larger when the snap is a mid-segment "tee-in"
+           * that will split the target pipe on release, so the user knows it's a special
+           * snap kind. */
+          const half = (hint.split ? r * 2.6 : r * 2.1);
+          const thick = (hint.split ? r * 0.42 : r * 0.32);
+          const redColor = new three.Color(hint.split ? 0xDC2626 : 0xEF4444);
+          /* White fill behind the red outline. */
+          const sFill = new three.Mesh(
+            new three.PlaneGeometry(half * 2, half * 2),
+            new three.MeshBasicMaterial({
+              color: new three.Color(0xffffff),
+              transparent: true, opacity: 0.95,
+              depthTest: false, depthWrite: false, side: three.DoubleSide,
+            }),
+          );
+          sFill.position.set(ex, ey, 0.59);
+          sFill.renderOrder = 1211.5;
+          group.add(sFill);
+          const redMat = new three.MeshBasicMaterial({
+            color: redColor,
+            transparent: true, opacity: 0.98,
+            depthTest: false, depthWrite: false, side: three.DoubleSide,
+          });
+          /* 4 thin strips forming a hollow square. */
+          const strips: Array<[number, number, number, number]> = [
+            [ex, ey + half - thick / 2, half * 2, thick], // top
+            [ex, ey - half + thick / 2, half * 2, thick], // bottom
+            [ex - half + thick / 2, ey, thick, half * 2 - thick * 2], // left
+            [ex + half - thick / 2, ey, thick, half * 2 - thick * 2], // right
+          ];
+          for (const [cx, cy, w, h] of strips) {
+            const strip = new three.Mesh(new three.PlaneGeometry(w, h), redMat);
+            strip.position.set(cx, cy, 0.62);
+            strip.renderOrder = 1212;
+            group.add(strip);
+          }
+        }
+      }
     }
 
     scene.add(group);
@@ -1820,7 +2191,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   useEffect(() => {
     renderDetectors();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detectors, dxfUrl, worldToM, selectedDetectorId, selectedDetectorIds, pipesData, showPipes, sourceSelectMode, detectedSources, chosenSource, manualPipes, pipeDrawStart, pipeDrawPreview, equipmentLayerVisibility, selectedPipe, measureStart, measureEnd, measurePreview, showCoverageDisks, detectorSpacingM]);
+  }, [detectors, dxfUrl, worldToM, selectedDetectorId, selectedDetectorIds, pipesData, showPipes, sourceSelectMode, detectedSources, chosenSource, manualPipes, pipeDrawStart, pipeDrawPreview, equipmentLayerVisibility, selectedPipe, measureStart, measureEnd, measurePreview, showCoverageDisks, detectorSpacingM, pipeEditSnap, tool]);
 
   function worldPointFromPointer(pointer: PointerInfo): { x: number; y: number } | null {
     const viewer = viewerRef.current;
@@ -1943,6 +2314,134 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       }
     }
     return bestDist2 <= 14 * 14 ? best : null;
+  }
+
+  /** Given a world-space point (typically a freshly-clicked pipe endpoint), find the
+   *  nearest detector / source / existing pipe-end within screen-space `snapRadiusPx`
+   *  and return both the snapped world coordinates and an anchor descriptor (when the
+   *  snap target is a detector or pipe source). Pipe-to-pipe joints are kept tight by
+   *  coordinate identity, not by an explicit anchor.
+   *
+   *  `exclude` lets the pipe-edit drag suppress self-snap: any detector id in
+   *  `exclude.detectorIds` and any pipe endpoint key (`${kind}:${index}:${end}`) in
+   *  `exclude.pipeEndpointKeys` is skipped. */
+  function snapPipeEndpoint(
+    world: { x: number; y: number },
+    snapRadiusPx = 16,
+    exclude?: { detectorIds?: Set<string>; pipeEndpointKeys?: Set<string>; pipeSegmentKeys?: Set<string> },
+  ): {
+    point: { x: number; y: number };
+    anchor?: PipeEndpointAnchor;
+    /** When the snap landed in the middle of an existing pipe (not at an endpoint), the
+     *  caller should split that pipe at `t∈(0,1)` on commit so the dragged endpoint
+     *  becomes a real T-junction joint. */
+    splitTarget?: { pipeKind: "auto" | "manual"; pipeIndex: number; t: number };
+  } {
+    const screen = screenPointForWorld(world.x, world.y, 0.8);
+    if (!screen) return { point: world };
+
+    let bestDist2 = snapRadiusPx * snapRadiusPx;
+    let bestPoint: { x: number; y: number } | null = null;
+    let bestAnchor: PipeEndpointAnchor | undefined;
+
+    const visibleDetectors = selectedFloorId
+      ? detectors.filter((d) => d.floor_plan_id === selectedFloorId)
+      : detectors;
+    for (const d of visibleDetectors) {
+      if (exclude?.detectorIds?.has(d.id)) continue;
+      const p = screenPointForWorld(d.x, d.y, 0.8);
+      if (!p) continue;
+      const dx = p.x - screen.x, dy = p.y - screen.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestDist2) {
+        bestDist2 = d2;
+        bestPoint = { x: d.x, y: d.y };
+        bestAnchor = { kind: "detector", id: d.id };
+      }
+    }
+    if (pipesData?.sources) {
+      for (let i = 0; i < pipesData.sources.length; i++) {
+        const s = pipesData.sources[i];
+        const p = screenPointForWorld(s.x, s.y, 0.8);
+        if (!p) continue;
+        const dx = p.x - screen.x, dy = p.y - screen.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestDist2) {
+          bestDist2 = d2;
+          bestPoint = { x: s.x, y: s.y };
+          bestAnchor = { kind: "source", index: i };
+        }
+      }
+    }
+    /* Pipe ends (auto + manual) — snap to position only, joint identity preserved by coords. */
+    const ends: Array<{ x: number; y: number; key: string }> = [];
+    if (pipesData?.pipes) {
+      for (let i = 0; i < pipesData.pipes.length; i++) {
+        const seg = pipesData.pipes[i];
+        ends.push({ x: seg.from[0], y: seg.from[1], key: `auto:${i}:from` });
+        ends.push({ x: seg.to[0],   y: seg.to[1],   key: `auto:${i}:to`   });
+      }
+    }
+    for (let i = 0; i < manualPipes.length; i++) {
+      const seg = manualPipes[i];
+      ends.push({ x: seg.from[0], y: seg.from[1], key: `manual:${i}:from` });
+      ends.push({ x: seg.to[0],   y: seg.to[1],   key: `manual:${i}:to`   });
+    }
+    for (const e of ends) {
+      if (exclude?.pipeEndpointKeys?.has(e.key)) continue;
+      const p = screenPointForWorld(e.x, e.y, 0.8);
+      if (!p) continue;
+      const dx = p.x - screen.x, dy = p.y - screen.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestDist2) {
+        bestDist2 = d2;
+        bestPoint = { x: e.x, y: e.y };
+        bestAnchor = undefined;
+      }
+    }
+    /* Mid-segment snaps — project query onto each pipe segment in screen space; if the
+     * projection sits within the radius the pipe will be split at that point on commit
+     * so the moved endpoint becomes a true T-junction. */
+    let bestSplit: { pipeKind: "auto" | "manual"; pipeIndex: number; t: number } | undefined;
+    function testSegment(pipeKind: "auto" | "manual", pipeIndex: number, ax: number, ay: number, bx: number, by: number) {
+      const segKey = `${pipeKind}:${pipeIndex}`;
+      if (exclude?.pipeSegmentKeys?.has(segKey)) return;
+      const sa = screenPointForWorld(ax, ay, 0.8);
+      const sb = screenPointForWorld(bx, by, 0.8);
+      if (!sa || !sb) return;
+      const sdx = sb.x - sa.x, sdy = sb.y - sa.y;
+      const len2 = sdx * sdx + sdy * sdy;
+      if (len2 === 0) return;
+      let t = ((screen.x - sa.x) * sdx + (screen.y - sa.y) * sdy) / len2;
+      /* Keep a margin away from endpoints so endpoint snap wins for true endpoint hits. */
+      if (t < 0.05 || t > 0.95) return;
+      t = Math.max(0, Math.min(1, t));
+      const cx = sa.x + t * sdx, cy = sa.y + t * sdy;
+      const dx = cx - screen.x, dy = cy - screen.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestDist2) {
+        bestDist2 = d2;
+        const wx = ax + t * (bx - ax);
+        const wy = ay + t * (by - ay);
+        bestPoint = { x: wx, y: wy };
+        bestAnchor = undefined;
+        bestSplit = { pipeKind, pipeIndex, t };
+      }
+    }
+    if (pipesData?.pipes) {
+      for (let i = 0; i < pipesData.pipes.length; i++) {
+        const seg = pipesData.pipes[i];
+        testSegment("auto", i, seg.from[0], seg.from[1], seg.to[0], seg.to[1]);
+      }
+    }
+    for (let i = 0; i < manualPipes.length; i++) {
+      const seg = manualPipes[i];
+      testSegment("manual", i, seg.from[0], seg.from[1], seg.to[0], seg.to[1]);
+    }
+    if (!bestPoint) return { point: world };
+    return bestSplit
+      ? { point: bestPoint, anchor: bestAnchor, splitTarget: bestSplit }
+      : { point: bestPoint, anchor: bestAnchor };
   }
 
   function getMeasureDistanceMeters(
@@ -2083,6 +2582,63 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     return bestDist2 <= HIT_THRESHOLD_PX * HIT_THRESHOLD_PX ? bestKey : null;
   }
 
+  /** Hit-test pipe endpoints (not segments). Returns the joint description: every pipe
+   *  end + detector that's coincident with the closest endpoint under the cursor. This
+   *  is what powers grip-style edits — dragging a joint moves all incident pipes and
+   *  the detector (if any) together. Tolerance is screen-space pixels. */
+  function nearestPipeEndpoint(pointer: PointerInfo, thresholdPx = 12): {
+    joint: { x: number; y: number };
+    endpoints: Array<{ kind: "auto" | "manual"; index: number; end: "from" | "to" }>;
+    detectorIds: string[];
+  } | null {
+    const candidates: Array<{ x: number; y: number; ref: { kind: "auto" | "manual"; index: number; end: "from" | "to" } }> = [];
+    if (pipesData?.pipes) {
+      for (let i = 0; i < pipesData.pipes.length; i++) {
+        const seg = pipesData.pipes[i];
+        candidates.push({ x: seg.from[0], y: seg.from[1], ref: { kind: "auto", index: i, end: "from" } });
+        candidates.push({ x: seg.to[0],   y: seg.to[1],   ref: { kind: "auto", index: i, end: "to" } });
+      }
+    }
+    for (let i = 0; i < manualPipes.length; i++) {
+      const seg = manualPipes[i];
+      candidates.push({ x: seg.from[0], y: seg.from[1], ref: { kind: "manual", index: i, end: "from" } });
+      candidates.push({ x: seg.to[0],   y: seg.to[1],   ref: { kind: "manual", index: i, end: "to" } });
+    }
+
+    let bestDist2 = thresholdPx * thresholdPx;
+    let bestCand: typeof candidates[number] | null = null;
+    for (const c of candidates) {
+      const p = screenPointForWorld(c.x, c.y, 0.8);
+      if (!p) continue;
+      const dx = p.x - pointer.clientX, dy = p.y - pointer.clientY;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestDist2) {
+        bestDist2 = d2;
+        bestCand = c;
+      }
+    }
+    if (!bestCand) return null;
+
+    /* Gather every pipe end + detector coincident with the picked endpoint. */
+    const JOINT_EPS = 1e-3;
+    const TOL2 = JOINT_EPS * JOINT_EPS;
+    const joint = { x: bestCand.x, y: bestCand.y };
+    const endpoints: Array<{ kind: "auto" | "manual"; index: number; end: "from" | "to" }> = [];
+    for (const c of candidates) {
+      const dx = c.x - joint.x, dy = c.y - joint.y;
+      if (dx * dx + dy * dy <= TOL2) endpoints.push(c.ref);
+    }
+    const detectorIds: string[] = [];
+    const visibleDetectors = selectedFloorId
+      ? detectors.filter((d) => d.floor_plan_id === selectedFloorId)
+      : detectors;
+    for (const d of visibleDetectors) {
+      const dx = d.x - joint.x, dy = d.y - joint.y;
+      if (dx * dx + dy * dy <= TOL2) detectorIds.push(d.id);
+    }
+    return { joint, endpoints, detectorIds };
+  }
+
   function deleteSelectedPipe() {
     if (!selectedPipe) return;
     if (selectedPipe.kind === "manual") {
@@ -2218,13 +2774,69 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       if (tool === "select") {
         const additive = evt.shiftKey || evt.ctrlKey || evt.metaKey;
         if (!hitId) {
+          /* Endpoint/joint grip-edit takes precedence over segment-select: if the user
+           * clicks within a few pixels of any pipe-end, drag that joint (and every pipe
+           * end + detector coincident with it) instead of selecting the segment. */
+          if (!additive) {
+            const jointHit = nearestPipeEndpoint(pointer);
+            if (jointHit && jointHit.endpoints.length > 0) {
+              evt.preventDefault();
+              evt.stopPropagation();
+              const pipeStarts = new Map<string, { from: [number, number]; to: [number, number] }>();
+              for (const ep of jointHit.endpoints) {
+                const key = `${ep.kind}:${ep.index}`;
+                if (pipeStarts.has(key)) continue;
+                const src = ep.kind === "auto"
+                  ? pipesData?.pipes[ep.index]
+                  : manualPipes[ep.index];
+                if (!src) continue;
+                pipeStarts.set(key, {
+                  from: [src.from[0], src.from[1]],
+                  to:   [src.to[0],   src.to[1]],
+                });
+              }
+              const detectorStarts: Record<string, { x: number; y: number }> = {};
+              for (const id of jointHit.detectorIds) {
+                const d = detectors.find((x) => x.id === id);
+                if (d) detectorStarts[id] = { x: d.x, y: d.y };
+              }
+              pipeEndpointDragRef.current = {
+                startWorld: jointHit.joint,
+                endpoints: jointHit.endpoints,
+                pipeStarts,
+                detectorIds: jointHit.detectorIds,
+                detectorStarts,
+                moved: false,
+              };
+              applySelectedIds(jointHit.detectorIds);
+              setSelectedPipe(null);
+              setPipeEditSnap([{ x: jointHit.joint.x, y: jointHit.joint.y, snapped: false }]);
+              try { el.style.cursor = "grabbing"; } catch {}
+              return;
+            }
+          }
           // No detector under cursor — try a pipe before falling back to marquee.
           const hitPipe = nearestPipe(pointer);
           if (hitPipe) {
             evt.preventDefault();
             evt.stopPropagation();
-            applySelectedIds([]);
-            setSelectedPipe(hitPipe);
+            /* Start a pipe-body translate. If the cursor never actually moves we'll
+             * fall back to plain selection on pointer-up. */
+            const seg = hitPipe.kind === "auto"
+              ? pipesData?.pipes[hitPipe.index]
+              : manualPipes[hitPipe.index];
+            const world = worldPointFromPointer(pointer);
+            if (seg && world) {
+              pipeBodyDragRef.current = {
+                ref: hitPipe,
+                startWorld: world,
+                startClient: { x: evt.clientX, y: evt.clientY },
+                startFrom: [seg.from[0], seg.from[1]],
+                startTo:   [seg.to[0],   seg.to[1]],
+                moved: false,
+              };
+              try { el.style.cursor = "grabbing"; } catch {}
+            }
             return;
           }
           evt.preventDefault();
@@ -2263,12 +2875,202 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
             startById[d.id] = { x: d.x, y: d.y };
           }
         }
-        groupDragRef.current = { ids: dragIds, startWorld: world, startById };
+
+        /* Snapshot every pipe endpoint that is anchored to (or coincident with) any of
+         * the dragged detectors. The drag-move pass will translate those endpoints by
+         * the same delta as the detector, keeping joints rigidly connected. */
+        const JOINT_EPS = 1e-3;       // world units — generous for floating-point noise
+        const dragIdSet = new Set(dragIds);
+        const draggedAnchorPts = Object.values(startById);
+        function followsDrag(
+          end: [number, number],
+          anchor: PipeEndpointAnchor | undefined,
+        ): boolean {
+          if (anchor?.kind === "detector" && dragIdSet.has(anchor.id)) return true;
+          for (const p of draggedAnchorPts) {
+            const dx = end[0] - p.x, dy = end[1] - p.y;
+            if (dx * dx + dy * dy <= JOINT_EPS * JOINT_EPS) return true;
+          }
+          return false;
+        }
+        const pipeStarts = new Map<number, { from: [number, number]; to: [number, number]; followFrom: boolean; followTo: boolean }>();
+        if (pipesData?.pipes) {
+          for (let i = 0; i < pipesData.pipes.length; i++) {
+            const seg = pipesData.pipes[i];
+            const f = followsDrag(seg.from, seg.fromAnchor);
+            const t = followsDrag(seg.to,   seg.toAnchor);
+            if (f || t) {
+              pipeStarts.set(i, {
+                from: [seg.from[0], seg.from[1]],
+                to:   [seg.to[0],   seg.to[1]],
+                followFrom: f, followTo: t,
+              });
+            }
+          }
+        }
+        const manualStarts = new Map<number, { from: [number, number]; to: [number, number]; followFrom: boolean; followTo: boolean }>();
+        for (let i = 0; i < manualPipes.length; i++) {
+          const seg = manualPipes[i];
+          const f = followsDrag(seg.from, seg.fromAnchor);
+          const t = followsDrag(seg.to,   seg.toAnchor);
+          if (f || t) {
+            manualStarts.set(i, {
+              from: [seg.from[0], seg.from[1]],
+              to:   [seg.to[0],   seg.to[1]],
+              followFrom: f, followTo: t,
+            });
+          }
+        }
+        groupDragRef.current = { ids: dragIds, startWorld: world, startById, pipeStarts, manualStarts };
+        try { el.style.cursor = "grabbing"; } catch {}
       }
     };
 
     const onPointerMove = (evt: PointerEvent) => {
       if (!canEdit || tool !== "select") return;
+
+      /* Schedule a state update on the next animation frame, replacing any pending
+       * payload so we never run more state work than the screen can render. */
+      function scheduleDragFrame(fn: () => void) {
+        const slot = pipeDragRafRef.current;
+        if (slot) { slot.pending = fn; return; }
+        const raf = requestAnimationFrame(() => {
+          const s = pipeDragRafRef.current;
+          pipeDragRafRef.current = null;
+          if (s?.pending) s.pending();
+        });
+        pipeDragRafRef.current = { raf, pending: fn };
+      }
+
+      /* Pipe-body translate — drag the whole segment by both endpoints. Each endpoint
+       * snaps independently to a nearby pipe-end / sprinkler / source so the moved
+       * pipe re-joins the network on release; both endpoints show a live snap dot. */
+      if (pipeBodyDragRef.current) {
+        const world = worldPointFromPointer({ clientX: evt.clientX, clientY: evt.clientY });
+        if (!world) return;
+        evt.preventDefault();
+        evt.stopPropagation();
+        const drag = pipeBodyDragRef.current;
+        const dx = world.x - drag.startWorld.x;
+        const dy = world.y - drag.startWorld.y;
+        /* Tap-vs-drag threshold uses pixel distance so it doesn't change with zoom.
+         * Real mouse clicks always exceed a tiny world-units threshold, so the previous
+         * 1e-8 check effectively never registered clicks as taps. */
+        if (!drag.moved) {
+          const pdx = evt.clientX - drag.startClient.x;
+          const pdy = evt.clientY - drag.startClient.y;
+          if (pdx * pdx + pdy * pdy < 16) return;   // < 4 px → still a click
+        }
+        drag.moved = true;
+        const rawFrom: [number, number] = [drag.startFrom[0] + dx, drag.startFrom[1] + dy];
+        const rawTo:   [number, number] = [drag.startTo[0]   + dx, drag.startTo[1]   + dy];
+        /* Snap each endpoint independently, excluding the moving pipe's own ends. */
+        const excludeKeys = new Set([
+          `${drag.ref.kind}:${drag.ref.index}:from`,
+          `${drag.ref.kind}:${drag.ref.index}:to`,
+        ]);
+        const snapFrom = snapPipeEndpoint({ x: rawFrom[0], y: rawFrom[1] }, 16, { pipeEndpointKeys: excludeKeys });
+        const snapTo   = snapPipeEndpoint({ x: rawTo[0],   y: rawTo[1]   }, 16, { pipeEndpointKeys: excludeKeys });
+        const newFrom: [number, number] = [snapFrom.point.x, snapFrom.point.y];
+        const newTo:   [number, number] = [snapTo.point.x,   snapTo.point.y];
+        const snappedFrom = snapFrom.anchor !== undefined || snapFrom.point.x !== rawFrom[0] || snapFrom.point.y !== rawFrom[1];
+        const snappedTo   = snapTo.anchor   !== undefined || snapTo.point.x   !== rawTo[0]   || snapTo.point.y   !== rawTo[1];
+        scheduleDragFrame(() => {
+          setPipeEditSnap([
+            { x: newFrom[0], y: newFrom[1], snapped: snappedFrom, split: snapFrom.splitTarget !== undefined },
+            { x: newTo[0],   y: newTo[1],   snapped: snappedTo,   split: snapTo.splitTarget   !== undefined },
+          ]);
+          if (drag.ref.kind === "auto") {
+            setPipesData((prev) => {
+              if (!prev) return prev;
+              const next = prev.pipes.slice();
+              const cur = next[drag.ref.index];
+              if (cur) {
+                next[drag.ref.index] = { ...cur, from: newFrom, to: newTo, fromAnchor: undefined, toAnchor: undefined };
+              }
+              return { ...prev, pipes: next };
+            });
+          } else {
+            setManualPipes((prev) => {
+              const next = prev.slice();
+              const cur = next[drag.ref.index];
+              if (cur) {
+                next[drag.ref.index] = { ...cur, from: newFrom, to: newTo, fromAnchor: undefined, toAnchor: undefined };
+              }
+              return next;
+            });
+          }
+        });
+        return;
+      }
+
+      /* Pipe endpoint / joint drag — runs before marquee + detector-group drag so the
+       * grip edit is never preempted. */
+      if (pipeEndpointDragRef.current) {
+        const world = worldPointFromPointer({ clientX: evt.clientX, clientY: evt.clientY });
+        if (!world) return;
+        evt.preventDefault();
+        evt.stopPropagation();
+        const drag = pipeEndpointDragRef.current;
+        /* Snap the moving joint to any other detector / source / pipe-end nearby, but
+         * exclude the endpoints + detectors that are being dragged (otherwise the joint
+         * would always self-snap to its previous frame's position). */
+        const excludeDetectorIds = new Set(drag.detectorIds);
+        const excludePipeKeys = new Set(drag.endpoints.map((e) => `${e.kind}:${e.index}:${e.end}`));
+        const snap = snapPipeEndpoint(world, 16, {
+          detectorIds: excludeDetectorIds,
+          pipeEndpointKeys: excludePipeKeys,
+        });
+        const target = snap.point;
+        const snapped = snap.anchor !== undefined || snap.splitTarget !== undefined || (target.x !== world.x || target.y !== world.y);
+
+        const autoUpdates: Array<{ index: number; end: "from" | "to" }> = [];
+        const manualUpdates: Array<{ index: number; end: "from" | "to" }> = [];
+        for (const ep of drag.endpoints) {
+          (ep.kind === "auto" ? autoUpdates : manualUpdates).push({ index: ep.index, end: ep.end });
+        }
+        scheduleDragFrame(() => {
+          setPipeEditSnap([{ x: target.x, y: target.y, snapped, split: snap.splitTarget !== undefined }]);
+          if (autoUpdates.length > 0) {
+            setPipesData((prev) => {
+              if (!prev) return prev;
+              const next = prev.pipes.slice();
+              for (const u of autoUpdates) {
+                const cur = next[u.index];
+                if (!cur) continue;
+                next[u.index] = {
+                  ...cur,
+                  from: u.end === "from" ? [target.x, target.y] : cur.from,
+                  to:   u.end === "to"   ? [target.x, target.y] : cur.to,
+                };
+              }
+              return { ...prev, pipes: next };
+            });
+          }
+          if (manualUpdates.length > 0) {
+            setManualPipes((prev) => {
+              const next = prev.slice();
+              for (const u of manualUpdates) {
+                const cur = next[u.index];
+                if (!cur) continue;
+                next[u.index] = {
+                  ...cur,
+                  from: u.end === "from" ? [target.x, target.y] : cur.from,
+                  to:   u.end === "to"   ? [target.x, target.y] : cur.to,
+                };
+              }
+              return next;
+            });
+          }
+          if (drag.detectorIds.length > 0) {
+            setDetectors((prev) => prev.map((d) =>
+              drag.detectorIds.includes(d.id) ? { ...d, x: target.x, y: target.y } : d,
+            ));
+          }
+        });
+        drag.moved = true;
+        return;
+      }
 
       if (marqueeRef.current) {
         evt.preventDefault();
@@ -2297,10 +3099,240 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
         const start = drag.startById[d.id];
         return start ? { ...d, x: start.x + dx, y: start.y + dy } : d;
       }));
+      /* Auto-routed pipes: translate every captured endpoint by the same delta. */
+      if (drag.pipeStarts.size > 0) {
+        setPipesData((prev) => {
+          if (!prev) return prev;
+          const next = prev.pipes.map((seg, i) => {
+            const cap = drag.pipeStarts.get(i);
+            if (!cap) return seg;
+            return {
+              ...seg,
+              from: cap.followFrom ? [cap.from[0] + dx, cap.from[1] + dy] as [number, number] : seg.from,
+              to:   cap.followTo   ? [cap.to[0]   + dx, cap.to[1]   + dy] as [number, number] : seg.to,
+            };
+          });
+          return { ...prev, pipes: next };
+        });
+      }
+      /* Manual pipes: same treatment. */
+      if (drag.manualStarts.size > 0) {
+        setManualPipes((prev) =>
+          prev.map((seg, i) => {
+            const cap = drag.manualStarts.get(i);
+            if (!cap) return seg;
+            return {
+              ...seg,
+              from: cap.followFrom ? [cap.from[0] + dx, cap.from[1] + dy] as [number, number] : seg.from,
+              to:   cap.followTo   ? [cap.to[0]   + dx, cap.to[1]   + dy] as [number, number] : seg.to,
+            };
+          }),
+        );
+      }
       setHasManualChanges(true);
     };
 
     const onPointerUp = (evt: PointerEvent) => {
+      /* Helper: rebuild a pipe array by applying any number of in-place mutations
+       * (typically anchor/coordinate updates on dragged pipes) and then splitting
+       * any number of target pipes at given (t, point) pairs into chains of
+       * contiguous sub-segments. Mutations apply first at their original indices;
+       * splits then process from highest index downward so earlier indices remain
+       * valid as we splice replacements in. */
+      function applyMutationAndSplits<T extends PipeSegment>(
+        arr: T[],
+        mutates: Array<{ index: number; from?: [number, number]; to?: [number, number]; fromAnchor?: PipeEndpointAnchor; toAnchor?: PipeEndpointAnchor; setFromAnchor?: boolean; setToAnchor?: boolean }>,
+        splits: Array<{ index: number; t: number; point: [number, number] }>,
+      ): T[] {
+        let next = arr.slice();
+        for (const m of mutates) {
+          const c = next[m.index];
+          if (!c) continue;
+          next[m.index] = {
+            ...c,
+            from: m.from ?? c.from,
+            to: m.to ?? c.to,
+            fromAnchor: m.setFromAnchor ? m.fromAnchor : c.fromAnchor,
+            toAnchor: m.setToAnchor ? m.toAnchor : c.toAnchor,
+          } as T;
+        }
+        if (splits.length === 0) return next;
+        const byIndex = new Map<number, Array<{ t: number; point: [number, number] }>>();
+        for (const s of splits) {
+          const list = byIndex.get(s.index) ?? [];
+          list.push({ t: s.t, point: s.point });
+          byIndex.set(s.index, list);
+        }
+        const indices = Array.from(byIndex.keys()).sort((a, b) => b - a);
+        for (const idx of indices) {
+          const orig = next[idx];
+          if (!orig) continue;
+          const splitsAtIdx = byIndex.get(idx)!.sort((a, b) => a.t - b.t);
+          const points: Array<[number, number]> = [orig.from];
+          for (const s of splitsAtIdx) points.push(s.point);
+          points.push(orig.to);
+          const replacement: T[] = [];
+          for (let i = 0; i < points.length - 1; i++) {
+            const isFirst = i === 0;
+            const isLast = i === points.length - 2;
+            replacement.push({
+              ...orig,
+              from: points[i],
+              to: points[i + 1],
+              fromAnchor: isFirst ? orig.fromAnchor : undefined,
+              toAnchor: isLast ? orig.toAnchor : undefined,
+            } as T);
+          }
+          next.splice(idx, 1, ...replacement);
+        }
+        return next;
+      }
+
+      /* Finalize pipe-body translate (or convert to a plain selection if not moved).
+       * On release we redo a fresh snap test and, when an endpoint locks onto a
+       * sprinkler/source, bake the anchor so subsequent sprinkler drags carry the
+       * pipe along — exactly like dropping a wire onto a terminal. Mid-segment snaps
+       * additionally split the target pipe into a real T-junction. */
+      if (pipeBodyDragRef.current) {
+        const drag = pipeBodyDragRef.current;
+        if (drag.moved) {
+          const world = worldPointFromPointer({ clientX: evt.clientX, clientY: evt.clientY });
+          if (world) {
+            const dx = world.x - drag.startWorld.x;
+            const dy = world.y - drag.startWorld.y;
+            const rawFrom: [number, number] = [drag.startFrom[0] + dx, drag.startFrom[1] + dy];
+            const rawTo:   [number, number] = [drag.startTo[0]   + dx, drag.startTo[1]   + dy];
+            const excludeKeys = new Set([
+              `${drag.ref.kind}:${drag.ref.index}:from`,
+              `${drag.ref.kind}:${drag.ref.index}:to`,
+            ]);
+            const excludeSegKeys = new Set([`${drag.ref.kind}:${drag.ref.index}`]);
+            const snapFrom = snapPipeEndpoint({ x: rawFrom[0], y: rawFrom[1] }, 16, { pipeEndpointKeys: excludeKeys, pipeSegmentKeys: excludeSegKeys });
+            const snapTo   = snapPipeEndpoint({ x: rawTo[0],   y: rawTo[1]   }, 16, { pipeEndpointKeys: excludeKeys, pipeSegmentKeys: excludeSegKeys });
+            const finalFrom: [number, number] = [snapFrom.point.x, snapFrom.point.y];
+            const finalTo:   [number, number] = [snapTo.point.x,   snapTo.point.y];
+
+            const autoSplits: Array<{ index: number; t: number; point: [number, number] }> = [];
+            const manualSplits: Array<{ index: number; t: number; point: [number, number] }> = [];
+            if (snapFrom.splitTarget) {
+              (snapFrom.splitTarget.pipeKind === "auto" ? autoSplits : manualSplits)
+                .push({ index: snapFrom.splitTarget.pipeIndex, t: snapFrom.splitTarget.t, point: finalFrom });
+            }
+            if (snapTo.splitTarget) {
+              (snapTo.splitTarget.pipeKind === "auto" ? autoSplits : manualSplits)
+                .push({ index: snapTo.splitTarget.pipeIndex, t: snapTo.splitTarget.t, point: finalTo });
+            }
+
+            if (drag.ref.kind === "auto") {
+              setPipesData((prev) => {
+                if (!prev) return prev;
+                const nextPipes = applyMutationAndSplits(
+                  prev.pipes,
+                  [{ index: drag.ref.index, from: finalFrom, to: finalTo, fromAnchor: snapFrom.anchor, toAnchor: snapTo.anchor, setFromAnchor: true, setToAnchor: true }],
+                  autoSplits,
+                );
+                return { ...prev, pipes: nextPipes };
+              });
+              if (manualSplits.length > 0) {
+                setManualPipes((prev) => applyMutationAndSplits(prev, [], manualSplits));
+              }
+              setPipesModified(true);
+            } else {
+              setManualPipes((prev) => applyMutationAndSplits(
+                prev,
+                [{ index: drag.ref.index, from: finalFrom, to: finalTo, fromAnchor: snapFrom.anchor, toAnchor: snapTo.anchor, setFromAnchor: true, setToAnchor: true }],
+                manualSplits,
+              ));
+              if (autoSplits.length > 0) {
+                setPipesData((prev) => {
+                  if (!prev) return prev;
+                  return { ...prev, pipes: applyMutationAndSplits(prev.pipes, [], autoSplits) };
+                });
+                setPipesModified(true);
+              }
+            }
+          }
+          setHasManualChanges(true);
+        } else {
+          /* Tiny-click → treat as selection. */
+          applySelectedIds([]);
+          setSelectedPipe(drag.ref);
+        }
+        pipeBodyDragRef.current = null;
+        setPipeEditSnap(null);
+        if (pipeDragRafRef.current) {
+          cancelAnimationFrame(pipeDragRafRef.current.raf);
+          pipeDragRafRef.current = null;
+        }
+        try { (containerRef.current!).style.cursor = ""; } catch {}
+        return;
+      }
+
+      /* Finalize a pipe-endpoint / joint drag. If the user released onto a snap target
+       * (detector or source), bake that as an explicit anchor on every captured pipe
+       * end so subsequent detector drags carry the pipe joint along automatically. */
+      if (pipeEndpointDragRef.current) {
+        const drag = pipeEndpointDragRef.current;
+        if (drag.moved) {
+          const world = worldPointFromPointer({ clientX: evt.clientX, clientY: evt.clientY });
+          if (world) {
+            const excludeDetectorIds = new Set(drag.detectorIds);
+            const excludePipeKeys = new Set(drag.endpoints.map((e) => `${e.kind}:${e.index}:${e.end}`));
+            const excludeSegKeys = new Set(drag.endpoints.map((e) => `${e.kind}:${e.index}`));
+            const snap = snapPipeEndpoint(world, 16, {
+              detectorIds: excludeDetectorIds,
+              pipeEndpointKeys: excludePipeKeys,
+              pipeSegmentKeys: excludeSegKeys,
+            });
+            const newAnchor: PipeEndpointAnchor | undefined = snap.anchor;
+            const finalPoint: [number, number] = [snap.point.x, snap.point.y];
+            const autoEps = drag.endpoints.filter((e) => e.kind === "auto");
+            const manualEps = drag.endpoints.filter((e) => e.kind === "manual");
+
+            const autoMutates = autoEps.map((ep) => ({
+              index: ep.index,
+              fromAnchor: ep.end === "from" ? newAnchor : undefined,
+              toAnchor:   ep.end === "to"   ? newAnchor : undefined,
+              setFromAnchor: ep.end === "from",
+              setToAnchor:   ep.end === "to",
+            }));
+            const manualMutates = manualEps.map((ep) => ({
+              index: ep.index,
+              fromAnchor: ep.end === "from" ? newAnchor : undefined,
+              toAnchor:   ep.end === "to"   ? newAnchor : undefined,
+              setFromAnchor: ep.end === "from",
+              setToAnchor:   ep.end === "to",
+            }));
+            const autoSplits: Array<{ index: number; t: number; point: [number, number] }> = [];
+            const manualSplits: Array<{ index: number; t: number; point: [number, number] }> = [];
+            if (snap.splitTarget) {
+              (snap.splitTarget.pipeKind === "auto" ? autoSplits : manualSplits)
+                .push({ index: snap.splitTarget.pipeIndex, t: snap.splitTarget.t, point: finalPoint });
+            }
+
+            if (autoMutates.length > 0 || autoSplits.length > 0) {
+              setPipesData((prev) => {
+                if (!prev) return prev;
+                return { ...prev, pipes: applyMutationAndSplits(prev.pipes, autoMutates, autoSplits) };
+              });
+              setPipesModified(true);
+            }
+            if (manualMutates.length > 0 || manualSplits.length > 0) {
+              setManualPipes((prev) => applyMutationAndSplits(prev, manualMutates, manualSplits));
+            }
+          }
+          setHasManualChanges(true);
+        }
+        pipeEndpointDragRef.current = null;
+        setPipeEditSnap(null);
+        if (pipeDragRafRef.current) {
+          cancelAnimationFrame(pipeDragRafRef.current.raf);
+          pipeDragRafRef.current = null;
+        }
+        try { el.style.cursor = ""; } catch {}
+        return;
+      }
+
       if (tool === "select" && marqueeRef.current) {
         const { startX, startY, additive } = marqueeRef.current;
         const width = Math.abs(evt.clientX - startX);
@@ -2324,6 +3356,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
 
       groupDragRef.current = null;
       setDraggingDetectorId(null);
+      try { el.style.cursor = ""; } catch {}
     };
 
     el.addEventListener("pointerdown", onPointerDown, true);
@@ -2334,7 +3367,51 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       window.removeEventListener("pointermove", onPointerMove, true);
       window.removeEventListener("pointerup", onPointerUp, true);
     };
-  }, [tool, addType, draggingDetectorId, detectors, selectedFloorId, canEdit, selectedDetectorIds]);
+  }, [tool, addType, draggingDetectorId, detectors, selectedFloorId, canEdit, selectedDetectorIds, manualPipes, pipesData]);
+
+  /* ────────────────────────────────────────────────────────────────────────────
+   * Cursor / hover feedback
+   * Picks a CSS cursor based on the active tool and (for the select tool) what
+   * lies under the pointer — detector, pipe-end joint, pipe body, or empty
+   * canvas. Uses direct style mutation (no React state) so move events don't
+   * trigger re-renders. */
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    if (!canEdit) { el.style.cursor = "default"; return; }
+    const baseCursor =
+      tool === "pan"        ? "grab" :
+      tool === "add"        ? "copy" :
+      tool === "erase"      ? "crosshair" :
+      tool === "draw-pipe"  ? "crosshair" :
+      tool === "measure"    ? "crosshair" :
+      /* select */            "default";
+    el.style.cursor = baseCursor;
+    if (tool !== "select") return;
+
+    const onMove = (evt: PointerEvent) => {
+      // While any drag is active, the drag-start handler already sets the cursor.
+      if (
+        pipeEndpointDragRef.current ||
+        pipeBodyDragRef.current ||
+        groupDragRef.current ||
+        marqueeRef.current
+      ) return;
+      const pointer = { clientX: evt.clientX, clientY: evt.clientY };
+      const hitDet = nearestDetectorId(pointer);
+      if (hitDet) { el.style.cursor = "grab"; return; }
+      const jointHit = nearestPipeEndpoint(pointer);
+      if (jointHit && jointHit.endpoints.length > 0) {
+        el.style.cursor = "crosshair";
+        return;
+      }
+      const hitPipe = nearestPipe(pointer);
+      if (hitPipe) { el.style.cursor = "move"; return; }
+      el.style.cursor = "default";
+    };
+    el.addEventListener("pointermove", onMove);
+    return () => { el.removeEventListener("pointermove", onMove); };
+  }, [tool, canEdit, detectors, pipesData, manualPipes, selectedFloorId]);
 
   useEffect(() => {
     if (!sourceSelectMode) return;
@@ -2794,22 +3871,29 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       if (tgt && tgt.closest && tgt.closest("[data-ui-overlay]")) return;
       evt.preventDefault();
       evt.stopPropagation();
-      const world = worldPointFromPointer({ clientX: evt.clientX, clientY: evt.clientY });
-      if (!world) return;
+      const rawWorld = worldPointFromPointer({ clientX: evt.clientX, clientY: evt.clientY });
+      if (!rawWorld) return;
+      /* Snap to the nearest sprinkler / source / pipe-end so joints stay tight. */
+      const snap = snapPipeEndpoint(rawWorld);
+      const world = snap.point;
 
       if (!pipeDrawStart) {
         // First click: anchor start point
+        pipeDrawStartAnchorRef.current = snap.anchor;
         setPipeDrawStart(world);
         setPipeDrawPreview(world);
       } else {
-        // Second click: commit the pipe segment
-        const seg = {
+        // Second click: commit the pipe segment with anchor metadata.
+        const seg: PipeSegment = {
           from: [pipeDrawStart.x, pipeDrawStart.y] as [number, number],
           to: [world.x, world.y] as [number, number],
           diameter: `${pipeDrawDiameter}mm`,
+          fromAnchor: pipeDrawStartAnchorRef.current,
+          toAnchor: snap.anchor,
         };
         setManualPipes((prev) => [...prev, seg]);
         // Chain: new start is current endpoint for continuous drawing
+        pipeDrawStartAnchorRef.current = snap.anchor;
         setPipeDrawStart(world);
         setPipeDrawPreview(world);
       }
@@ -2817,14 +3901,17 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
 
     const onPointerMove = (evt: PointerEvent) => {
       if (!pipeDrawStart) return;
-      const world = worldPointFromPointer({ clientX: evt.clientX, clientY: evt.clientY });
-      if (world) setPipeDrawPreview(world);
+      const rawWorld = worldPointFromPointer({ clientX: evt.clientX, clientY: evt.clientY });
+      if (!rawWorld) return;
+      /* Preview also snaps so the user sees the tightening effect before committing. */
+      setPipeDrawPreview(snapPipeEndpoint(rawWorld).point);
     };
 
     const onKeyDown = (evt: KeyboardEvent) => {
       if (evt.key === "Escape") {
         setPipeDrawStart(null);
         setPipeDrawPreview(null);
+        pipeDrawStartAnchorRef.current = undefined;
       }
     };
 
