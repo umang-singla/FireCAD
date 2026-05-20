@@ -1,0 +1,1454 @@
+diff --git a/node_modules/dxf-viewer/src/DxfScene.js b/node_modules/dxf-viewer/src/DxfScene.js
+index 852184e..c97200d 100644
+--- a/node_modules/dxf-viewer/src/DxfScene.js
++++ b/node_modules/dxf-viewer/src/DxfScene.js
+@@ -1,6 +1,6 @@
+ import { DynamicBuffer, NativeType } from "./DynamicBuffer.js"
+ import { BatchingKey } from "./BatchingKey.js"
+-import { Matrix3, Vector2 } from "three"
++import { Matrix3, Vector2, Vector3 } from "three"
+ import { TextRenderer, ParseSpecialChars, HAlign, VAlign } from "./TextRenderer.js"
+ import { RBTree } from "./RBTree.js"
+ import { MTextFormatParser } from "./MTextFormatParser.js"
+@@ -21,14 +21,30 @@ const POINT_SHAPE_BLOCK_NAME = "__point_shape"
+ const BLOCK_FLATTENING_VERTICES_THRESHOLD = 1024
+ /** Number of subdivisions per spline point. */
+ const SPLINE_SUBDIVISION = 4
+-/** Limit hatch lines number to some reasonable value to mitigate hanging and out-of-memory issues
+- * on bad files.
++/** Default per-pattern-line parallel-copy cap (dxf-render parity: lQ = 1000).
++ * If a single pattern-line definition would emit more than this many parallel copies to
++ * cover the boundary bbox, the WHOLE pattern-line definition is skipped (no copies drawn).
++ * This is the single most effective cap for taming pathological CAD-converted hatches
++ * where one pattern direction would otherwise produce 100k+ parallel lines.
++ * Overridable per-load via `sceneOptions.hatchMaxLinesPerPattern`.
+  */
+-const MAX_HATCH_LINES = 20000
+-/** Limit hatch segments number per line to some reasonable value to mitigate hanging and
+- * out-of-memory issues on bad files.
++const MAX_HATCH_LINES = 1000
++/** Default per-pattern-line dash-segment cap.
++ * Overridable per-load via `sceneOptions.hatchMaxDashSegmentsPerLine`.
+  */
+ const MAX_HATCH_SEGMENTS = 20000
++/** Default GLOBAL per-hatch segment-output cap (dxf-render parity: st = 50000).
++ * Running counter across all pattern lines and all dash segments of one HATCH entity.
++ * Once exceeded the remaining pattern work is abandoned for that hatch. The hatch
++ * ends up partially filled instead of perfectly tiled, but never freezes the renderer.
++ * Overridable per-load via `sceneOptions.hatchMaxSegmentsPerHatch`.
++ */
++const MAX_HATCH_SEGMENTS_PER_HATCH = 50000
++
++/** Half-length used when materialising infinite lines (RAY, XLINE) into finite geometry.
++ *  The renderer will clip to the camera frustum; choose a value large enough to extend
++ *  beyond any plausible drawing extent. */
++const INFINITE_LINE_HALF_LENGTH = 1e7
+ 
+ 
+ /** Default values for system variables. Entry may be either value or function to call for obtaining
+@@ -98,6 +114,15 @@ export class DxfScene {
+         this.pointShapeBlock = null
+         this.numBlocksFlattened = 0
+         this.numEntitiesFiltered = 0
++        /* Per-hatch fill records collected when options.hatchStencilFill is true. Each
++         * record carries the triangulated boundary plus its pattern definition so the
++         * consumer can render real pattern fills (via shader/stencil) outside the
++         * normal batched geometry pipeline. */
++        this._hatchFills = []
++        /* Linetype registry — `_GetLineType` returns a positive integer ID into this array
++         * for any non-solid pattern. Index 0 is reserved for solid (CONTINUOUS/ByLayer). */
++        this._lineTypes = [null]
++        this._lineTypeIdByName = new Map()
+     }
+ 
+     /** Build the scene from the provided parsed DXF.
+@@ -130,6 +155,25 @@ export class DxfScene {
+             }
+         }
+ 
++        if (dxf.tables && dxf.tables.lineType && dxf.tables.lineType.lineTypes) {
++            for (const [, lt] of Object.entries(dxf.tables.lineType.lineTypes)) {
++                if (!lt || !lt.name) continue
++                const name = lt.name.toUpperCase()
++                const pattern = Array.isArray(lt.pattern) ? lt.pattern : null
++                if (!pattern || pattern.length < 2 || name === "CONTINUOUS" || name === "BYBLOCK"
++                        || name === "BYLAYER") {
++                    continue
++                }
++                /* Total pattern length is the sum of absolute values. */
++                let totalLen = 0
++                for (const p of pattern) totalLen += Math.abs(p)
++                if (totalLen <= 0) continue
++                const id = this._lineTypes.length
++                this._lineTypes.push({ name: lt.name, pattern, totalLen })
++                this._lineTypeIdByName.set(name, id)
++            }
++        }
++
+         if(dxf.tables && dxf.tables.dimstyle) {
+             for (const [, style] of Object.entries(dxf.tables.dimstyle.dimStyles)) {
+                 this.dimStyles.set(style.name, style)
+@@ -343,12 +387,43 @@ export class DxfScene {
+         case "HATCH":
+             renderEntities = this._DecomposeHatch(entity, blockCtx)
+             break
++        case "MLINE":
++            renderEntities = this._DecomposeMLine(entity, blockCtx)
++            break
++        case "LEADER":
++            renderEntities = this._DecomposeLeader(entity, blockCtx)
++            break
++        case "MLEADER":
++        case "MULTILEADER":
++            renderEntities = this._DecomposeMLeader(entity, blockCtx)
++            break
++        case "RAY":
++            renderEntities = this._DecomposeRay(entity, blockCtx)
++            break
++        case "XLINE":
++            renderEntities = this._DecomposeXLine(entity, blockCtx)
++            break
++        case "IMAGE":
++            renderEntities = this._DecomposeImage(entity, blockCtx)
++            break
++        case "WIPEOUT":
++            renderEntities = this._DecomposeWipeout(entity, blockCtx)
++            break
++        case "VIEWPORT":
++            renderEntities = this._DecomposeViewport(entity, blockCtx)
++            break
++        case "REGION":
++        case "3DSOLID":
++        case "BODY":
++            /* ACIS solids — consumed silently (require ACIS kernel to render). */
++            return
+         default:
+             console.log("Unhandled entity type: " + entity.type)
+             return
+         }
+         for (const renderEntity of renderEntities) {
+-            this._ProcessEntity(renderEntity, blockCtx)
++            const dashed = this._MaybeDashifyEntity(renderEntity, entity)
++            this._ProcessEntity(dashed, blockCtx)
+         }
+     }
+     /**
+@@ -381,8 +456,124 @@ export class DxfScene {
+      * @return {number}
+      */
+     _GetLineType(entity, vertex = null, blockCtx = null) {
+-        //XXX lookup
+-        return 0
++        let name = entity?.lineType
++        /* Inherit from layer for "ByLayer" or missing names. */
++        if (!name || name.toUpperCase() === "BYLAYER") {
++            const layerName = this._GetEntityLayer(entity, blockCtx)
++            const layer = this.layers.get(layerName)
++            name = layer?.lineTypeName ?? layer?.lineType
++        }
++        if (!name) return 0
++        const id = this._lineTypeIdByName.get(name.toUpperCase())
++        return id ?? 0
++    }
++
++    /** Walk a pattern (alternating dash positive / gap negative / dot 0) along a single segment
++     * (p0 → p1). Push pairs of {x,y} for every drawn dash into `out`. Returns the new running
++     * phase position for the caller to thread through subsequent segments. */
++    _AppendDashedSegment(out, p0, p1, pattern, totalLen, scale, phase) {
++        const dx = p1.x - p0.x, dy = p1.y - p0.y
++        const segLen = Math.hypot(dx, dy)
++        if (segLen < 1e-12) return phase
++        const ux = dx / segLen, uy = dy / segLen
++        const scaledTotal = totalLen * scale
++        if (scaledTotal < 1e-9) {
++            out.push({ x: p0.x, y: p0.y }, { x: p1.x, y: p1.y })
++            return phase
++        }
++        let cursor = 0                          // distance walked along this segment
++        let patIdx = 0
++        let inSegRem = segLen
++        /* Find the entry into the pattern at the carried phase. */
++        let cum = 0
++        for (let i = 0; i < pattern.length; i++) {
++            const len = Math.abs(pattern[i]) * scale
++            if (phase < cum + len || i === pattern.length - 1) {
++                patIdx = i
++                break
++            }
++            cum += len
++        }
++        let inPatRem = (Math.abs(pattern[patIdx]) * scale) - (phase - cum)
++        let pen     = pattern[patIdx] >= 0
++        /* Special-case dot: render as a near-zero dash. */
++        const minDotLen = Math.max(1e-6, scaledTotal * 1e-5)
++
++        let drawStart = null
++        while (inSegRem > 1e-12) {
++            const advance = Math.min(inSegRem, inPatRem)
++            if (pen) {
++                const a = { x: p0.x + ux * cursor,            y: p0.y + uy * cursor            }
++                const b = { x: p0.x + ux * (cursor + advance), y: p0.y + uy * (cursor + advance) }
++                if (drawStart === null) drawStart = a
++                /* Coalesce consecutive dashes into one push. */
++                /* (we just emit each segment as its own pair to keep code simple.) */
++                if (advance < minDotLen && Math.abs(pattern[patIdx]) < 1e-9) {
++                    /* dot — emit a tiny visible mark */
++                    const t = { x: a.x + ux * minDotLen, y: a.y + uy * minDotLen }
++                    out.push(a, t)
++                } else {
++                    out.push(a, b)
++                }
++                drawStart = null
++            }
++            cursor   += advance
++            inSegRem -= advance
++            inPatRem -= advance
++            if (inPatRem <= 1e-12) {
++                patIdx  = (patIdx + 1) % pattern.length
++                inPatRem = Math.abs(pattern[patIdx]) * scale || minDotLen
++                pen      = pattern[patIdx] >= 0
++            }
++        }
++        /* Carry phase: how far into the current pattern slot we ended. */
++        let consumedInSlot = (Math.abs(pattern[patIdx]) * scale) - inPatRem
++        let newPhase = 0
++        for (let i = 0; i < patIdx; i++) newPhase += Math.abs(pattern[i]) * scale
++        newPhase += consumedInSlot
++        return newPhase % scaledTotal
++    }
++
++    /** If the entity carries a real linetype pattern, expand its line geometry into dashed
++     * LINE_SEGMENTS pairs. Otherwise returns the entity unchanged. */
++    _MaybeDashifyEntity(entity, dxfEntity) {
++        if (!entity || !entity.lineType) return entity
++        const lt = this._lineTypes[entity.lineType]
++        if (!lt) return entity
++        const scale = (dxfEntity?.lineTypeScale ?? 1) || 1
++
++        let segVertices
++        if (entity.type === Entity.Type.LINE_SEGMENTS) {
++            segVertices = entity.vertices
++        } else if (entity.type === Entity.Type.POLYLINE) {
++            const v = entity.vertices
++            if (v.length < 2) return entity
++            segVertices = []
++            for (let i = 0; i < v.length - 1; i++) {
++                segVertices.push(v[i], v[i + 1])
++            }
++            if (entity.shape && v.length > 2) {
++                segVertices.push(v[v.length - 1], v[0])
++            }
++        } else {
++            return entity
++        }
++
++        const out = []
++        let phase = 0
++        for (let i = 0; i < segVertices.length; i += 2) {
++            phase = this._AppendDashedSegment(
++                out, segVertices[i], segVertices[i + 1],
++                lt.pattern, lt.totalLen, scale, phase)
++        }
++        if (out.length < 2) return entity
++        return new Entity({
++            type: Entity.Type.LINE_SEGMENTS,
++            vertices: out,
++            layer: entity.layer,
++            color: entity.color,
++            lineType: 0,                // already materialised; downstream sees solid
++        })
+     }
+ 
+     /** Check if start/end with are not specified. */
+@@ -1074,6 +1265,37 @@ export class DxfScene {
+         const color = this._GetEntityColor(entity, blockCtx)
+         const transform = this._GetEntityExtrusionTransform(entity)
+ 
++        /* Fast-path bailout: when the tessellated boundary is too dense, emitting the
++         * full pattern fill costs O(M·E·log E) and stalls the scene for minutes on
++         * CAD-converted DXFs. Emit only the boundary outline so the user still sees
++         * the geometry. */
++        const maxBoundaryVerts = this.options.hatchMaxBoundaryVertices ?? Infinity
++        let totalBoundaryVerts = 0
++        for (const loop of boundaryLoops) {
++            totalBoundaryVerts += loop.vertices.length
++        }
++        if (totalBoundaryVerts > maxBoundaryVerts) {
++            console.warn(`HATCH handle=${entity.handle} boundary has ${totalBoundaryVerts} ` +
++                `vertices (cap ${maxBoundaryVerts}); rendering outline only.`)
++            for (const loop of boundaryLoops) {
++                const verts = transform
++                    ? loop.vertices.map(v => v.clone().applyMatrix3(transform))
++                    : loop.vertices
++                if (verts.length < 2) continue
++                const segments = []
++                for (let i = 0; i < verts.length; i++) {
++                    segments.push(verts[i])
++                    segments.push(verts[(i + 1) % verts.length])
++                }
++                yield new Entity({
++                    type: Entity.Type.LINE_SEGMENTS,
++                    vertices: segments,
++                    layer, color
++                })
++            }
++            return
++        }
++
+         let filteredBoundaryLoops = null
+ 
+         /* Make external loop first, outermost the second, all the rest in arbitrary order. Now is
+@@ -1111,7 +1333,17 @@ export class DxfScene {
+             filteredBoundaryLoops = boundaryLoops.map(loop => loop.vertices)
+         }
+ 
+-        if (entity.isSolid) {
++        if (entity.isSolid || this.options.hatchStencilFill) {
++            /* Stencil-prototype path: route ALL hatches (solid and pattern) through earcut
++             * boundary triangulation. This eliminates the O(M·E·log E) pattern-line clipping
++             * loop entirely.
++             *
++             * For solid hatches we emit a normal TRIANGLES Entity (batched, opaque) as
++             * before. For pattern hatches (when hatchStencilFill is on), we instead push a
++             * per-hatch record to `_hatchFills` carrying the triangulated boundary AND the
++             * pattern definition. The consumer renders these via a separate Three.js group
++             * with a custom shader that samples a pattern texture in OCS space.
++             */
+             const coords = this._TransformBoundaryLoop(filteredBoundaryLoops[0], transform)
+             const holes = []
+             for (let i = 1; i < filteredBoundaryLoops.length; i++) {
+@@ -1119,6 +1351,58 @@ export class DxfScene {
+                 this._TransformBoundaryLoop(filteredBoundaryLoops[i], transform, coords)
+             }
+             const indices = earcut(coords, holes)
++
++            if (!entity.isSolid && this.options.hatchStencilFill) {
++                /* Serialize pattern definition into a plain-object payload (no class
++                 * instances, no Vector2 — safe for structured clone if a worker is ever
++                 * re-enabled). `coords` is already in OCS world units (origin offset NOT
++                 * yet applied — consumer does that). */
++                let pattern = null
++                if (entity.definitionLines || entity.patternName) {
++                    const lines = (entity.definitionLines ?? []).map(l => ({
++                        angle: l.angle ?? 0,
++                        base: { x: l.base?.x ?? 0, y: l.base?.y ?? 0 },
++                        offset: { x: l.offset?.x ?? 0, y: l.offset?.y ?? 0 },
++                        dashes: Array.isArray(l.dashes) ? [...l.dashes] : [],
++                    }))
++                    pattern = {
++                        name: entity.patternName ?? null,
++                        scale: entity.patternScale ?? 1,
++                        angle: entity.patternAngle ?? 0,
++                        lines,
++                    }
++                }
++                /* `coords` was built incrementally and may have ended up as a regular Array;
++                 * convert to typed arrays so the data is compact and zero-copy on access. */
++                const verts = new Float32Array(coords)
++                const indexArr = verts.length / 2 > 65535
++                    ? new Uint32Array(indices)
++                    : new Uint16Array(indices)
++                this._hatchFills.push({
++                    handle: entity.handle ?? null,
++                    layer,
++                    color,
++                    vertices: verts,
++                    indices: indexArr,
++                    pattern,
++                })
++                /* Stencil hatches skip the batched entity pipeline, so contribute their
++                 * boundary bbox to scene bounds explicitly (otherwise FitView clips them). */
++                let bMinX = Infinity, bMinY = Infinity, bMaxX = -Infinity, bMaxY = -Infinity
++                for (let i = 0; i < verts.length; i += 2) {
++                    const x = verts[i], y = verts[i + 1]
++                    if (x < bMinX) bMinX = x
++                    if (x > bMaxX) bMaxX = x
++                    if (y < bMinY) bMinY = y
++                    if (y > bMaxY) bMaxY = y
++                }
++                if (bMinX <= bMaxX) {
++                    this._UpdateBounds({ x: bMinX, y: bMinY })
++                    this._UpdateBounds({ x: bMaxX, y: bMaxY })
++                }
++                return
++            }
++
+             const vertices = []
+             for (const loop of filteredBoundaryLoops) {
+                 vertices.push(...loop)
+@@ -1158,7 +1442,19 @@ export class DxfScene {
+ 
+         const seedPoints = entity.seedPoints ? entity.seedPoints : [{x: 0, y: 0}]
+ 
++        /* dxf-render parity caps. `linesPerPatternCap` mirrors lQ (skip a pattern-line
++         * definition entirely if it would emit more parallel copies). `segmentsPerHatchCap`
++         * mirrors st (running counter across the whole hatch; abandon remaining work once hit).
++         * `dashSegmentsPerLineCap` retains dxf-viewer's original per-pattern-line dash guard.
++         */
++        const linesPerPatternCap = this.options.hatchMaxLinesPerPattern ?? MAX_HATCH_LINES
++        const dashSegmentsPerLineCap = this.options.hatchMaxDashSegmentsPerLine ?? MAX_HATCH_SEGMENTS
++        const segmentsPerHatchCap = this.options.hatchMaxSegmentsPerHatch ?? MAX_HATCH_SEGMENTS_PER_HATCH
++        let hatchSegmentCount = 0
++        let hatchAborted = false
++
+         for (const seedPoint of seedPoints) {
++            if (hatchAborted) break
+ 
+             /* Seems pattern transform is not applied at all if using lines definition embedded into
+              * HATCH entity (according to observation of AutoDesk viewer behavior).
+@@ -1170,6 +1466,7 @@ export class DxfScene {
+             }) : new Matrix3()
+ 
+             for (const line of pattern.lines) {
++                if (hatchAborted) break
+ 
+                 let offsetX
+                 let offsetY
+@@ -1214,8 +1511,9 @@ export class DxfScene {
+                     maxLineIdx = Math.floor(bbox.max.y / offsetY)
+                 }
+ 
+-                if (maxLineIdx - minLineIdx > MAX_HATCH_LINES) {
+-                    console.warn("Too many lines produced by hatching pattern")
++                if (maxLineIdx - minLineIdx > linesPerPatternCap) {
++                    console.warn(`HATCH ${entity.handle ?? "?"}: pattern-line definition skipped ` +
++                                 `(${maxLineIdx - minLineIdx} parallel copies > cap ${linesPerPatternCap})`)
+                     continue
+                 }
+ 
+@@ -1294,12 +1592,14 @@ export class DxfScene {
+                     if (dashPatLength !== null) {
+                         let minSegIdx = Math.floor((xStart - xBase) / dashPatLength)
+                         let maxSegIdx = Math.floor((xEnd - xBase) / dashPatLength)
+-                        if (maxSegIdx - minSegIdx >= MAX_HATCH_SEGMENTS) {
+-                            console.warn("Too many segments produced by hatching pattern line")
++                        if (maxSegIdx - minSegIdx >= dashSegmentsPerLineCap) {
++                            console.warn(`HATCH ${entity.handle ?? "?"}: dash-segments skipped ` +
++                                         `(${maxSegIdx - minSegIdx} > cap ${dashSegmentsPerLineCap})`)
+                             continue
+                         }
+ 
+                         for (let segIdx = minSegIdx; segIdx <= maxSegIdx; segIdx++) {
++                            if (hatchAborted) break
+                             let segStartParam = GetParam(xBase + segIdx * dashPatLength)
+ 
+                             for (let dashLength of line.dashes) {
+@@ -1312,7 +1612,14 @@ export class DxfScene {
+                                     for (const seg of ClipSegment(segStartParam,
+                                                                   segStartParam + dashLengthParam)) {
+                                         yield RenderSegment(seg)
++                                        if (++hatchSegmentCount >= segmentsPerHatchCap) {
++                                            console.warn(`HATCH ${entity.handle ?? "?"} aborted ` +
++                                                         `at ${hatchSegmentCount} segments (cap ${segmentsPerHatchCap})`)
++                                            hatchAborted = true
++                                            break
++                                        }
+                                     }
++                                    if (hatchAborted) break
+                                 }
+                                 segStartParam += dashLengthParam
+                             }
+@@ -1322,6 +1629,12 @@ export class DxfScene {
+                         /* Single solid line. */
+                         for (const seg of clippedSegments) {
+                             yield RenderSegment(seg)
++                            if (++hatchSegmentCount >= segmentsPerHatchCap) {
++                                console.warn(`HATCH ${entity.handle ?? "?"} aborted ` +
++                                             `at ${hatchSegmentCount} segments (cap ${segmentsPerHatchCap})`)
++                                hatchAborted = true
++                                break
++                            }
+                         }
+                     }
+                 }
+@@ -1440,10 +1753,20 @@ export class DxfScene {
+                         AddPoints(vertices, arcVertices)
+                         break;
+                     }
+-                    case 4:
++                    case 4: {
+                         /* Spline. */
+                         const controlPoints = edge.controlPoints.map(p => [p.x, p.y])
+-                        const subdivisions = controlPoints.length * SPLINE_SUBDIVISION
++                        /* Cap subdivisions per spline edge inside a hatch boundary.
++                         * CloudConvert and similar tools emit hatch boundary splines with
++                         * hundreds of control points; without this cap, a single edge would
++                         * tessellate to thousands of vertices and amplify every later step
++                         * (earcut, per-line clipping) by 100×+. Lower-bound at 8 to keep
++                         * curvature reasonable on small splines. */
++                        const maxSub = this.options.hatchMaxSplineSubdivisions ?? Infinity
++                        const subdivisions = Math.max(8, Math.min(
++                            controlPoints.length * SPLINE_SUBDIVISION,
++                            maxSub
++                        ))
+                         const step = 1 / subdivisions
+                         for (let i = 0; i <= subdivisions; i++) {
+                             const pt = this._InterpolateSpline(i * step, edge.degreeOfSplineCurve,
+@@ -1452,6 +1775,7 @@ export class DxfScene {
+                             vertices.push(new Vector2(pt[0],pt[1]))
+                         }
+                         break;
++                    }
+                     default:
+                         console.warn("Unhandled hatch boundary loop edge type: " + edge.type)
+                     }
+@@ -1649,6 +1973,237 @@ export class DxfScene {
+         return vertices
+     }
+ 
++    /* ----------------------------------------------------------------------------------------
++     * Extended-entity decomposers (MLINE, LEADER, MLEADER, RAY, XLINE, IMAGE, WIPEOUT, VIEWPORT)
++     * ----------------------------------------------------------------------------------------
++     */
++
++    /** Push pairs of {x,y} vertices for a polyline path into a flat LINE_SEGMENTS array. */
++    static _PolyPathToLineSegments(points, closed = false) {
++        const out = []
++        if (!points || points.length < 2) return out
++        for (let i = 0; i < points.length - 1; i++) {
++            out.push({ x: points[i].x, y: points[i].y })
++            out.push({ x: points[i + 1].x, y: points[i + 1].y })
++        }
++        if (closed && points.length > 2) {
++            const last = points[points.length - 1]
++            const first = points[0]
++            out.push({ x: last.x, y: last.y })
++            out.push({ x: first.x, y: first.y })
++        }
++        return out
++    }
++
++    *_DecomposeMLine(entity, blockCtx) {
++        if (!entity.vertices || entity.vertices.length < 2) return
++        const layer = this._GetEntityLayer(entity, blockCtx)
++        const color = this._GetEntityColor(entity, blockCtx)
++        const lineType = this._GetLineType(entity, null, blockCtx)
++        const scale = entity.scale ?? 1
++        const justification = entity.justification ?? 0   // 0=top, 1=zero, 2=bottom
++        const closed = !!(entity.flags & 2)
++        const path = entity.vertices.map(v => v.position)
++
++        /* Without the multiline style table we approximate every MLINE as two parallel offset
++         * lines around the path. Justification picks the offset direction. */
++        const offsets = []
++        switch (justification) {
++            case 0:  offsets.push(0, -scale); break
++            case 2:  offsets.push(scale, 0);  break
++            default: offsets.push(scale * 0.5, -scale * 0.5); break
++        }
++
++        function offsetPath(off) {
++            const out = []
++            for (let i = 0; i < path.length; i++) {
++                const p = path[i]
++                /* Use vertex.miter when present (DXF group 13) else compute normal from segments. */
++                let nx = 0, ny = 0
++                const prev = path[i - 1]
++                const next = path[i + 1]
++                let tx = 0, ty = 0
++                if (prev && next) { tx = next.x - prev.x; ty = next.y - prev.y }
++                else if (next) { tx = next.x - p.x; ty = next.y - p.y }
++                else if (prev) { tx = p.x - prev.x; ty = p.y - prev.y }
++                const len = Math.hypot(tx, ty) || 1
++                nx = -ty / len
++                ny =  tx / len
++                out.push({ x: p.x + nx * off, y: p.y + ny * off })
++            }
++            return out
++        }
++
++        for (const off of offsets) {
++            const offsetPts = (off === 0) ? path : offsetPath(off)
++            const segs = DxfScene._PolyPathToLineSegments(offsetPts, closed)
++            if (segs.length >= 2) {
++                yield new Entity({
++                    type: Entity.Type.LINE_SEGMENTS,
++                    vertices: segs,
++                    layer, color, lineType
++                })
++            }
++        }
++    }
++
++    *_DecomposeLeader(entity, blockCtx) {
++        if (!entity.vertices || entity.vertices.length < 2) return
++        const layer = this._GetEntityLayer(entity, blockCtx)
++        const color = this._GetEntityColor(entity, blockCtx)
++        const lineType = this._GetLineType(entity, null, blockCtx)
++        const segs = DxfScene._PolyPathToLineSegments(entity.vertices, false)
++        yield new Entity({
++            type: Entity.Type.LINE_SEGMENTS,
++            vertices: segs,
++            layer, color, lineType
++        })
++        /* Arrowhead — small triangle wireframe at the first vertex pointing along the leader. */
++        if (entity.arrowheadFlag !== 0) {
++            const a = entity.vertices[0]
++            const b = entity.vertices[1]
++            const dx = b.x - a.x, dy = b.y - a.y
++            const len = Math.hypot(dx, dy)
++            if (len > 1e-9) {
++                const headLen = (entity.textHeight || 1) * 3 * 0.18
++                const headWid = headLen * 0.4
++                const ux = dx / len, uy = dy / len
++                const px = -uy, py = ux
++                const tip = { x: a.x, y: a.y }
++                const baseMid = { x: a.x + ux * headLen, y: a.y + uy * headLen }
++                const baseL = { x: baseMid.x + px * headWid, y: baseMid.y + py * headWid }
++                const baseR = { x: baseMid.x - px * headWid, y: baseMid.y - py * headWid }
++                yield new Entity({
++                    type: Entity.Type.LINE_SEGMENTS,
++                    vertices: [tip, baseL, baseL, baseR, baseR, tip],
++                    layer, color
++                })
++            }
++        }
++    }
++
++    *_DecomposeMLeader(entity, blockCtx) {
++        const layer = this._GetEntityLayer(entity, blockCtx)
++        const color = this._GetEntityColor(entity, blockCtx)
++        const lineType = this._GetLineType(entity, null, blockCtx)
++        if (!entity.leaders || entity.leaders.length === 0) return
++        for (const leader of entity.leaders) {
++            if (!leader.leaderLines) continue
++            for (const line of leader.leaderLines) {
++                if (!line.vertices || line.vertices.length < 2) continue
++                const segs = DxfScene._PolyPathToLineSegments(line.vertices, false)
++                yield new Entity({
++                    type: Entity.Type.LINE_SEGMENTS,
++                    vertices: segs,
++                    layer, color, lineType
++                })
++            }
++        }
++    }
++
++    *_DecomposeRay(entity, blockCtx) {
++        if (!entity.position || !entity.direction) return
++        const layer = this._GetEntityLayer(entity, blockCtx)
++        const color = this._GetEntityColor(entity, blockCtx)
++        const lineType = this._GetLineType(entity, null, blockCtx)
++        const len = Math.hypot(entity.direction.x, entity.direction.y) || 1
++        const ux = entity.direction.x / len, uy = entity.direction.y / len
++        yield new Entity({
++            type: Entity.Type.LINE_SEGMENTS,
++            vertices: [
++                { x: entity.position.x, y: entity.position.y },
++                { x: entity.position.x + ux * INFINITE_LINE_HALF_LENGTH,
++                  y: entity.position.y + uy * INFINITE_LINE_HALF_LENGTH }
++            ],
++            layer, color, lineType
++        })
++    }
++
++    *_DecomposeXLine(entity, blockCtx) {
++        if (!entity.position || !entity.direction) return
++        const layer = this._GetEntityLayer(entity, blockCtx)
++        const color = this._GetEntityColor(entity, blockCtx)
++        const lineType = this._GetLineType(entity, null, blockCtx)
++        const len = Math.hypot(entity.direction.x, entity.direction.y) || 1
++        const ux = entity.direction.x / len, uy = entity.direction.y / len
++        yield new Entity({
++            type: Entity.Type.LINE_SEGMENTS,
++            vertices: [
++                { x: entity.position.x - ux * INFINITE_LINE_HALF_LENGTH,
++                  y: entity.position.y - uy * INFINITE_LINE_HALF_LENGTH },
++                { x: entity.position.x + ux * INFINITE_LINE_HALF_LENGTH,
++                  y: entity.position.y + uy * INFINITE_LINE_HALF_LENGTH }
++            ],
++            layer, color, lineType
++        })
++    }
++
++    /** Frame an IMAGE entity as a closed quadrilateral (no raster — we don't ship a texture
++     * loader). Uses the image's UV vectors and pixel size to compute the four corners. */
++    *_DecomposeImage(entity, blockCtx) {
++        if (!entity.position || !entity.uVector || !entity.vVector || !entity.imageSize) return
++        const layer = this._GetEntityLayer(entity, blockCtx)
++        const color = this._GetEntityColor(entity, blockCtx)
++        const o = entity.position
++        const u = entity.uVector
++        const v = entity.vVector
++        const w = entity.imageSize.x || 0
++        const h = entity.imageSize.y || 0
++        const p0 = { x: o.x,                       y: o.y                       }
++        const p1 = { x: o.x + u.x * w,             y: o.y + u.y * w             }
++        const p2 = { x: o.x + u.x * w + v.x * h,   y: o.y + u.y * w + v.y * h   }
++        const p3 = { x: o.x + v.x * h,             y: o.y + v.y * h             }
++        yield new Entity({
++            type: Entity.Type.LINE_SEGMENTS,
++            vertices: [p0, p1, p1, p2, p2, p3, p3, p0],
++            layer, color
++        })
++    }
++
++    /** Render WIPEOUT as a wireframe polygon outline (true wipeout would need stencil masking). */
++    *_DecomposeWipeout(entity, blockCtx) {
++        if (!entity.clipBoundary || entity.clipBoundary.length < 2) return
++        const layer = this._GetEntityLayer(entity, blockCtx)
++        const color = this._GetEntityColor(entity, blockCtx)
++        /* clipBoundary is in IMAGE-pixel space; transform with U/V if available. */
++        const u = entity.uVector
++        const v = entity.vVector
++        const o = entity.position
++        const pts = entity.clipBoundary.map(p => {
++            if (u && v && o) {
++                return {
++                    x: o.x + p.x * u.x + p.y * v.x,
++                    y: o.y + p.x * u.y + p.y * v.y
++                }
++            }
++            return { x: p.x, y: p.y }
++        })
++        const segs = DxfScene._PolyPathToLineSegments(pts, true)
++        yield new Entity({
++            type: Entity.Type.LINE_SEGMENTS,
++            vertices: segs,
++            layer, color
++        })
++    }
++
++    /** Frame a VIEWPORT as a rectangle outline in paper space. */
++    *_DecomposeViewport(entity, blockCtx) {
++        if (!entity.center || !entity.width || !entity.height) return
++        const layer = this._GetEntityLayer(entity, blockCtx)
++        const color = this._GetEntityColor(entity, blockCtx)
++        const cx = entity.center.x, cy = entity.center.y
++        const hw = entity.width / 2, hh = entity.height / 2
++        const p0 = { x: cx - hw, y: cy - hh }
++        const p1 = { x: cx + hw, y: cy - hh }
++        const p2 = { x: cx + hw, y: cy + hh }
++        const p3 = { x: cx - hw, y: cy + hh }
++        yield new Entity({
++            type: Entity.Type.LINE_SEGMENTS,
++            vertices: [p0, p1, p1, p2, p2, p3, p3, p0],
++            layer, color
++        })
++    }
++
+     *_DecomposePolyline(entity, blockCtx = null) {
+ 
+         if (entity.isPolyfaceMesh) {
+@@ -2161,15 +2716,40 @@ export class DxfScene {
+      * @return {?Matrix3} Null if not transform required.
+      */
+     _GetEntityExtrusionTransform(entity) {
+-        //XXX For now just mirror X axis if extrusion Z is negative. No full support for arbitrary
+-        // OCS yet.
+         if (!entity.hasOwnProperty("extrusionDirection")) {
+             return null
+         }
+-        if (entity.extrusionDirection.z > 0) {
++        const n = entity.extrusionDirection
++        const nz = (typeof n.z === "number") ? n.z : 1
++        const nx = (typeof n.x === "number") ? n.x : 0
++        const ny = (typeof n.y === "number") ? n.y : 0
++
++        /* Fast path: trivial Z+ extrusion → no transform. */
++        if (Math.abs(nx) < 1e-12 && Math.abs(ny) < 1e-12 && nz > 0) {
+             return null
+         }
+-        return new Matrix3().scale(-1, 1)
++        /* Common 2D-mirror case for Z- extrusion. */
++        if (Math.abs(nx) < 1e-12 && Math.abs(ny) < 1e-12 && nz < 0) {
++            return new Matrix3().scale(-1, 1)
++        }
++        /* General case — AutoCAD Arbitrary Axis Algorithm.
++         * Given the OCS normal N, derive an X axis Wx that is stable for nearly-vertical N. */
++        const N = new Vector3(nx, ny, nz).normalize()
++        let Wx
++        if (Math.abs(N.x) < 1 / 64 && Math.abs(N.y) < 1 / 64) {
++            Wx = new Vector3(0, 1, 0).cross(N).normalize()
++        } else {
++            Wx = new Vector3(0, 0, 1).cross(N).normalize()
++        }
++        const Wy = new Vector3().crossVectors(N, Wx).normalize()
++        /* Return the 2D projection of the 3x3 OCS-to-WCS basis: take XY rows of [Wx | Wy]. */
++        const m = new Matrix3()
++        m.set(
++            Wx.x, Wy.x, 0,
++            Wx.y, Wy.y, 0,
++            0,    0,    1
++        )
++        return m
+     }
+ 
+     /** @return {RenderBatch} */
+@@ -2245,7 +2825,8 @@ export class DxfScene {
+             layers: [],
+             origin: this.origin,
+             bounds: this.bounds,
+-            hasMissingChars: this.hasMissingChars
++            hasMissingChars: this.hasMissingChars,
++            hatchFills: this._hatchFills,
+         }
+ 
+         const buffers = {
+@@ -2847,6 +3428,33 @@ DxfScene.DefaultOptions = {
+     wireframeMesh: false,
+     /** Suppress paper-space entities when true (only model-space is rendered). */
+     suppressPaperSpace: false,
++    /** Hard cap on subdivisions per spline edge inside a hatch boundary. CloudConvert-style
++     * DXFs often have splines with hundreds of control points; without this cap a single
++     * edge tessellates to thousands of vertices and the per-line pattern clipping becomes
++     * pathological. Set to Infinity to disable. */
++    hatchMaxSplineSubdivisions: 64,
++    /** When the total tessellated boundary-vertex count of a HATCH exceeds this cap,
++     * skip the (potentially O(M·E·log E)) pattern infill and emit only the boundary
++     * outline as line segments. Prevents single hatches from stalling the scene for
++     * minutes on CAD-converted DXFs while still showing the geometry. Set to Infinity
++     * to disable. */
++    hatchMaxBoundaryVertices: 5000,
++    /** dxf-render parity cap: skip a pattern-line definition entirely if it would emit
++     * more than this many parallel copies. Default 1000 matches dxf-render's lQ.
++     * Use a much larger value (e.g. 20000) for "render at any cost". */
++    hatchMaxLinesPerPattern: 1000,
++    /** dxf-render parity cap: hard upper bound on dash-segments per pattern line. */
++    hatchMaxDashSegmentsPerLine: 20000,
++    /** dxf-render parity cap (st = 50000): running counter across all pattern lines and
++     * dash segments of one HATCH entity. Once exceeded the remaining pattern work is
++     * abandoned for that hatch (partially filled rather than freezing). */
++    hatchMaxSegmentsPerHatch: 50000,
++    /** Stencil-prototype path: when true, route ALL hatches (solid + pattern) through
++     * the earcut boundary triangulation and emit a single TRIANGLES entity per hatch.
++     * Skips the per-line pattern clipping loop entirely — turns 161 s wall hatches
++     * into <50 ms flat fills. Pattern detail is lost (looks like AutoCAD zoomed out
++     * past the pattern threshold), but the file actually renders. */
++    hatchStencilFill: false,
+     /** Text rendering options. */
+     textOptions: TextRenderer.DefaultOptions,
+ }
+diff --git a/node_modules/dxf-viewer/src/HatchCalculator.js b/node_modules/dxf-viewer/src/HatchCalculator.js
+index 03bb14c..34d426c 100644
+--- a/node_modules/dxf-viewer/src/HatchCalculator.js
++++ b/node_modules/dxf-viewer/src/HatchCalculator.js
+@@ -19,24 +19,32 @@ function EdgeSameSide(e1, e2) {
+ /** Context for one line clipping calculations. */
+ class ClipCalculator {
+ 
+-    constructor(boundaryLoops, style, line) {
++    /**
++     * @param {Object[][]} precomputedLoops Edge-wrapper loops built once by HatchCalculator.
++     *  Each wrapper carries static geometry (start, end, edgeVecNorm, isZero) and transient
++     *  per-line state that this constructor resets.
++     * @param {HatchStyle} style
++     * @param {[Vector2, Vector2]} line
++     */
++    constructor(precomputedLoops, style, line) {
+         this.style = style
+         this.line = line
+         this.lineDir = line[1].clone().sub(line[0]).normalize()
++        this.loops = precomputedLoops
+ 
+-        this.loops = []
+-        for (let loopIdx = 0; loopIdx < boundaryLoops.length; loopIdx++) {
+-            const loop = boundaryLoops[loopIdx]
+-            const _loop = []
+-            for (let vtxIdx = 0; vtxIdx < loop.length; vtxIdx++) {
+-                _loop.push({
+-                    idx: vtxIdx,
+-                    start: loop[vtxIdx],
+-                    end: loop[vtxIdx == loop.length - 1 ? 0 : vtxIdx + 1],
+-                    loopIdx
+-                })
++        /* Reset transient state on every wrapper from the previous ClipLine call. Cheaper
++         * than reallocating the wrappers (which was the prior bottleneck — O(E) allocations
++         * per swept line, O(M × E) per HATCH).
++         */
++        for (const loop of precomputedLoops) {
++            for (const edge of loop) {
++                edge.isParallel = false
++                edge.intersection = null
++                edge.isProcessed = false
++                edge.toggle = false
++                edge.suppress = false
++                edge.unsuppress = false
+             }
+-            this.loops.push(_loop)
+         }
+     }
+ 
+@@ -59,16 +67,15 @@ class ClipCalculator {
+     }
+ 
+     _ProcessEdges() {
++        const lineDir = this.lineDir
+         for (const loop of this.loops) {
+             for (const edge of loop) {
+-                const edgeVec = edge.end.clone().sub(edge.start)
+-                const len = edgeVec.length()
+-                edge.isZero = len <= Number.EPSILON
+                 if (edge.isZero) {
+                     continue
+                 }
+-                edgeVec.divideScalar(len)
+-                const a = edgeVec.cross(this.lineDir)
++                /* edgeVecNorm is precomputed once in HatchCalculator's ctor (line-independent).
++                 * Vector2.cross is non-mutating in three.js — returns the scalar z-component. */
++                const a = edge.edgeVecNorm.cross(lineDir)
+                 edge.isParallel = Math.abs(a) <= 1e-6
+                 if (edge.isParallel) {
+                     continue
+@@ -280,6 +287,49 @@ export class HatchCalculator {
+     constructor(boundaryLoops, style) {
+         this.boundaryLoops = boundaryLoops
+         this.style = style
++
++        /* Precompute edge wrappers ONCE per HATCH. Each ClipLine call would otherwise
++         * rebuild this whole structure (O(E) allocations × M swept lines = O(M·E) GC
++         * pressure and re-computation). Edge geometry (start, end, normalized direction,
++         * is-zero check) is line-independent, so we cache it here. Per-line state
++         * (intersection, isParallel, isProcessed, toggle, suppress, unsuppress) is reset
++         * by ClipCalculator's constructor on each call.
++         */
++        this._precomputedLoops = []
++        for (let loopIdx = 0; loopIdx < boundaryLoops.length; loopIdx++) {
++            const loop = boundaryLoops[loopIdx]
++            const _loop = new Array(loop.length)
++            for (let vtxIdx = 0; vtxIdx < loop.length; vtxIdx++) {
++                const start = loop[vtxIdx]
++                const end = loop[vtxIdx == loop.length - 1 ? 0 : vtxIdx + 1]
++                const edgeVec = end.clone().sub(start)
++                const len = edgeVec.length()
++                const isZero = len <= Number.EPSILON
++                if (!isZero) {
++                    edgeVec.divideScalar(len)
++                }
++                _loop[vtxIdx] = {
++                    idx: vtxIdx,
++                    loopIdx,
++                    start,
++                    end,
++                    edgeVecNorm: edgeVec,
++                    isZero,
++                    /* Transient fields, reset per ClipLine call: */
++                    isParallel: false,
++                    intersection: null,
++                    isProcessed: false,
++                    toggle: false,
++                    suppress: false,
++                    unsuppress: false,
++                }
++            }
++            this._precomputedLoops.push(_loop)
++        }
++
++        /* Cache for GetBoundingBox — same transform is queried once per pattern line, but
++         * the boundary is invariant. Memoising avoids cloning every vertex on each call. */
++        this._bboxCache = new Map()
+     }
+ 
+     /**
+@@ -290,7 +340,7 @@ export class HatchCalculator {
+      * @returns {[Vector2, Vector2][]} clipped line segments
+      */
+     ClipLine(line) {
+-        return new ClipCalculator(this.boundaryLoops, this.style, line).Calculate()
++        return new ClipCalculator(this._precomputedLoops, this.style, line).Calculate()
+     }
+ 
+     /**
+diff --git a/node_modules/dxf-viewer/src/parser/DxfParser.js b/node_modules/dxf-viewer/src/parser/DxfParser.js
+index b08c197..adc2707 100644
+--- a/node_modules/dxf-viewer/src/parser/DxfParser.js
++++ b/node_modules/dxf-viewer/src/parser/DxfParser.js
+@@ -18,6 +18,15 @@ import Solid from "./entities/solid.js";
+ import Spline from "./entities/spline.js";
+ import Text from "./entities/text.js";
+ import Hatch from "./entities/hatch.js";
++import MLine from "./entities/mline.js";
++import Leader from "./entities/leader.js";
++import MLeader, { MLeaderAlias } from "./entities/mleader.js";
++import Ray from "./entities/ray.js";
++import XLine from "./entities/xline.js";
++import Image from "./entities/image.js";
++import Wipeout from "./entities/wipeout.js";
++import Viewport from "./entities/viewport.js";
++import Region, { Solid3d, Body } from "./entities/acisStub.js";
+ import dimStyleCodes from "./DimStyleCodes.js";
+ //import Vertex from "./entities/.js";
+ 
+@@ -49,6 +58,18 @@ function registerDefaultEntityHandlers(dxfParser) {
+     dxfParser.registerEntityHandler(Spline);
+     dxfParser.registerEntityHandler(Text);
+     dxfParser.registerEntityHandler(Hatch);
++    dxfParser.registerEntityHandler(MLine);
++    dxfParser.registerEntityHandler(Leader);
++    dxfParser.registerEntityHandler(MLeader);
++    dxfParser.registerEntityHandler(MLeaderAlias);
++    dxfParser.registerEntityHandler(Ray);
++    dxfParser.registerEntityHandler(XLine);
++    dxfParser.registerEntityHandler(Image);
++    dxfParser.registerEntityHandler(Wipeout);
++    dxfParser.registerEntityHandler(Viewport);
++    dxfParser.registerEntityHandler(Region);
++    dxfParser.registerEntityHandler(Solid3d);
++    dxfParser.registerEntityHandler(Body);
+     //dxfParser.registerEntityHandler(require('./entities/vertex'));
+ }
+ 
+diff --git a/node_modules/dxf-viewer/src/parser/entities/acisStub.js b/node_modules/dxf-viewer/src/parser/entities/acisStub.js
+new file mode 100644
+index 0000000..46fd7e0
+--- /dev/null
++++ b/node_modules/dxf-viewer/src/parser/entities/acisStub.js
+@@ -0,0 +1,38 @@
++
++import * as helpers from "../ParseHelpers.js"
++
++/* REGION, 3DSOLID, BODY — ACIS solid entities.
++ *
++ * Their geometry is stored as encrypted ACIS SAT blocks (group codes 1/3) which require a
++ * full ACIS kernel to interpret. We consume the entity so the scanner advances past it
++ * without warning, but emit no geometry.
++ */
++function makeStub(typeName) {
++    function P() {}
++    P.ForEntityName = typeName
++    P.prototype.parseEntity = function(scanner, curr) {
++        var entity = { type: curr.value, _unrenderable: true }
++        curr = scanner.next()
++        while (curr !== 'EOF') {
++            if (curr.code === 0) break
++            switch (curr.code) {
++            case 100: break
++            case 1: case 3: break // ACIS data — ignore
++            case 70: case 350: case 290: break
++            default:
++                helpers.checkCommonEntityProperties(entity, curr, scanner)
++                break
++            }
++            curr = scanner.next()
++        }
++        return entity
++    }
++    return P
++}
++
++const Region    = makeStub('REGION')
++const Solid3d   = makeStub('3DSOLID')
++const Body      = makeStub('BODY')
++
++export default Region
++export { Solid3d, Body }
+diff --git a/node_modules/dxf-viewer/src/parser/entities/image.js b/node_modules/dxf-viewer/src/parser/entities/image.js
+new file mode 100644
+index 0000000..ce2948f
+--- /dev/null
++++ b/node_modules/dxf-viewer/src/parser/entities/image.js
+@@ -0,0 +1,39 @@
++
++import * as helpers from "../ParseHelpers.js"
++
++/* IMAGE — raster image insert with clipping boundary. */
++export default function EntityParser() {}
++EntityParser.ForEntityName = 'IMAGE'
++EntityParser.prototype.parseEntity = function(scanner, curr) {
++    var entity = { type: curr.value, clipBoundary: [] }
++    var verticesCount = 0
++    curr = scanner.next()
++    while (curr !== 'EOF') {
++        if (curr.code === 0) break
++        switch (curr.code) {
++        case 10: entity.position = helpers.parsePoint(scanner); break
++        case 11: entity.uVector = helpers.parsePoint(scanner); break
++        case 12: entity.vVector = helpers.parsePoint(scanner); break
++        case 13: entity.imageSize = helpers.parsePoint(scanner); break
++        case 14:
++            entity.clipBoundary.push(helpers.parsePoint(scanner))
++            break
++        case 340: entity.imageDefHandle = curr.value; break
++        case 360: entity.imageDefReactorHandle = curr.value; break
++        case 70:  entity.displayProperties = curr.value; break
++        case 71:  entity.clippingType = curr.value; break
++        case 91:  verticesCount = curr.value; break
++        case 280: entity.clippingState = curr.value; break
++        case 281: entity.brightness = curr.value; break
++        case 282: entity.contrast = curr.value; break
++        case 283: entity.fade = curr.value; break
++        case 100: break
++        default:
++            helpers.checkCommonEntityProperties(entity, curr, scanner)
++            break
++        }
++        curr = scanner.next()
++    }
++    entity.numClipVertices = verticesCount
++    return entity
++}
+diff --git a/node_modules/dxf-viewer/src/parser/entities/leader.js b/node_modules/dxf-viewer/src/parser/entities/leader.js
+new file mode 100644
+index 0000000..5e3ac8c
+--- /dev/null
++++ b/node_modules/dxf-viewer/src/parser/entities/leader.js
+@@ -0,0 +1,38 @@
++
++import * as helpers from "../ParseHelpers.js"
++
++/* LEADER — annotation arrow with one or more vertices. */
++export default function EntityParser() {}
++
++EntityParser.ForEntityName = 'LEADER'
++
++EntityParser.prototype.parseEntity = function(scanner, curr) {
++    var entity = { type: curr.value, vertices: [] }
++    curr = scanner.next()
++    while (curr !== 'EOF') {
++        if (curr.code === 0) break
++        switch (curr.code) {
++        case 3:   entity.styleName = curr.value; break
++        case 40:  entity.textHeight = curr.value; break
++        case 41:  entity.textWidth = curr.value; break
++        case 71:  entity.arrowheadFlag = curr.value; break
++        case 72:  entity.pathType = curr.value; break       // 0=straight, 1=spline
++        case 73:  entity.creationFlag = curr.value; break
++        case 74:  entity.hooklineDirection = curr.value; break
++        case 75:  entity.hooklineFlag = curr.value; break
++        case 76:  entity.numberOfVertices = curr.value; break
++        case 10:  entity.vertices.push(helpers.parsePoint(scanner)); break
++        case 210: entity.extrusionDirection = helpers.parsePoint(scanner); break
++        case 211: entity.horizontalDirection = helpers.parsePoint(scanner); break
++        case 212: entity.blockOffset = helpers.parsePoint(scanner); break
++        case 213: entity.annotationOffset = helpers.parsePoint(scanner); break
++        case 340: entity.annotationHandle = curr.value; break
++        case 100: break
++        default:
++            helpers.checkCommonEntityProperties(entity, curr, scanner)
++            break
++        }
++        curr = scanner.next()
++    }
++    return entity
++}
+diff --git a/node_modules/dxf-viewer/src/parser/entities/mleader.js b/node_modules/dxf-viewer/src/parser/entities/mleader.js
+new file mode 100644
+index 0000000..f3e180b
+--- /dev/null
++++ b/node_modules/dxf-viewer/src/parser/entities/mleader.js
+@@ -0,0 +1,113 @@
++
++import * as helpers from "../ParseHelpers.js"
++
++/* MLEADER / MULTILEADER best-effort parser.
++ *
++ * MLEADER is a deeply nested entity (contextData → leaders[] → leaderLines[] → vertices[]).
++ * We walk the flat group-code stream and track scope via the string-coded section markers
++ * (300 = CONTEXT_DATA{ ... }, 302 = LEADER{ ... }, 304 = LEADER_LINE{ ... }).
++ *
++ * The output structure mirrors what dxf-render and AutoCAD's own MLEADER object expose:
++ *   entity.leaders[i].leaderLines[j].vertices = [{x,y,z}, ...]
++ *   entity.text                                = MText content (group 304/302/1)
++ *   entity.arrowSize                           = group 41
++ *   entity.textLocation                        = group 11 inside contextData
++ */
++function buildParser(typeName) {
++    function P() {}
++    P.ForEntityName = typeName
++    P.prototype.parseEntity = function(scanner, curr) {
++        var entity = { type: 'MLEADER', leaders: [] }
++        var inContext = false
++        var inLeader = null
++        var inLine = null
++        var textParts = []
++
++        curr = scanner.next()
++        while (curr !== 'EOF') {
++            if (curr.code === 0) break
++
++            switch (curr.code) {
++            case 300:
++                if (typeof curr.value === 'string') {
++                    if (curr.value.indexOf('CONTEXT_DATA{') !== -1) inContext = true
++                    else if (curr.value.indexOf('}') !== -1 && inContext && !inLeader && !inLine) inContext = false
++                }
++                break
++            case 302:
++                if (typeof curr.value === 'string') {
++                    if (curr.value.indexOf('LEADER{') !== -1) {
++                        inLeader = { leaderLines: [] }
++                    } else if (curr.value.indexOf('}') !== -1 && inLeader) {
++                        entity.leaders.push(inLeader)
++                        inLeader = null
++                    }
++                }
++                break
++            case 304:
++                if (typeof curr.value === 'string') {
++                    if (curr.value.indexOf('LEADER_LINE{') !== -1) {
++                        inLine = { vertices: [] }
++                    } else if (curr.value.indexOf('}') !== -1 && inLine) {
++                        if (inLeader) inLeader.leaderLines.push(inLine)
++                        inLine = null
++                    }
++                }
++                break
++            case 10:
++                if (inLine) inLine.vertices.push(helpers.parsePoint(scanner))
++                else if (inContext) entity.contextPoint = helpers.parsePoint(scanner)
++                break
++            case 11:
++                if (inContext && !inLine) entity.textLocation = helpers.parsePoint(scanner)
++                break
++            case 12:
++                if (inContext && !inLine) entity.textDirection = helpers.parsePoint(scanner)
++                break
++            case 13:
++                if (inLeader && !inLine) inLeader.lastLeaderLinePoint = helpers.parsePoint(scanner)
++                break
++            case 40:
++                if (inContext && entity.contentScale === undefined) entity.contentScale = curr.value
++                else if (entity.textHeight === undefined) entity.textHeight = curr.value
++                break
++            case 41:
++                entity.arrowSize = curr.value
++                break
++            case 71:
++                if (entity.contentType === undefined) entity.contentType = curr.value
++                break
++            case 170:
++                entity.leaderType = curr.value
++                break
++            case 1:
++                textParts.push(curr.value)
++                break
++            case 3:
++                entity.styleName = curr.value
++                break
++            case 340:
++                entity.styleHandle = curr.value
++                break
++            case 210:
++                entity.extrusionDirection = helpers.parsePoint(scanner)
++                break
++            case 100:
++                break
++            default:
++                helpers.checkCommonEntityProperties(entity, curr, scanner)
++                break
++            }
++            curr = scanner.next()
++        }
++        if (textParts.length > 0) entity.text = textParts.join('')
++        return entity
++    }
++    return P
++}
++
++const MLeader = buildParser('MULTILEADER')
++const MLeaderAliasParser = buildParser('MLEADER')
++
++export default MLeader
++export { MLeaderAliasParser as MLeaderAlias }
+diff --git a/node_modules/dxf-viewer/src/parser/entities/mline.js b/node_modules/dxf-viewer/src/parser/entities/mline.js
+new file mode 100644
+index 0000000..a4863fb
+--- /dev/null
++++ b/node_modules/dxf-viewer/src/parser/entities/mline.js
+@@ -0,0 +1,76 @@
++
++import * as helpers from "../ParseHelpers.js"
++
++/* MLINE — multiline (parallel lines along a path). DXF group codes per AutoCAD R2018 reference. */
++export default function EntityParser() {}
++
++EntityParser.ForEntityName = 'MLINE'
++
++EntityParser.prototype.parseEntity = function(scanner, curr) {
++    var entity = { type: curr.value, vertices: [] }
++    var pendingVertex = null
++    var pendingElemParams = []
++    var pendingFillParams = []
++    var expectedParamCount = 0
++    var expectedFillCount = 0
++
++    function flush() {
++        if (pendingVertex) {
++            pendingVertex.elementParameters = pendingElemParams
++            pendingVertex.areaFillParameters = pendingFillParams
++            entity.vertices.push(pendingVertex)
++            pendingVertex = null
++            pendingElemParams = []
++            pendingFillParams = []
++            expectedParamCount = 0
++            expectedFillCount = 0
++        }
++    }
++
++    curr = scanner.next()
++    while (curr !== 'EOF') {
++        if (curr.code === 0) break
++        switch (curr.code) {
++        case 2:   entity.styleName = curr.value; break
++        case 340: entity.styleHandle = curr.value; break
++        case 40:  entity.scale = curr.value; break
++        case 70:  entity.justification = curr.value; break
++        case 71:  entity.flags = curr.value; break
++        case 72:  entity.numberOfVertices = curr.value; break
++        case 73:  entity.numberOfStyleElements = curr.value; break
++        case 10:  entity.startPoint = helpers.parsePoint(scanner); break
++        case 11:
++            flush()
++            pendingVertex = { position: helpers.parsePoint(scanner) }
++            break
++        case 12:
++            if (pendingVertex) pendingVertex.direction = helpers.parsePoint(scanner)
++            break
++        case 13:
++            if (pendingVertex) pendingVertex.miter = helpers.parsePoint(scanner)
++            break
++        case 74:  expectedParamCount = curr.value; break
++        case 41:
++            if (pendingVertex && expectedParamCount > 0) {
++                pendingElemParams.push(curr.value)
++                expectedParamCount--
++            }
++            break
++        case 75:  expectedFillCount = curr.value; break
++        case 42:
++            if (pendingVertex && expectedFillCount > 0) {
++                pendingFillParams.push(curr.value)
++                expectedFillCount--
++            }
++            break
++        case 210: entity.extrusionDirection = helpers.parsePoint(scanner); break
++        case 100: break
++        default:
++            helpers.checkCommonEntityProperties(entity, curr, scanner)
++            break
++        }
++        curr = scanner.next()
++    }
++    flush()
++    return entity
++}
+diff --git a/node_modules/dxf-viewer/src/parser/entities/ray.js b/node_modules/dxf-viewer/src/parser/entities/ray.js
+new file mode 100644
+index 0000000..4c44af3
+--- /dev/null
++++ b/node_modules/dxf-viewer/src/parser/entities/ray.js
+@@ -0,0 +1,23 @@
++
++import * as helpers from "../ParseHelpers.js"
++
++/* RAY — line from a point extending to infinity in one direction. */
++export default function EntityParser() {}
++EntityParser.ForEntityName = 'RAY'
++EntityParser.prototype.parseEntity = function(scanner, curr) {
++    var entity = { type: curr.value }
++    curr = scanner.next()
++    while (curr !== 'EOF') {
++        if (curr.code === 0) break
++        switch (curr.code) {
++        case 10: entity.position = helpers.parsePoint(scanner); break
++        case 11: entity.direction = helpers.parsePoint(scanner); break
++        case 100: break
++        default:
++            helpers.checkCommonEntityProperties(entity, curr, scanner)
++            break
++        }
++        curr = scanner.next()
++    }
++    return entity
++}
+diff --git a/node_modules/dxf-viewer/src/parser/entities/viewport.js b/node_modules/dxf-viewer/src/parser/entities/viewport.js
+new file mode 100644
+index 0000000..7236b49
+--- /dev/null
++++ b/node_modules/dxf-viewer/src/parser/entities/viewport.js
+@@ -0,0 +1,27 @@
++
++import * as helpers from "../ParseHelpers.js"
++
++/* VIEWPORT — paper-space window into model space. We only need its rectangular boundary. */
++export default function EntityParser() {}
++EntityParser.ForEntityName = 'VIEWPORT'
++EntityParser.prototype.parseEntity = function(scanner, curr) {
++    var entity = { type: curr.value }
++    curr = scanner.next()
++    while (curr !== 'EOF') {
++        if (curr.code === 0) break
++        switch (curr.code) {
++        case 10: entity.center = helpers.parsePoint(scanner); break
++        case 40: entity.width = curr.value; break
++        case 41: entity.height = curr.value; break
++        case 68: entity.viewportStatus = curr.value; break
++        case 69: entity.viewportId = curr.value; break
++        case 90: entity.viewportStatusFlags = curr.value; break
++        case 100: break
++        default:
++            helpers.checkCommonEntityProperties(entity, curr, scanner)
++            break
++        }
++        curr = scanner.next()
++    }
++    return entity
++}
+diff --git a/node_modules/dxf-viewer/src/parser/entities/wipeout.js b/node_modules/dxf-viewer/src/parser/entities/wipeout.js
+new file mode 100644
+index 0000000..2525cbf
+--- /dev/null
++++ b/node_modules/dxf-viewer/src/parser/entities/wipeout.js
+@@ -0,0 +1,33 @@
++
++import * as helpers from "../ParseHelpers.js"
++
++/* WIPEOUT — opaque polygonal mask. Same data layout as IMAGE with a vertex polygon. */
++export default function EntityParser() {}
++EntityParser.ForEntityName = 'WIPEOUT'
++EntityParser.prototype.parseEntity = function(scanner, curr) {
++    var entity = { type: curr.value, clipBoundary: [] }
++    var verticesCount = 0
++    curr = scanner.next()
++    while (curr !== 'EOF') {
++        if (curr.code === 0) break
++        switch (curr.code) {
++        case 10: entity.position = helpers.parsePoint(scanner); break
++        case 11: entity.uVector = helpers.parsePoint(scanner); break
++        case 12: entity.vVector = helpers.parsePoint(scanner); break
++        case 13: entity.imageSize = helpers.parsePoint(scanner); break
++        case 14:
++            entity.clipBoundary.push(helpers.parsePoint(scanner))
++            break
++        case 71: entity.clippingType = curr.value; break
++        case 91: verticesCount = curr.value; break
++        case 280: entity.clippingState = curr.value; break
++        case 100: break
++        default:
++            helpers.checkCommonEntityProperties(entity, curr, scanner)
++            break
++        }
++        curr = scanner.next()
++    }
++    entity.numClipVertices = verticesCount
++    return entity
++}
+diff --git a/node_modules/dxf-viewer/src/parser/entities/xline.js b/node_modules/dxf-viewer/src/parser/entities/xline.js
+new file mode 100644
+index 0000000..59a2fe9
+--- /dev/null
++++ b/node_modules/dxf-viewer/src/parser/entities/xline.js
+@@ -0,0 +1,23 @@
++
++import * as helpers from "../ParseHelpers.js"
++
++/* XLINE — construction line, infinite in both directions. */
++export default function EntityParser() {}
++EntityParser.ForEntityName = 'XLINE'
++EntityParser.prototype.parseEntity = function(scanner, curr) {
++    var entity = { type: curr.value }
++    curr = scanner.next()
++    while (curr !== 'EOF') {
++        if (curr.code === 0) break
++        switch (curr.code) {
++        case 10: entity.position = helpers.parsePoint(scanner); break
++        case 11: entity.direction = helpers.parsePoint(scanner); break
++        case 100: break
++        default:
++            helpers.checkCommonEntityProperties(entity, curr, scanner)
++            break
++        }
++        curr = scanner.next()
++    }
++    return entity
++}

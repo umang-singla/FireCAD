@@ -1,0 +1,20 @@
+[harness] file C:\Users\umangsingla\Downloads\Museum_Sheep_File_lothal_layers_removed.dxf = 33.26 MB
+[harness] fetch http://debug.local/file.dxf
+[progress +1.24s] fetch 34875358/34875358
+[progress +1.24s] parse 0/?
+[progress +124.04s] prepare 0/?
+[harness] slow entity #2508 INSERT handle=28B1C layer=0 took 182ms
+[harness] slow entity #5205 HATCH handle=290D3 layer=B5 BLock$0$AHC-A-WALL took 160835ms solid=false pat=ANGLE loops=0 edges=0 types={}
+[harness] slow entity #5206 HATCH handle=290D4 layer=B5 BLock$0$AHC-A-WALL took 94315ms solid=false pat=ANGLE loops=0 edges=0 types={}
+[harness] slow entity #5219 INSERT handle=2908D layer=0 took 255195ms
+
+[harness] per-entity-type cost:
+  INSERT         count=   190  total=  255636ms  avg=1345.45ms  max=255195ms (handle=2908D)
+  HATCH          count=   544  total=  255278ms  avg= 469.26ms  max=160835ms (handle=290D3)
+  LWPOLYLINE     count=  1545  total=      30ms  avg=   0.02ms  max=     1ms (handle=279)
+  SPLINE         count=    26  total=      22ms  avg=   0.85ms  max=     7ms (handle=28E0B)
+  ARC            count=   447  total=       5ms  avg=   0.01ms  max=     0ms (handle=28B2F)
+  LINE           count=  2484  total=       5ms  avg=   0.00ms  max=     0ms (handle=28B5C)
+  CIRCLE         count=    36  total=       2ms  avg=   0.04ms  max=     0ms (handle=28B76)
+  MTEXT          count=    15  total=       1ms  avg=   0.07ms  max=     1ms (handle=290E8)
+  ELLIPSE        count=    14  total=       1ms  avg=   0.05ms  max=     0ms (handle=28E07)

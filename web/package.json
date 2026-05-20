@@ -4,20 +4,22 @@
   "scripts": {
     "dev": "next dev -p 3000",
     "build": "next build",
-    "start": "next start -p 3000"
+    "start": "next start -p 3000",
+    "postinstall": "patch-package"
   },
   "dependencies": {
     "dxf-viewer": "^1.0.47",
-    "three-dxf-viewer": "^1.0.44",
     "next": "16.1.6",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-zoom-pan-pinch": "^3.6.1",
-    "three": "^0.181.2"
+    "three": "^0.181.2",
+    "three-dxf-viewer": "^1.0.44"
   },
   "devDependencies": {
-    "typescript": "^5.9.2",
+    "@types/node": "^22.13.10",
     "@types/react": "^19.0.8",
-    "@types/node": "^22.13.10"
+    "patch-package": "^8.0.1",
+    "typescript": "^5.9.2"
   }
 }

@@ -578,6 +578,11 @@ export default function FloorPlanExtractor({
           sceneOptions: {
             wireframeMesh: true,
             suppressPaperSpace: false,
+            hatchMaxSplineSubdivisions: 64,
+            hatchMaxBoundaryVertices: 5000,
+            hatchMaxLinesPerPattern: 1000,
+            hatchMaxSegmentsPerHatch: 50000,
+            hatchStencilFill: false,
           },
         });
         viewerRef.current = viewer;
