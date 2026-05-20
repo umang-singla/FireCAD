@@ -110,6 +110,41 @@ const C = {
   info: "#2563EB",
 };
 
+/* ── project status display mapping ─────────────────────────────── */
+type DisplayStatus = "New" | "Awaiting floor plan review" | "Mask review" | "Ready";
+
+function displayStatus(raw: string | null | undefined): DisplayStatus {
+  const s = (raw || "").toLowerCase();
+  if (
+    s === "ready" ||
+    s === "ready_no_mask" ||
+    s === "awaiting_room_review" ||
+    s === "masked"
+  )
+    return "Ready";
+  if (s === "awaiting_floor_review") return "Awaiting floor plan review";
+  if (
+    s === "awaiting_alignment_review" ||
+    s === "mask_failed"
+  )
+    return "Mask review";
+  return "New";
+}
+
+function statusColor(d: DisplayStatus): { fg: string; bg: string } {
+  switch (d) {
+    case "Ready":
+      return { fg: C.success, bg: "#ECFDF5" };
+    case "Awaiting floor plan review":
+      return { fg: C.warning, bg: "#FFFBEB" };
+    case "Mask review":
+      return { fg: C.info, bg: "#EFF6FF" };
+    case "New":
+    default:
+      return { fg: C.textSecondary, bg: "#F3F4F6" };
+  }
+}
+
 /* ── component ─────────────────────────────── */
 
 export default function Dashboard() {
@@ -162,7 +197,7 @@ export default function Dashboard() {
   }, []);
 
   useEffect(() => {
-    if (active !== "quotes" || projects.length === 0) return;
+    if ((active !== "quotes" && active !== "dashboard") || projects.length === 0) return;
     let alive = true;
     (async () => {
       try {
@@ -274,6 +309,34 @@ export default function Dashboard() {
     const inProgress = total - ready - failed;
     return { total, ready, failed, inProgress };
   }, [projects]);
+
+  const recentQuotes = useMemo(() => {
+    return projects
+      .map((p) => {
+        const meta = boqMetaByProject[p.id] || {};
+        const hasQuote = !!(meta.quote_number || meta.quote_title || meta.client_name);
+        return hasQuote
+          ? {
+              id: p.id,
+              projectName: p.name,
+              quoteNumber: meta.quote_number || "",
+              quoteTitle: meta.quote_title || "",
+              clientName: meta.client_name || "",
+            }
+          : null;
+      })
+      .filter((x): x is { id: string; projectName: string; quoteNumber: string; quoteTitle: string; clientName: string } => x !== null)
+      .slice(0, 5);
+  }, [projects, boqMetaByProject]);
+
+  const quoteCount = useMemo(
+    () =>
+      projects.filter((p) => {
+        const meta = boqMetaByProject[p.id] || {};
+        return !!(meta.quote_number || meta.quote_title || meta.client_name);
+      }).length,
+    [projects, boqMetaByProject]
+  );
 
   type ActivityItem = { id: string; user_name: string; action: string; target_type: string; target_id: string; target_name: string; created_at: number };
   const [activity, setActivity] = useState<ActivityItem[]>([]);
@@ -392,46 +455,88 @@ export default function Dashboard() {
 
             {error && <div style={S.errorBanner}>{error}</div>}
 
-            {/* KPI cards */}
-            <div style={S.kpiRow}>
-              <KpiCard label="Total Projects" value={stats.total} sub="All projects" color={C.primary} bgColor="#E8F5E9" icon="box" />
-              <KpiCard label="Ready" value={stats.ready} sub="Completed" color={C.success} bgColor="#ECFDF5" icon="check" />
-              <KpiCard label="In Progress" value={stats.inProgress} sub="Running / reviewing" color={C.info} bgColor="#EFF6FF" icon="clock" />
-              <KpiCard label="Failed" value={stats.failed} sub="Errors" color={C.danger} bgColor="#FEF2F2" icon="alert" />
-            </div>
-
-            {/* row 2: progress ring + activity feed */}
-            <div style={{ display: "grid", gridTemplateColumns: "320px 1fr", gap: 16 }}>
-              {/* progress ring */}
-              <div style={S.card}>
-                <div style={S.cardHeader}><span style={S.cardTitle}>Project Progress</span></div>
-                <div style={S.progressCenter}>
-                  <div style={S.progressRing}>
-                    <svg width="120" height="120" viewBox="0 0 120 120">
-                      <circle cx="60" cy="60" r="52" fill="none" stroke={C.cardBorder} strokeWidth="8" />
-                      {stats.total > 0 && (
-                        <>
-                          <circle cx="60" cy="60" r="52" fill="none" stroke={C.success} strokeWidth="8" strokeLinecap="round"
-                            strokeDasharray={`${2 * Math.PI * 52}`}
-                            strokeDashoffset={`${2 * Math.PI * 52 * (1 - stats.ready / stats.total)}`}
-                            transform="rotate(-90 60 60)" />
-                          <circle cx="60" cy="60" r="52" fill="none" stroke={C.info} strokeWidth="8" strokeLinecap="round"
-                            strokeDasharray={`${2 * Math.PI * 52}`}
-                            strokeDashoffset={`${2 * Math.PI * 52 * (1 - stats.inProgress / stats.total)}`}
-                            transform={`rotate(${-90 + 360 * stats.ready / stats.total} 60 60)`} />
-                        </>
-                      )}
-                    </svg>
-                    <div style={S.progressText}>{stats.total}</div>
-                  </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                    <div style={S.progressLegend}><span style={{ ...S.legendDot, background: C.success }} /> Ready ({stats.ready})</div>
-                    <div style={S.progressLegend}><span style={{ ...S.legendDot, background: C.info }} /> In Progress ({stats.inProgress})</div>
-                    <div style={S.progressLegend}><span style={{ ...S.legendDot, background: C.danger }} /> Failed ({stats.failed})</div>
-                  </div>
+            {/* count strip */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
+              <div style={{ ...S.card, padding: "18px 20px", display: "flex", alignItems: "center", gap: 16 }}>
+                <div style={{ width: 44, height: 44, borderRadius: 12, background: C.primaryLighter, color: C.primary, display: "grid", placeItems: "center" }}>
+                  <Icon name="projects" />
+                </div>
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: C.textSecondary, textTransform: "uppercase", letterSpacing: 0.5 }}>Projects</div>
+                  <div style={{ fontSize: 28, fontWeight: 800, color: C.text, lineHeight: 1.1 }}>{stats.total}</div>
                 </div>
               </div>
+              <div style={{ ...S.card, padding: "18px 20px", display: "flex", alignItems: "center", gap: 16 }}>
+                <div style={{ width: 44, height: 44, borderRadius: 12, background: "#EFF6FF", color: C.info, display: "grid", placeItems: "center" }}>
+                  <Icon name="receipt" />
+                </div>
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: C.textSecondary, textTransform: "uppercase", letterSpacing: 0.5 }}>Quotes</div>
+                  <div style={{ fontSize: 28, fontWeight: 800, color: C.text, lineHeight: 1.1 }}>{quoteCount}</div>
+                </div>
+              </div>
+            </div>
 
+            {/* row 2: recent quotes + recent projects */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+              {/* recent quotes */}
+              <div style={S.card}>
+                <div style={S.cardHeader}>
+                  <span style={S.cardTitle}>Recent Quotes</span>
+                  <button type="button" onClick={() => setActive("quotes")} style={{ ...S.importBtn, padding: "6px 12px", fontSize: 12 }}>
+                    <span>View all</span><Icon name="chevronRight" />
+                  </button>
+                </div>
+                {recentQuotes.length === 0 ? (
+                  <div style={S.emptyRow}>No quotes yet. Open a project’s BOQ to create one.</div>
+                ) : (
+                  recentQuotes.map((q, idx) => (
+                    <div key={q.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", gap: 12, padding: "12px 20px", borderBottom: idx === recentQuotes.length - 1 ? "none" : `1px solid ${C.cardBorder}` }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {q.quoteTitle || "BOQ"}
+                        </div>
+                        <div style={{ fontSize: 11, color: C.textSecondary, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {(q.quoteNumber || "Q-DRAFT")} · {q.clientName || q.projectName}
+                        </div>
+                      </div>
+                      <a href={`/p/${q.id}/boq`} style={S.openLink}>Open <Icon name="chevronRight" /></a>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              {/* recent projects */}
+              <div style={S.card}>
+                <div style={S.cardHeader}>
+                  <span style={S.cardTitle}>Recent Projects</span>
+                  <button type="button" onClick={() => setActive("projects")} style={{ ...S.importBtn, padding: "6px 12px", fontSize: 12 }}>
+                    <span>View all</span><Icon name="chevronRight" />
+                  </button>
+                </div>
+                {projects.length === 0 ? (
+                  <div style={S.emptyRow}>No projects yet. Click “New Project” to get started.</div>
+                ) : (
+                  projects.slice(0, 5).map((p, idx) => {
+                    const d = displayStatus(p.status);
+                    const { fg, bg } = statusColor(d);
+                    return (
+                      <div key={p.id} style={{ display: "grid", gridTemplateColumns: "1fr auto auto", alignItems: "center", gap: 12, padding: "12px 20px", borderBottom: idx === Math.min(projects.length, 5) - 1 ? "none" : `1px solid ${C.cardBorder}` }}>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</div>
+                          <div style={{ fontSize: 11, color: C.textSecondary, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.id}</div>
+                        </div>
+                        <span style={{ fontSize: 11, fontWeight: 600, color: fg, background: bg, padding: "4px 10px", borderRadius: 999, whiteSpace: "nowrap" }}>{d}</span>
+                        <a href={`/p/${p.id}`} style={S.openLink}>Open <Icon name="chevronRight" /></a>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+
+            {/* row 3: team activity + quick actions */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 320px", gap: 16, marginTop: 16 }}>
               {/* activity feed */}
               <div style={S.card}>
                 <div style={S.cardHeader}>
@@ -479,6 +584,25 @@ export default function Dashboard() {
                   )}
                 </div>
               </div>
+
+              {/* quick actions */}
+              <div style={S.card}>
+                <div style={S.cardHeader}><span style={S.cardTitle}>Quick Actions</span></div>
+                <div style={{ display: "flex", flexDirection: "column", padding: 12, gap: 8 }}>
+                  <button type="button" onClick={createProject} style={{ ...S.addBtn, justifyContent: "flex-start", width: "100%" }}>
+                    <Icon name="plus" /><span>New Project</span>
+                  </button>
+                  <button type="button" onClick={() => setActive("projects")} style={{ ...S.importBtn, justifyContent: "flex-start", width: "100%" }}>
+                    <Icon name="projects" /><span>Browse Projects</span>
+                  </button>
+                  <button type="button" onClick={() => setActive("quotes")} style={{ ...S.importBtn, justifyContent: "flex-start", width: "100%" }}>
+                    <Icon name="receipt" /><span>Open Quotes / BOQ</span>
+                  </button>
+                  <button type="button" onClick={() => setActive("team")} style={{ ...S.importBtn, justifyContent: "flex-start", width: "100%" }}>
+                    <Icon name="team" /><span>Manage Team</span>
+                  </button>
+                </div>
+              </div>
             </div>
           </>
         )}
@@ -504,14 +628,6 @@ export default function Dashboard() {
             </div>
 
             {error && <div style={S.errorBanner}>{error}</div>}
-
-            {/* stats strip */}
-            <div style={S.kpiRow}>
-              <KpiCard label="Total" value={stats.total} sub="All projects" color={C.primary} bgColor="#E8F5E9" icon="box" />
-              <KpiCard label="Ready" value={stats.ready} sub="Completed" color={C.success} bgColor="#ECFDF5" icon="check" />
-              <KpiCard label="In Progress" value={stats.inProgress} sub="Running / reviewing" color={C.info} bgColor="#EFF6FF" icon="clock" />
-              <KpiCard label="Failed" value={stats.failed} sub="Errors" color={C.danger} bgColor="#FEF2F2" icon="alert" />
-            </div>
 
             {/* projects table */}
             <div style={S.card}>
