@@ -1443,30 +1443,23 @@ def _add_sprinklers_to_doc(
         seg_len = math.hypot(x2 - x1, y2 - y1)
         if seg_len <= 1e-9:
             return
-        half_w = width_world * 0.5
-        nx_ = -(y2 - y1) / seg_len * half_w
-        ny_ =  (x2 - x1) / seg_len * half_w
-        p1_ = (x1 + nx_, y1 + ny_)
-        p2_ = (x2 + nx_, y2 + ny_)
-        p3_ = (x2 - nx_, y2 - ny_)
-        p4_ = (x1 - nx_, y1 - ny_)
         r, g, b = rgb
         tc = (r << 16) | (g << 8) | b
-        hatch = msp.add_hatch(dxfattribs={"layer": DXF_LAYER_PIPES})
-        hatch.paths.add_polyline_path([p1_, p2_, p3_, p4_], is_closed=True)
-        hatch.set_solid_fill(rgb=(r, g, b))
-        border = msp.add_lwpolyline([p1_, p2_, p3_, p4_], close=True, dxfattribs={"layer": DXF_LAYER_PIPES})
-        border.dxf.true_color = tc
+        # Single LWPOLYLINE with constant width renders as a filled coloured
+        # band — one DXF entity, so a single AutoCAD click deletes the whole
+        # pipe (previously this was a HATCH + border polyline + centerline =
+        # 3 entities, which required 3 delete operations per pipe).
+        pl = msp.add_lwpolyline(
+            [(x1, y1), (x2, y2)],
+            dxfattribs={"layer": DXF_LAYER_PIPES, "const_width": float(width_world)},
+        )
+        pl.dxf.true_color = tc
 
     # Pipes — coloured by diameter, no per-segment text labels
     for (pt1, pt2), label in pipes:
         d_mm = _diameter_mm(label)
         rgb = _color_for_pipe_diameter(d_mm)
         _add_pipe_band(pt1, pt2, _pipe_width_world(d_mm), rgb)
-        r, g, b = rgb
-        line = msp.add_line(pt1, pt2, dxfattribs={"layer": DXF_LAYER_PIPES,
-                                                    "lineweight": _lineweight_for_diameter_mm(d_mm)})
-        line.dxf.true_color = (r << 16) | (g << 8) | b
 
     # Sprinkler symbols
     layer_attrs = {"layer": DXF_LAYER_SPRINKLER, "color": 1}
