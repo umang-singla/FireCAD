@@ -21,7 +21,6 @@ from app.pipeline.dxf_text_filter import filter_rooms_by_dxf_text, split_rooms_b
 from app.pipeline.sprinkler_routing import (
     place_sprinklers_from_rooms_json,
 )
-from app.pipeline.mcp_hooter_placement import place_mcp_hooter_from_rooms_payload
 from app.ws_manager import manager as ws_manager
 
 logger = logging.getLogger("mepit.pipeline")
@@ -208,36 +207,6 @@ def _replace_detectors_of_types(
         )
 
 
-def _to_mcp_hooter_detectors(
-    station_points: list[tuple[float, float]],
-    world_to_m: float,
-    floor_plan_id: str | None = None,
-) -> list[dict]:
-    out: list[dict] = []
-    # Keep MCP/Hooter as a compact left/right pair around each station.
-    offset = 0.45 / max(float(world_to_m), 1e-9)
-    for x, y in station_points:
-        half = offset * 0.5
-        out.append({
-            "id": str(uuid.uuid4())[:8],
-            "x": float(x - half),
-            "y": float(y),
-            "z": 0.0,
-            "dtype": "mcb",
-            "locked": 0,
-            "floor_plan_id": floor_plan_id,
-        })
-        out.append({
-            "id": str(uuid.uuid4())[:8],
-            "x": float(x + half),
-            "y": float(y),
-            "z": 0.0,
-            "dtype": "hooter",
-            "locked": 0,
-            "floor_plan_id": floor_plan_id,
-        })
-    return out
-
 def _centroid(poly_world: list[list[float]]):
     # simple polygon centroid
     xs = [p[0] for p in poly_world]; ys = [p[1] for p in poly_world]
@@ -279,26 +248,6 @@ def _run_post_alignment_steps(
     stage_done("extract_rooms", stage_ts, rooms=len(rooms), rooms_json=rooms_json)
     with db() as con:
         _set_project(con, project_id, rooms_json_path=rooms_json, status="rooms_extracted")
-
-    # 6.5) Place MCP + Hooter stations before room confirmation stage.
-    stage_ts = time.perf_counter()
-    stage_start("place_mcp_hooter")
-    placed_mcp_hooter = 0
-    try:
-        with open(rooms_json, "r", encoding="utf-8") as f:
-            rooms_payload = _json.load(f)
-        stations = place_mcp_hooter_from_rooms_payload(
-            rooms_payload if isinstance(rooms_payload, dict) else {"rooms": rooms_payload},
-            world_to_m=opts.world_to_m,
-            gemini_model=opts.gemini_model,
-        )
-        dets = _to_mcp_hooter_detectors(stations, opts.world_to_m)
-        with db() as con:
-            _replace_detectors_of_types(con, project_id, dets, ["mcb", "hooter"])
-        placed_mcp_hooter = len(stations)
-    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
-        logger.exception("mcp/hooter placement failed for project=%s", project_id)
-    stage_done("place_mcp_hooter", stage_ts, stations=placed_mcp_hooter)
 
     # ── Pause for user room review ──
     with db() as con:
@@ -403,25 +352,6 @@ def _run_multi_block_post_alignment(
                 block_staircases = block_data.get("staircases", []) or []
         except (OSError, ValueError, TypeError, KeyError):
             block_rooms = rooms
-
-        # Place MCP + Hooter stations per block before room review.
-        stage_ts = time.perf_counter()
-        stage_start(f"place_mcp_hooter_block_{idx}")
-        placed_mcp_hooter = 0
-        try:
-            payload = block_data if isinstance(block_data, dict) else {"rooms": block_rooms}
-            stations = place_mcp_hooter_from_rooms_payload(
-                payload,
-                world_to_m=opts.world_to_m,
-                gemini_model=opts.gemini_model,
-            )
-            dets = _to_mcp_hooter_detectors(stations, opts.world_to_m, floor_plan_id=fp_id)
-            with db() as con:
-                _replace_detectors_of_types(con, project_id, dets, ["mcb", "hooter"], floor_plan_id=fp_id)
-            placed_mcp_hooter = len(stations)
-        except (OSError, ValueError, TypeError, KeyError, RuntimeError):
-            logger.exception("mcp/hooter placement failed for project=%s block=%s", project_id, idx)
-        stage_done(f"place_mcp_hooter_block_{idx}", stage_ts, stations=placed_mcp_hooter)
 
         # Tag each extracted entity with its block index for traceability.
         for d in block_doors:

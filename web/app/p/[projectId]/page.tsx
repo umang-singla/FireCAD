@@ -4968,16 +4968,6 @@ function RoomEditor({
                     label: "Sprinklers",
                     icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2v6"/><path d="M5 10l7 4 7-4"/><path d="M5 14l2 6"/><path d="M19 14l-2 6"/><path d="M12 14v8"/></svg>,
                   },
-                  {
-                    key: "yard_hydrant", dtype: "fire_hose",
-                    label: "External Hydrant",
-                    icon: <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden><rect x="2.5" y="10" width="7.5" height="4" fill="none" stroke="currentColor" strokeWidth="1.8"/><line x1="2.7" y1="12" x2="11.6" y2="12" stroke="currentColor" strokeWidth="1.2" opacity="0.9"/><rect x="8.6" y="7.6" width="3.6" height="8.8" fill="currentColor"/><circle cx="14.2" cy="12" r="3.9" fill="none" stroke="currentColor" strokeWidth="1.8"/><path d="M10.3 12 C 12.1 10.3, 14.8 13.7, 17 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/><path d="M19.6 8.4 Q21 12 19.6 15.6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/><line x1="20.9" y1="8.8" x2="20.9" y2="15.2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>,
-                  },
-                  {
-                    key: "mcp_hooter", dtype: "mcp_hooter",
-                    label: "MCP + Hooter",
-                    icon: <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden><rect x="2.5" y="8" width="7" height="7" fill="none" stroke="currentColor" strokeWidth="1.6"/><circle cx="6" cy="11.5" r="1.4" fill="currentColor"/><path d="M14 15.8h7v2.2h-7z" fill="currentColor" opacity="0.35"/><path d="M15 14h5.5Q20.5 9.8 18 9q-2.5.8-3 5z" fill="currentColor"/><line x1="18" y1="6.6" x2="18" y2="4.8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/></svg>,
-                  },
                 ];
 
                 const nbcMap: Record<string, NBCEquipmentItem> = {};

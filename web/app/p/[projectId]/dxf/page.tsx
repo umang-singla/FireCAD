@@ -78,8 +78,6 @@ const EQUIPMENT_BUTTONS: { key: string; label: string; color: string }[] = [
   { key: "smoke",      label: "Smoke Detectors", color: "#ef4444" },
   { key: "heat",       label: "Heat Detectors",  color: "#eab308" },
   { key: "sprinkler",  label: "Sprinkler",       color: "#ef4444" },
-  { key: "fire_hose",  label: "External Hydrant",color: "#ef4444" },
-  { key: "mcp_hooter", label: "MCP + Hooter",    color: "#a855f7" },
 ];
 
 const ADD_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
@@ -217,6 +215,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   const [floorOpacity, setFloorOpacity] = useState<number>(0.28);
   const [detectors, setDetectors] = useState<Detector[]>([]);
   const [tool, setTool] = useState<EditTool>("pan");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
   const [addType, setAddType] = useState<string>("smoke");
   const [selectedDetectorId, setSelectedDetectorId] = useState<string | null>(null);
   const [selectedDetectorIds, setSelectedDetectorIds] = useState<string[]>([]);
@@ -674,6 +673,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   }, [bgIdx]);
 
   // Lock viewer navigation while editing/selecting so drag only affects markers.
+  // Zoom (wheel) stays enabled in every tool so the user can always zoom in/out;
+  // only pan/rotate are disabled outside pan mode (or while picking a source).
   useEffect(() => {
     const viewer = viewerRef.current;
     if (!viewer) return;
@@ -681,7 +682,9 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     const navigationEnabled = (tool === "pan") && !sourceSelectMode;
     const controls = (viewer.GetControls?.() ?? (viewer as any).controls ?? (viewer as any)._controls) as any;
     if (controls) {
-      if ("enabled" in controls) controls.enabled = navigationEnabled;
+      // Keep the controls instance itself enabled so wheel-zoom always works.
+      if ("enabled" in controls) controls.enabled = true;
+      if ("enableZoom" in controls) controls.enableZoom = true;
       if ("enablePan" in controls) controls.enablePan = navigationEnabled;
       if ("enableRotate" in controls) controls.enableRotate = navigationEnabled;
       if ("enableDamping" in controls && !navigationEnabled) controls.enableDamping = false;
@@ -4424,11 +4427,47 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       {/* SmartDraw-style body: left sidebar + center workspace */}
       <div style={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0 }}>
         {/* ── Left sidebar ───────────────────────────────── */}
-        <aside style={sidebarStyle}>
+        <aside style={sidebarCollapsed ? sidebarCollapsedStyle : sidebarStyle}>
+          {sidebarCollapsed ? (
+            <button
+              onClick={() => setSidebarCollapsed(false)}
+              title="Expand sidebar"
+              aria-label="Expand sidebar"
+              style={{
+                width: "100%",
+                padding: "10px 0",
+                background: SD.surfaceAlt,
+                border: "none",
+                borderBottom: `1px solid ${SD.divider}`,
+                color: SD.text,
+                cursor: "pointer",
+                fontSize: 14,
+                lineHeight: 1,
+              }}
+            >
+              ▶
+            </button>
+          ) : (
           <div style={{ overflowY: "auto", flex: 1 }}>
-            {/* Tools */}
-            <div style={sidebarSectionTitleStyle}>
+            {/* Collapse toggle */}
+            <div style={{ ...sidebarSectionTitleStyle, borderTop: "none" }}>
               <span>Tools</span>
+              <button
+                onClick={() => setSidebarCollapsed(true)}
+                title="Collapse sidebar"
+                aria-label="Collapse sidebar"
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: SD.text,
+                  cursor: "pointer",
+                  padding: "0 4px",
+                  fontSize: 12,
+                  lineHeight: 1,
+                }}
+              >
+                ◀
+              </button>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 4, padding: 8 }}>
               {([
@@ -4552,6 +4591,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
             ) : null}
 
           </div>
+          )}
         </aside>
 
         {/* ── Center workspace ───────────────────────────── */}
@@ -5357,6 +5397,16 @@ const spinnerStyle: React.CSSProperties = {
 // ──────────────────────────────────────────────────────────────────────────────
 const sidebarStyle: React.CSSProperties = {
   width: 232,
+  flexShrink: 0,
+  background: SD.surface,
+  borderRight: `1px solid ${SD.border}`,
+  display: "flex",
+  flexDirection: "column",
+  overflow: "hidden",
+};
+
+const sidebarCollapsedStyle: React.CSSProperties = {
+  width: 28,
   flexShrink: 0,
   background: SD.surface,
   borderRight: `1px solid ${SD.border}`,

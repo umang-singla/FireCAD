@@ -331,6 +331,23 @@ def _add_internal_hydrant_symbol(msp, x: float, y: float, radius: float, layer: 
 def _add_symbol_for_dtype(msp, dtype: str, x: float, y: float, radius: float):
     key = _normalize_dtype(dtype)
     layer = LAYER_BY_DTYPE.get(key, DXF_LAYER_SMOKE)
+    block_name = _BLOCK_NAMES.get(key)
+    doc = getattr(msp, "doc", None)
+    if block_name and doc is not None:
+        _ensure_symbol_blocks(doc)
+        if block_name in doc.blocks:
+            msp.add_blockref(
+                block_name,
+                (x, y),
+                dxfattribs={
+                    "xscale": float(radius),
+                    "yscale": float(radius),
+                    "zscale": float(radius),
+                    "layer": layer,
+                },
+            )
+            return
+    # Fallback: draw raw geometry if blocks unavailable.
     if key == "smoke":
         _add_smoke_symbol(msp, x, y, radius, layer)
     elif key == "heat":
@@ -349,6 +366,63 @@ def _add_symbol_for_dtype(msp, dtype: str, x: float, y: float, radius: float):
         _add_internal_hydrant_symbol(msp, x, y, radius, layer)
     else:
         _add_filled_dot(msp, x, y, radius, layer)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Symbol BLOCK definitions
+# ──────────────────────────────────────────────────────────────────────────────
+# Each detector/sprinkler/MCP+Hooter symbol is defined ONCE per drawing as a
+# BLOCK at the origin with reference radius 1.0.  Placements then use INSERT
+# (block reference) entities scaled by the desired radius, so each symbol is
+# a single selectable/movable entity in AutoCAD and its sub-parts (circle,
+# text, lines, hatches) cannot be accidentally separated.
+
+_BLOCK_NAMES: dict[str, str] = {
+    "smoke":            "AI_SYM_SMOKE",
+    "heat":             "AI_SYM_HEAT",
+    "sprinkler":        "AI_SYM_SPRINKLER",
+    "panel":            "AI_SYM_FACP",
+    "mcb":              "AI_SYM_MCP",
+    "hooter":           "AI_SYM_HOOTER",
+    "fire_hose":        "AI_SYM_EXT_HYDRANT",
+    "internal_hydrant": "AI_SYM_INT_HYDRANT",
+}
+
+_BLOCK_BUILDERS = {
+    "smoke":            _add_smoke_symbol,
+    "heat":             _add_heat_symbol,
+    "sprinkler":        _add_sprinkler_symbol,
+    "panel":            _add_panel_symbol,
+    "mcb":              _add_mcp_symbol,
+    "hooter":           _add_hooter_symbol,
+    "fire_hose":        _add_external_hydrant_symbol,
+    "internal_hydrant": _add_internal_hydrant_symbol,
+}
+
+
+def _ensure_symbol_blocks(doc) -> None:
+    """Create one BLOCK definition per symbol type at origin with radius=1.0.
+
+    Idempotent: skips blocks already present in the document.
+    """
+    for dtype, name in _BLOCK_NAMES.items():
+        if name in doc.blocks:
+            continue
+        layer = LAYER_BY_DTYPE.get(dtype, DXF_LAYER_SMOKE)
+        if layer not in doc.layers:
+            try:
+                doc.layers.add(layer)
+            except Exception:
+                pass
+        block = doc.blocks.new(name=name)
+        builder = _BLOCK_BUILDERS.get(dtype)
+        if builder is None:
+            continue
+        try:
+            builder(block, 0.0, 0.0, 1.0, layer)
+        except Exception:
+            logger.exception("failed to build symbol block %s", name)
+
 
 
 def _add_cloud_outline(msp, xmin: float, ymin: float, xmax: float, ymax: float, layer: str, color: int = 4):
@@ -643,6 +717,8 @@ def _populate_doc_with_overlays(
     for layer_name in [*LAYER_BY_DTYPE.values(), DXF_LAYER_LEGEND, DXF_LAYER_PIPES, DXF_LAYER_SOURCE, DXF_LAYER_ANNOTATIONS]:
         if layer_name not in doc.layers:
             doc.layers.add(layer_name)
+
+    _ensure_symbol_blocks(doc)
 
     for d in detectors:
         x = float(d["x"]); y = float(d["y"])
