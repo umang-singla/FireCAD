@@ -29,6 +29,74 @@ from app.routers.auth import get_current_user
 
 router = APIRouter(tags=["projects"])
 
+
+def _parse_region_polygon(payload) -> list[tuple[float, float]] | None:
+    """Extract an (x,y) polygon from a route_pipes request payload, or None."""
+    if not payload or not isinstance(payload, dict):
+        return None
+    region = payload.get("region")
+    if not isinstance(region, list) or len(region) < 3:
+        return None
+    pts: list[tuple[float, float]] = []
+    for v in region:
+        if isinstance(v, dict) and "x" in v and "y" in v:
+            try:
+                pts.append((float(v["x"]), float(v["y"])))
+            except (TypeError, ValueError):
+                return None
+    return pts if len(pts) >= 3 else None
+
+
+def _point_in_polygon(x: float, y: float, poly: list[tuple[float, float]]) -> bool:
+    """Ray-cast point-in-polygon test (inclusive on edges is best-effort)."""
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _merge_pipes_file(path: str, new_pipes: list, new_sources: list) -> dict:
+    """Append *new_pipes*/*new_sources* to an existing pipes JSON file and
+    return the merged structure. If the file does not exist (or is corrupt)
+    the new data is written as-is."""
+    existing: dict = {"pipes": [], "sources": []}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                existing = json.load(f) or {"pipes": [], "sources": []}
+        except (OSError, ValueError):
+            existing = {"pipes": [], "sources": []}
+    existing_pipes = list(existing.get("pipes") or [])
+    existing_sources = list(existing.get("sources") or [])
+
+    def _src_key(s):
+        try:
+            return (round(float(s.get("x", 0)), 3), round(float(s.get("y", 0)), 3))
+        except (TypeError, ValueError):
+            return None
+    seen = {_src_key(s) for s in existing_sources if _src_key(s) is not None}
+    for s in new_sources:
+        k = _src_key(s)
+        if k is None or k in seen:
+            continue
+        existing_sources.append(s)
+        seen.add(k)
+
+    merged = {
+        "pipes": existing_pipes + list(new_pipes),
+        "sources": existing_sources,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(merged, f, indent=2)
+    return merged
+
+
 # Keep MCP and Hooter as a tight side-by-side pair.
 MCP_HOOTER_PAIR_OFFSET_M = 0.45
 
@@ -1806,22 +1874,13 @@ def clear_floor_plan_sprinkler_pipes(project_id: str, fp_id: str, user=Depends(g
 
 @router.get("/projects/{project_id}/detect_sources")
 def detect_sources(project_id: str, user=Depends(get_current_user)):
-    """Return pipeline source points detected from the DXF drawing."""
-    from app.pipeline.sprinkler_routing import detect_sources_from_dxf, SOURCE_LABELS
-
+    """Automatic DXF source detection has been removed.
+    Endpoint kept for frontend compatibility; always returns an empty list so
+    the UI falls through to manual source picking.
+    """
     with db() as con:
-        r = _authorize_project(con, project_id, user)
-
-    dxf_path = r["dxf_path"]
-    if not dxf_path or not os.path.exists(dxf_path):
-        raise HTTPException(400, "base DXF not available")
-
-    settings = json.loads(r["settings_json"] or "{}")
-    opts = PipelineOptions.from_env().merge_settings(settings)
-    labels = opts.sprinkler_source_labels or SOURCE_LABELS
-
-    sources = detect_sources_from_dxf(dxf_path, labels)
-    return [{"x": s[0], "y": s[1]} for s in sources]
+        _authorize_project(con, project_id, user)
+    return []
 
 
 @router.post("/projects/{project_id}/route_pipes")
@@ -1861,6 +1920,13 @@ def route_pipes_project(project_id: str, payload: dict = None, user=Depends(get_
 
     sprinkler_coords = [(float(row["x"]), float(row["y"])) for row in sprinkler_rows]
 
+    region_poly = _parse_region_polygon(payload)
+    if region_poly is not None:
+        filtered = [p for p in sprinkler_coords if _point_in_polygon(p[0], p[1], region_poly)]
+        if not filtered:
+            raise HTTPException(400, "no sprinklers fall inside the selected region")
+        sprinkler_coords = filtered
+
     user_source = None
     if payload and isinstance(payload.get("source"), dict):
         src = payload["source"]
@@ -1875,16 +1941,13 @@ def route_pipes_project(project_id: str, payload: dict = None, user=Depends(get_
         override_source=user_source,
     )
 
-    pipes_data = {
-        "pipes": [
-            {"from": list(seg[0][0]), "to": list(seg[0][1]), "diameter": seg[1]}
-            for seg in pipe_segments
-        ],
-        "sources": [{"x": s[0], "y": s[1]} for s in sources],
-    }
+    new_pipes = [
+        {"from": list(seg[0][0]), "to": list(seg[0][1]), "diameter": seg[1]}
+        for seg in pipe_segments
+    ]
+    new_sources = [{"x": s[0], "y": s[1]} for s in sources]
     pipes_json_path = os.path.join(pdir, "sprinkler_pipes.json")
-    with open(pipes_json_path, "w", encoding="utf-8") as f:
-        json.dump(pipes_data, f, indent=2)
+    pipes_data = _merge_pipes_file(pipes_json_path, new_pipes, new_sources)
 
     return pipes_data
 
@@ -1926,6 +1989,13 @@ def route_pipes_floor_plan(project_id: str, fp_id: str, payload: dict = None, us
 
     sprinkler_coords = [(float(row["x"]), float(row["y"])) for row in sprinkler_rows]
 
+    region_poly = _parse_region_polygon(payload)
+    if region_poly is not None:
+        filtered = [p for p in sprinkler_coords if _point_in_polygon(p[0], p[1], region_poly)]
+        if not filtered:
+            raise HTTPException(400, "no sprinklers fall inside the selected region")
+        sprinkler_coords = filtered
+
     user_source = None
     if payload and isinstance(payload.get("source"), dict):
         src = payload["source"]
@@ -1940,15 +2010,12 @@ def route_pipes_floor_plan(project_id: str, fp_id: str, payload: dict = None, us
         override_source=user_source,
     )
 
-    pipes_data = {
-        "pipes": [
-            {"from": list(seg[0][0]), "to": list(seg[0][1]), "diameter": seg[1]}
-            for seg in pipe_segments
-        ],
-        "sources": [{"x": s[0], "y": s[1]} for s in sources],
-    }
+    new_pipes = [
+        {"from": list(seg[0][0]), "to": list(seg[0][1]), "diameter": seg[1]}
+        for seg in pipe_segments
+    ]
+    new_sources = [{"x": s[0], "y": s[1]} for s in sources]
     pipes_json_path = os.path.join(pdir, f"sprinkler_pipes_{fp['block_index']}.json")
-    with open(pipes_json_path, "w", encoding="utf-8") as f:
-        json.dump(pipes_data, f, indent=2)
+    pipes_data = _merge_pipes_file(pipes_json_path, new_pipes, new_sources)
 
     return pipes_data
