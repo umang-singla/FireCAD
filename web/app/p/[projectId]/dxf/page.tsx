@@ -279,6 +279,12 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   const [sourceSelectMode, setSourceSelectMode] = useState(false);
   const [detectedSources, setDetectedSources] = useState<PipeSource[]>([]);
   const [chosenSource, setChosenSource] = useState<PipeSource | null>(null);
+  /** After the user picks a source we enter region-select mode: they draw a
+   *  polygon that constrains which sprinklers are routed for this source. */
+  const [regionSelectMode, setRegionSelectMode] = useState(false);
+  const [regionPolygon, setRegionPolygon] = useState<PipeSource[]>([]);
+  const [regionPreview, setRegionPreview] = useState<PipeSource | null>(null);
+  const [regionClosed, setRegionClosed] = useState(false);
   const [isClearingPipes, setIsClearingPipes] = useState(false);
   const [pipeMsg, setPipeMsg] = useState<string | null>(null);
   const [ribbonTab, setRibbonTab] = useState<RibbonTab>("home");
@@ -1031,7 +1037,9 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     if (!viewer || !three) return;
 
     clearPipeMarkers();
-    const hasSelectionOverlay = sourceSelectMode && (detectedSources.length > 0 || !!chosenSource);
+    const hasSelectionOverlay =
+      (sourceSelectMode && (detectedSources.length > 0 || !!chosenSource)) ||
+      (regionSelectMode && (!!chosenSource || regionPolygon.length > 0));
     const hasManualPipes = manualPipes.length > 0 || !!pipeDrawStart;
     const hasMeasureOverlay = !!measureStart && !!(measureEnd || measurePreview);
     if ((!pipesData || !showPipes) && !hasSelectionOverlay && !hasManualPipes && !hasMeasureOverlay) return;
@@ -1259,7 +1267,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     }
 
     if (
-      sourceSelectMode &&
+      (sourceSelectMode || regionSelectMode) &&
       chosenSource &&
       !detectedSources.some((src) => Math.abs(src.x - chosenSource.x) < 1 && Math.abs(src.y - chosenSource.y) < 1)
     ) {
@@ -1350,6 +1358,161 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       halo.position.set(p[0], p[1], 0.57);
       halo.renderOrder = 1005;
       group.add(halo);
+    }
+
+    // ── Render in-progress region polygon (sprinkler scope) ──
+    if (regionSelectMode && (regionPolygon.length > 0 || chosenSource)) {
+      const ptsWorld: PipeSource[] = regionPolygon.slice();
+      const pts3: any[] = ptsWorld.map(
+        (v) => new three.Vector3(v.x - origin.x, v.y - origin.y, 0.60),
+      );
+      const REGION_COLOR = 0xEA580C;        // bright orange — high contrast on white plans
+      const REGION_COLOR_CLOSED = 0x16A34A; // green when closed
+      const FIRST_COLOR = 0x16A34A;         // first vertex green (snap target)
+      const SNAP_RADIUS = 14;               // world units near first vertex to "snap close"
+
+      // Detect whether the cursor is snapping to the first vertex (close affordance).
+      let snapClosing = false;
+      if (!regionClosed && pts3.length >= 3 && regionPreview) {
+        const dx = regionPreview.x - regionPolygon[0].x;
+        const dy = regionPreview.y - regionPolygon[0].y;
+        if (Math.hypot(dx, dy) < SNAP_RADIUS) snapClosing = true;
+      }
+
+      // Edges between committed vertices (and closing edge when closed)
+      if (pts3.length >= 2) {
+        const segPts: any[] = [];
+        for (let i = 0; i < pts3.length - 1; i++) {
+          segPts.push(pts3[i], pts3[i + 1]);
+        }
+        if (regionClosed && pts3.length >= 3) {
+          segPts.push(pts3[pts3.length - 1], pts3[0]);
+        }
+        const edges = new three.LineSegments(
+          new three.BufferGeometry().setFromPoints(segPts),
+          new three.LineBasicMaterial({
+            color: new three.Color(regionClosed ? REGION_COLOR_CLOSED : REGION_COLOR),
+            transparent: true,
+            opacity: 1,
+            depthTest: false,
+            depthWrite: false,
+            linewidth: 3,
+          }),
+        );
+        edges.renderOrder = 1010;
+        group.add(edges);
+      }
+
+      // Rubber-band line from LAST vertex to cursor only (no auto-close hint
+      // unless the user is actively snapping to the first vertex).
+      if (!regionClosed && pts3.length > 0 && regionPreview) {
+        const previewEnd = snapClosing
+          ? pts3[0]
+          : new three.Vector3(regionPreview.x - origin.x, regionPreview.y - origin.y, 0.60);
+        const previewSeg = [pts3[pts3.length - 1], previewEnd];
+        const previewLine = new three.Line(
+          new three.BufferGeometry().setFromPoints(previewSeg),
+          new three.LineBasicMaterial({
+            color: new three.Color(snapClosing ? FIRST_COLOR : REGION_COLOR),
+            transparent: true,
+            opacity: 0.95,
+            depthTest: false,
+            depthWrite: false,
+            linewidth: 2,
+          }),
+        );
+        previewLine.renderOrder = 1010;
+        group.add(previewLine);
+      }
+
+      // Vertex markers — solid dot with white halo so they pop on any background.
+      for (let i = 0; i < pts3.length; i++) {
+        const v = pts3[i];
+        const isFirst = i === 0;
+        // Highlight the first vertex larger when the user is snap-closing.
+        const r = isFirst ? (snapClosing ? 9 : 7) : 5.5;
+        // White halo
+        const halo = new three.Mesh(
+          new three.CircleGeometry(r + 2.5, 24),
+          new three.MeshBasicMaterial({
+            color: new three.Color(0xffffff),
+            transparent: true,
+            opacity: 1,
+            depthTest: false,
+            depthWrite: false,
+            side: three.DoubleSide,
+          }),
+        );
+        halo.position.set(v.x, v.y, 0.61);
+        halo.renderOrder = 1011;
+        group.add(halo);
+        // Filled dot
+        const mark = new three.Mesh(
+          new three.CircleGeometry(r, 24),
+          new three.MeshBasicMaterial({
+            color: new three.Color(isFirst ? FIRST_COLOR : REGION_COLOR),
+            transparent: true,
+            opacity: 1,
+            depthTest: false,
+            depthWrite: false,
+            side: three.DoubleSide,
+          }),
+        );
+        mark.position.set(v.x, v.y, 0.62);
+        mark.renderOrder = 1012;
+        group.add(mark);
+        // Extra ring on the first vertex when snap-closing is available.
+        if (isFirst && snapClosing) {
+          const ring = new three.Mesh(
+            new three.RingGeometry(r + 3, r + 5, 28),
+            new three.MeshBasicMaterial({
+              color: new three.Color(FIRST_COLOR),
+              transparent: true,
+              opacity: 0.85,
+              depthTest: false,
+              depthWrite: false,
+              side: three.DoubleSide,
+            }),
+          );
+          ring.position.set(v.x, v.y, 0.63);
+          ring.renderOrder = 1013;
+          group.add(ring);
+        }
+      }
+
+      // Floating dot under the cursor (mirrors the manual-pipe drawing UX).
+      if (!regionClosed && regionPreview) {
+        const cx = regionPreview.x - origin.x;
+        const cy = regionPreview.y - origin.y;
+        const cursorHalo = new three.Mesh(
+          new three.CircleGeometry(5.5, 24),
+          new three.MeshBasicMaterial({
+            color: new three.Color(0xffffff),
+            transparent: true,
+            opacity: 0.9,
+            depthTest: false,
+            depthWrite: false,
+            side: three.DoubleSide,
+          }),
+        );
+        cursorHalo.position.set(cx, cy, 0.61);
+        cursorHalo.renderOrder = 1011;
+        group.add(cursorHalo);
+        const cursorDot = new three.Mesh(
+          new three.CircleGeometry(3.5, 24),
+          new three.MeshBasicMaterial({
+            color: new three.Color(REGION_COLOR),
+            transparent: true,
+            opacity: 1,
+            depthTest: false,
+            depthWrite: false,
+            side: three.DoubleSide,
+          }),
+        );
+        cursorDot.position.set(cx, cy, 0.62);
+        cursorDot.renderOrder = 1012;
+        group.add(cursorDot);
+      }
     }
 
     // ── Render manually drawn pipes as solid-red rectangles ──
@@ -2194,7 +2357,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   useEffect(() => {
     renderDetectors();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detectors, dxfUrl, worldToM, selectedDetectorId, selectedDetectorIds, pipesData, showPipes, sourceSelectMode, detectedSources, chosenSource, manualPipes, pipeDrawStart, pipeDrawPreview, equipmentLayerVisibility, selectedPipe, measureStart, measureEnd, measurePreview, showCoverageDisks, detectorSpacingM, pipeEditSnap, tool]);
+  }, [detectors, dxfUrl, worldToM, selectedDetectorId, selectedDetectorIds, pipesData, showPipes, sourceSelectMode, detectedSources, chosenSource, regionSelectMode, regionPolygon, regionPreview, regionClosed, manualPipes, pipeDrawStart, pipeDrawPreview, equipmentLayerVisibility, selectedPipe, measureStart, measureEnd, measurePreview, showCoverageDisks, detectorSpacingM, pipeEditSnap, tool]);
 
   function worldPointFromPointer(pointer: PointerInfo): { x: number; y: number } | null {
     const viewer = viewerRef.current;
@@ -3437,7 +3600,16 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
         return;
       }
       setChosenSource(source);
-      setPipeMsg(`Source selected at (${source.x.toFixed(1)}, ${source.y.toFixed(1)}). Click Route with Source.`);
+      // Move into region-polygon drawing mode immediately.
+      setSourceSelectMode(false);
+      setRegionSelectMode(true);
+      setRegionPolygon([]);
+      setRegionPreview(null);
+      setRegionClosed(false);
+      setPipeMsg(
+        `Source selected at (${source.x.toFixed(1)}, ${source.y.toFixed(1)}). ` +
+        `Now draw a polygon region: click to add vertices, double-click or press Enter to close, Esc to cancel.`,
+      );
     };
 
     el.addEventListener("pointerdown", onPointerDown, true);
@@ -3445,6 +3617,132 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       el.removeEventListener("pointerdown", onPointerDown, true);
     };
   }, [sourceSelectMode, detectedSources, canEdit, isRoutingPipes, selectedFloorId]);
+
+  // ── Region-polygon selection (after a source has been picked) ──
+  useEffect(() => {
+    if (!regionSelectMode) return;
+    const el = containerRef.current;
+    if (!el) return;
+
+    const onPointerDown = (evt: PointerEvent) => {
+      if (!canEdit || isRoutingPipes) return;
+      const tgt = evt.target as Element | null;
+      if (tgt && tgt.closest && tgt.closest("[data-ui-overlay]")) return;
+      // Right-click closes the polygon (≥3 vertices) or cancels otherwise.
+      if (evt.button === 2) {
+        evt.preventDefault();
+        evt.stopPropagation();
+        setRegionPolygon((prev) => {
+          if (prev.length >= 3) {
+            setRegionClosed(true);
+            setRegionPreview(null);
+            setPipeMsg(`Region closed (${prev.length} vertices). Click Route with Source.`);
+          }
+          return prev;
+        });
+        return;
+      }
+      if (evt.button !== 0) return;
+      evt.preventDefault();
+      evt.stopPropagation();
+      if (regionClosed) return;
+      const world = worldPointFromPointer({ clientX: evt.clientX, clientY: evt.clientY });
+      if (!world) return;
+      setRegionPolygon((prev) => {
+        // Click near the first vertex (and ≥3 pts) closes the polygon.
+        if (prev.length >= 3) {
+          const first = prev[0];
+          const dx = first.x - world.x;
+          const dy = first.y - world.y;
+          if (Math.hypot(dx, dy) < 14) {
+            setRegionClosed(true);
+            setRegionPreview(null);
+            setPipeMsg(`Region closed (${prev.length} vertices). Click Route with Source.`);
+            return prev;
+          }
+        }
+        const next = [...prev, { x: world.x, y: world.y }];
+        setPipeMsg(
+          next.length < 3
+            ? `Polygon: ${next.length} vertex${next.length === 1 ? "" : "es"}. Need at least 3.`
+            : `Polygon: ${next.length} vertices. Double-click, press Enter, or click the first vertex to close.`,
+        );
+        return next;
+      });
+    };
+
+    const onPointerMove = (evt: PointerEvent) => {
+      if (regionClosed) return;
+      const world = worldPointFromPointer({ clientX: evt.clientX, clientY: evt.clientY });
+      if (world) setRegionPreview({ x: world.x, y: world.y });
+    };
+
+    const onDoubleClick = (evt: MouseEvent) => {
+      const tgt = evt.target as Element | null;
+      if (tgt && tgt.closest && tgt.closest("[data-ui-overlay]")) return;
+      evt.preventDefault();
+      evt.stopPropagation();
+      setRegionPolygon((prev) => {
+        if (prev.length >= 3) {
+          setRegionClosed(true);
+          setRegionPreview(null);
+          setPipeMsg(`Region closed (${prev.length} vertices). Click Route with Source.`);
+        } else {
+          setPipeMsg("Need at least 3 vertices before closing the region.");
+        }
+        return prev;
+      });
+    };
+
+    const onContextMenu = (evt: MouseEvent) => {
+      // Suppress browser context menu while drawing the region.
+      const tgt = evt.target as Element | null;
+      if (tgt && tgt.closest && tgt.closest("[data-ui-overlay]")) return;
+      evt.preventDefault();
+    };
+
+    const onKeyDown = (evt: KeyboardEvent) => {
+      if (evt.key === "Enter") {
+        setRegionPolygon((prev) => {
+          if (prev.length >= 3) {
+            setRegionClosed(true);
+            setRegionPreview(null);
+            setPipeMsg(`Region closed (${prev.length} vertices). Click Route with Source.`);
+          } else {
+            setPipeMsg("Need at least 3 vertices before closing the region.");
+          }
+          return prev;
+        });
+      } else if (evt.key === "Escape") {
+        setRegionSelectMode(false);
+        setRegionPolygon([]);
+        setRegionPreview(null);
+        setRegionClosed(false);
+        setChosenSource(null);
+        setPipeMsg("Region selection cancelled.");
+      } else if (evt.key === "Backspace") {
+        // Undo the last vertex while drawing.
+        setRegionClosed((closed) => {
+          if (closed) return closed;
+          setRegionPolygon((prev) => prev.slice(0, -1));
+          return closed;
+        });
+      }
+    };
+
+    el.addEventListener("pointerdown", onPointerDown, true);
+    el.addEventListener("pointermove", onPointerMove);
+    el.addEventListener("dblclick", onDoubleClick, true);
+    el.addEventListener("contextmenu", onContextMenu);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      el.removeEventListener("pointerdown", onPointerDown, true);
+      el.removeEventListener("pointermove", onPointerMove);
+      el.removeEventListener("dblclick", onDoubleClick, true);
+      el.removeEventListener("contextmenu", onContextMenu);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [regionSelectMode, regionClosed, canEdit, isRoutingPipes]);
 
   useEffect(() => {
     applySelectedIds([]);
@@ -3520,7 +3818,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     }
   }
 
-  async function routePipesFromSource(source: PipeSource | null) {
+  async function routePipesFromSource(source: PipeSource | null, region: PipeSource[] | null) {
     if (!canEdit) return;
     setIsRoutingPipes(true);
     try {
@@ -3531,10 +3829,15 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       const routeUrl = selectedFloorId
         ? `/api/projects/${projectId}/floor_plans/${selectedFloorId}/route_pipes`
         : `/api/projects/${projectId}/route_pipes`;
+      const body: any = {};
+      if (source) body.source = { x: source.x, y: source.y };
+      if (region && region.length >= 3) {
+        body.region = region.map((p) => ({ x: p.x, y: p.y }));
+      }
       const routeRes = await fetch(apiUrl(routeUrl), {
         method: "POST",
         headers,
-        body: source ? JSON.stringify({ source: { x: source.x, y: source.y } }) : undefined,
+        body: Object.keys(body).length ? JSON.stringify(body) : undefined,
       });
       if (!routeRes.ok) {
         const text = await routeRes.text();
@@ -3546,6 +3849,10 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       setChosenSource(source);
       setSourceSelectMode(false);
       setDetectedSources([]);
+      setRegionSelectMode(false);
+      setRegionPolygon([]);
+      setRegionPreview(null);
+      setRegionClosed(false);
       setPipeMsg("Pipes routed successfully.");
     } catch (e: any) {
       setPipeMsg(e?.message || "Failed to route pipes.");
@@ -3559,7 +3866,11 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       setPipeMsg("Select a source first, then click Route with Source.");
       return;
     }
-    await routePipesFromSource(chosenSource);
+    if (!regionClosed || regionPolygon.length < 3) {
+      setPipeMsg("Draw a polygon region (≥3 vertices) and close it before routing.");
+      return;
+    }
+    await routePipesFromSource(chosenSource, regionPolygon);
   }
 
   async function clearCurrentPipes() {
@@ -3589,6 +3900,10 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       setSourceSelectMode(false);
       setDetectedSources([]);
       setChosenSource(null);
+      setRegionSelectMode(false);
+      setRegionPolygon([]);
+      setRegionPreview(null);
+      setRegionClosed(false);
       setPipeMsg(selectedFloorId ? "Cleared pipes for selected block." : "Cleared project pipes.");
     } catch (e: any) {
       setPipeMsg(e?.message || "Failed to clear pipes.");
@@ -3600,11 +3915,15 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   async function drawSprinklerPipes() {
     if (!canEdit) return;
 
-    if (sourceSelectMode) {
+    if (sourceSelectMode || regionSelectMode) {
       setSourceSelectMode(false);
       setDetectedSources([]);
       setChosenSource(null);
-      setPipeMsg("Source selection cancelled.");
+      setRegionSelectMode(false);
+      setRegionPolygon([]);
+      setRegionPreview(null);
+      setRegionClosed(false);
+      setPipeMsg("Source / region selection cancelled.");
       return;
     }
 
@@ -4375,29 +4694,51 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
                     disabled={!canEdit || isRoutingPipes || isDetectingSources || isClearingPipes}
                     style={{
                       ...btnStyle,
-                      background: sourceSelectMode ? "#D97706" : "#B42318",
+                      background: sourceSelectMode || regionSelectMode ? "#D97706" : "#B42318",
                       borderColor: "#b91c1c",
                       color: "#fff",
                       opacity: !canEdit || isRoutingPipes || isDetectingSources || isClearingPipes ? 0.6 : 1,
                       cursor: !canEdit || isRoutingPipes || isDetectingSources || isClearingPipes ? "not-allowed" : "pointer",
                     }}
                   >
-                    {isDetectingSources ? "Detecting..." : isRoutingPipes ? "Connecting..." : sourceSelectMode ? "Cancel Source" : "Connect Pipes"}
+                    {isDetectingSources
+                      ? "Detecting..."
+                      : isRoutingPipes
+                      ? "Connecting..."
+                      : regionSelectMode
+                      ? "Cancel Region"
+                      : sourceSelectMode
+                      ? "Cancel Source"
+                      : "Connect Pipes"}
                   </button>
-                  <button
-                    onClick={routeWithSelectedSource}
-                    disabled={!canEdit || !sourceSelectMode || !chosenSource || isRoutingPipes || isDetectingSources || isClearingPipes}
-                    style={{
-                      ...btnStyle,
-                      background: sourceSelectMode && chosenSource ? "#2D6A4F" : btnStyle.background,
-                      borderColor: sourceSelectMode && chosenSource ? "#15803d" : "#E8EAED",
-                      color: sourceSelectMode && chosenSource ? "#fff" : btnStyle.color,
-                      opacity: !canEdit || !sourceSelectMode || !chosenSource || isRoutingPipes || isDetectingSources || isClearingPipes ? 0.6 : 1,
-                      cursor: !canEdit || !sourceSelectMode || !chosenSource || isRoutingPipes || isDetectingSources || isClearingPipes ? "not-allowed" : "pointer",
-                    }}
-                  >
-                    Route with Source
-                  </button>
+                  {(() => {
+                    const ready = !!chosenSource && regionClosed && regionPolygon.length >= 3;
+                    const busy = isRoutingPipes || isDetectingSources || isClearingPipes;
+                    const disabled = !canEdit || !ready || busy;
+                    return (
+                      <button
+                        onClick={routeWithSelectedSource}
+                        disabled={disabled}
+                        style={{
+                          ...btnStyle,
+                          background: ready ? "#2D6A4F" : btnStyle.background,
+                          borderColor: ready ? "#15803d" : "#E8EAED",
+                          color: ready ? "#fff" : btnStyle.color,
+                          opacity: disabled ? 0.6 : 1,
+                          cursor: disabled ? "not-allowed" : "pointer",
+                        }}
+                        title={
+                          !chosenSource
+                            ? "Pick a source on the drawing first"
+                            : !regionClosed || regionPolygon.length < 3
+                            ? "Draw and close a polygon region (≥3 vertices)"
+                            : "Route pipes for sprinklers inside the region"
+                        }
+                      >
+                        Route with Source
+                      </button>
+                    );
+                  })()}
                   <button
                     onClick={clearCurrentPipes}
                     disabled={!canEdit || !hasPipeData || isRoutingPipes || isDetectingSources || isClearingPipes}
@@ -4812,7 +5153,10 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
               borderRadius: 8,
               padding: "6px 10px",
               fontSize: 12,
-              color: "#1A1A2E",
+              color: "#F8FAFC",
+              pointerEvents: "none",
+              maxWidth: "70%",
+              textAlign: "center",
             }}
           >
             {pipeMsg}

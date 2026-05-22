@@ -143,9 +143,6 @@ DXF_LAYER_SPRINKLER = "AI_FIRE_SPRINKLERS"
 DXF_LAYER_PIPES = "AI_FIRE_PIPES"
 DXF_LAYER_SOURCE = "AI_FIRE_SOURCE"
 
-# Labels used to detect pipe source locations inside the DXF
-SOURCE_LABELS = ["FHC", "PL-Service Water", "PL_Waste Pipe", "Sprinkler"]
-
 # Per-diameter colours (RGB) — must mirror PIPE_DIAMETER_COLOR_HEX in the frontend.
 PIPE_DIAMETER_COLORS_RGB: dict[int, tuple[int, int, int]] = {
     20:  (139, 92, 246),   # violet
@@ -550,55 +547,6 @@ def _classify_room_hazards(rooms: List[Dict]) -> List[str]:
 
 def _hazard_params(hazard_type: str) -> Dict[str, float]:
     return _HAZARD_PARAMS.get(hazard_type, _HAZARD_PARAMS[HAZARD_LH])
-
-
-# ──────────────────────────────────────────────────────────────────
-# DXF source detection
-# ──────────────────────────────────────────────────────────────────
-def detect_sources_from_dxf(
-    dxf_path: str,
-    labels: List[str] | None = None,
-) -> List[Tuple[float, float]]:
-    """Scan the DXF for text, blocks or layers matching *labels* and return
-    world coordinates of each source location."""
-    if labels is None:
-        labels = SOURCE_LABELS
-
-    if not _EZDXF_OK or not os.path.exists(dxf_path):
-        return []
-
-    labels_lower = [l.lower() for l in labels]
-    detected: List[Tuple[float, float]] = []
-
-    try:
-        doc = ezdxf.readfile(dxf_path)
-        msp = doc.modelspace()
-
-        for entity in msp.query("TEXT MTEXT"):
-            text_val = ""
-            if entity.dxftype() == "TEXT":
-                text_val = entity.dxf.text
-            elif entity.dxftype() == "MTEXT":
-                text_val = entity.text
-
-            text_lower = text_val.lower()
-            layer_lower = entity.dxf.layer.lower()
-            if any(l in text_lower for l in labels_lower) or any(l in layer_lower for l in labels_lower):
-                pt = entity.dxf.insert
-                detected.append((float(pt.x), float(pt.y)))
-
-        for entity in msp.query("INSERT"):
-            name_lower = entity.dxf.name.lower()
-            layer_lower = entity.dxf.layer.lower()
-            if any(l in name_lower for l in labels_lower) or any(l in layer_lower for l in labels_lower):
-                pt = entity.dxf.insert
-                detected.append((float(pt.x), float(pt.y)))
-
-    except Exception as e:
-        logger.warning("detect_sources_from_dxf failed: %s", e)
-
-    logger.info("detect_sources_from_dxf found=%d", len(detected))
-    return detected
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1539,7 +1487,9 @@ def place_sprinklers_from_rooms_json(
     """
     _set_runtime_config(spacing_m=spacing_m, wall_buffer_m=wall_buffer_m, world_to_m=world_to_m)
 
-    global_sources = detect_sources_from_dxf(dxf_path, source_labels)
+    # Automatic DXF source detection was removed; callers/UI must supply a source.
+    _ = source_labels  # accepted for backward compatibility, no longer used
+    global_sources: List[Tuple[float, float]] = []
 
     all_points: List[Tuple[float, float]] = []
     all_regions: List[Polygon] = []
@@ -1774,10 +1724,13 @@ def route_pipes_for_sprinklers(
         all_regions.extend(regs)
 
     # Determine source
+    _ = source_labels  # accepted for backward compatibility, no longer used
     if override_source is not None:
         source = override_source
     else:
-        global_sources = detect_sources_from_dxf(dxf_path, source_labels)
+        # Automatic DXF source detection was removed; fall back to centroid
+        # of the existing sprinklers when no explicit source is provided.
+        global_sources: List[Tuple[float, float]] = []
 
         min_x = min(p[0] for p in sprinkler_coords)
         max_x = max(p[0] for p in sprinkler_coords)
