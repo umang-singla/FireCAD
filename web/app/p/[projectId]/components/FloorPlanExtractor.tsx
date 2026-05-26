@@ -312,6 +312,12 @@ export default function FloorPlanExtractor({
   const [floorPlans, setFloorPlans] = useState<Rect[]>([]);
   const [floorPlanHeights, setFloorPlanHeights] = useState<string[]>([]);
   const [mode, setMode] = useState<"view" | "draw">("view");
+  // Background color used both in the live dxf-viewer preview and in the
+  // off-screen capture (the PNG that is uploaded to the backend). Some
+  // drawings use light line colors that clash with the default dark bg, so
+  // we let the user pick from a few presets or a custom hex.
+  const BG_PRESETS = ["#1e1e1e", "#ffffff", "#0b0b0b", "#f5f5f5", "#2d2d2d"];
+  const [bgColor, setBgColor] = useState<string>(BG_PRESETS[0]);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<ViewerInstance | null>(null);
@@ -487,7 +493,7 @@ export default function FloorPlanExtractor({
     });
     renderer.setPixelRatio(1);
     renderer.setSize(imgW, imgH, false);
-    renderer.setClearColor(new t.Color("#1e1e1e"), 1);
+    renderer.setClearColor(new t.Color(bgColor), 1);
     (renderer as any).sortObjects = false;
 
     // Orthographic camera scoped exactly to this floor plan's bounding box.
@@ -514,11 +520,29 @@ export default function FloorPlanExtractor({
     viewer.Render?.();
 
     return blob;
-  }, []);
+  }, [bgColor]);
 
   useEffect(() => {
     if (status === "done") rebuildOverlay(floorPlans, draftRectRef.current);
   }, [floorPlans, status, rebuildOverlay]);
+
+  // Apply background color changes to the live dxf-viewer preview. dxf-viewer
+  // doesn't expose a public setter for clearColor, so we reach into the
+  // bundled three renderer when available. Falls back gracefully.
+  useEffect(() => {
+    const viewer: any = viewerRef.current;
+    const t = threeRef.current;
+    if (!viewer || !t) return;
+    try {
+      const renderer = viewer.renderer || viewer.GetRenderer?.();
+      if (renderer?.setClearColor) {
+        renderer.setClearColor(new (t as any).Color(bgColor), 1);
+        viewer.Render?.();
+      }
+    } catch {
+      /* ignore — capture still uses the chosen bg */
+    }
+  }, [bgColor, status]);
 
   useEffect(() => {
     return () => {
@@ -567,9 +591,7 @@ export default function FloorPlanExtractor({
 
         const ViewerCtor = DxfViewer as any;
         const viewer = new ViewerCtor(containerRef.current, {
-          clearColor: new (three as any).Color(
-            "#1e1e1e"
-          ),
+          clearColor: new (three as any).Color(bgColor),
           autoResize: true,
           colorCorrection: true,
           blackWhiteInversion: true,
@@ -785,6 +807,60 @@ export default function FloorPlanExtractor({
             {floorPlans.length} detected
           </span>
           <div style={{ flex: 1 }} />
+          {/* Background color picker — applies to both the preview and the
+              captured PNG that is uploaded for processing. */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              padding: "4px 8px",
+              borderRadius: 10,
+              border: "1px solid #E8EAED",
+              background: "#FFFFFF",
+            }}
+            title="Background color for floor plan render"
+          >
+            <span style={{ fontSize: 11, color: "#6B7280", fontWeight: 600 }}>BG</span>
+            {BG_PRESETS.map((c) => (
+              <button
+                key={c}
+                type="button"
+                onClick={() => setBgColor(c)}
+                disabled={confirming}
+                aria-label={`Background ${c}`}
+                title={c}
+                style={{
+                  width: 18,
+                  height: 18,
+                  borderRadius: 4,
+                  border:
+                    bgColor.toLowerCase() === c.toLowerCase()
+                      ? "2px solid #2D6A4F"
+                      : "1px solid #D1D5DB",
+                  background: c,
+                  cursor: "pointer",
+                  padding: 0,
+                }}
+              />
+            ))}
+            <input
+              type="color"
+              value={bgColor}
+              onChange={(e) => setBgColor(e.target.value)}
+              disabled={confirming}
+              title="Custom background color"
+              style={{
+                width: 22,
+                height: 22,
+                padding: 0,
+                border: "1px solid #D1D5DB",
+                borderRadius: 4,
+                background: "transparent",
+                cursor: "pointer",
+              }}
+            />
+          </div>
           {canEdit && (
             <button
               onClick={toggleDrawMode}
@@ -883,7 +959,7 @@ export default function FloorPlanExtractor({
             flex: 1,
             position: "relative",
             border: "1px solid #E8EAED",
-            background: "#1e1e1e",
+            background: bgColor,
             overflow: "hidden",
           }}
         >

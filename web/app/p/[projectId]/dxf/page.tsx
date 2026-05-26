@@ -108,12 +108,12 @@ const DTYPE_COLORS: Record<string, string> = {
 
 // Real-world symbol radius (meters) per detector type. Converted to drawing
 // units at render time using the project's world_to_m (from settings).
-// Smoke/MCP/hooter symbols are small (~1 cm), while a sprinkler's circle
-// represents its coverage radius (~1.8 m) as is standard on fire plans.
+// Keep these as symbol sizes (not coverage radii) so detector glyphs remain
+// visually stable across unit systems (mm/inch/ft).
 const DTYPE_RADIUS_M: Record<string, number> = {
   smoke:            0.10,
   heat:             0.10,
-  sprinkler:        0.40,
+  sprinkler:        0.15,
   fire_hose:        0.50,
   internal_hydrant: 0.50,
   beam_detector:    0.50,
