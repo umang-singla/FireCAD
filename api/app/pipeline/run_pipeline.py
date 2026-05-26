@@ -409,6 +409,7 @@ def _run_post_room_review_steps(
             fp_rooms_path = fp["rooms_json_path"]
             fp_mapping = fp["mapping_json_path"]
             fp_render = fp["render_png_path"]
+            fp_aligned_mask = fp["aligned_mask_path"]
 
             if not fp_rooms_path or not os.path.exists(fp_rooms_path):
                 logger.warning("block %d has no rooms JSON, skipping placement", idx)
@@ -485,6 +486,8 @@ def _run_post_room_review_steps(
                     wall_buffer_m=opts.wall_buffer_m,
                     world_to_m=opts.world_to_m,
                     source_labels=opts.sprinkler_source_labels,
+                    mask_png_path=fp_aligned_mask,
+                    mapping_json_path=fp_mapping or mapping_json,
                 )
                 fp_sp_dets = [
                     {"id": str(uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0,
@@ -554,10 +557,15 @@ def _run_post_room_review_steps(
         if opts.enable_sprinklers:
             stage_ts = time.perf_counter()
             stage_start("place_sprinklers")
+            with db() as con:
+                _proj_row = _get_project(con, project_id)
+            _proj_aligned_mask = _proj_row["aligned_mask_path"] if _proj_row else None
             sp_points, sp_pipes, sp_sources, _sp_regions = place_sprinklers_from_rooms_json(
                 rooms, dxf_path,
                 spacing_m=opts.sprinkler_spacing_m, wall_buffer_m=opts.wall_buffer_m,
                 world_to_m=opts.world_to_m, source_labels=opts.sprinkler_source_labels,
+                mask_png_path=_proj_aligned_mask,
+                mapping_json_path=mapping_json,
             )
             all_sprinkler_dets = [
                 {"id": str(uuid.uuid4())[:8], "x": x, "y": y, "z": 0.0, "dtype": "sprinkler", "locked": 0}

@@ -1939,6 +1939,8 @@ def route_pipes_project(project_id: str, payload: dict = None, user=Depends(get_
         world_to_m=opts.world_to_m,
         source_labels=opts.sprinkler_source_labels,
         override_source=user_source,
+        mask_png_path=r["aligned_mask_path"],
+        mapping_json_path=r["mapping_json_path"],
     )
 
     new_pipes = [
@@ -2008,6 +2010,8 @@ def route_pipes_floor_plan(project_id: str, fp_id: str, payload: dict = None, us
         world_to_m=opts.world_to_m,
         source_labels=opts.sprinkler_source_labels,
         override_source=user_source,
+        mask_png_path=fp["aligned_mask_path"],
+        mapping_json_path=fp["mapping_json_path"],
     )
 
     new_pipes = [

@@ -225,6 +225,104 @@ def _center_of_bbox(b: dict) -> Tuple[float, float]:
     return (b["xmin"] + b["xmax"]) / 2.0, (b["ymin"] + b["ymax"]) / 2.0
 
 
+# ──────────────────────────────────────────────────────────────────
+# Black-mask obstacle extraction
+# ──────────────────────────────────────────────────────────────────
+def _pixel_polygon_to_world(
+    pts_px: np.ndarray,
+    mapping: dict,
+) -> List[Tuple[float, float]]:
+    """Convert an array of (u, v) pixel points to world (x, y) using mapping.json."""
+    W = float(mapping["width_px"])
+    H = float(mapping["height_px"])
+    bbox = mapping["world_bbox"]
+    xmin = float(bbox["xmin"])
+    xmax = float(bbox["xmax"])
+    ymin = float(bbox["ymin"])
+    ymax = float(bbox["ymax"])
+    x_range = xmax - xmin
+    y_range = ymax - ymin
+    out: List[Tuple[float, float]] = []
+    for u, v in pts_px:
+        x = xmin + (float(u) * x_range / W)
+        y = ymax - (float(v) * y_range / H)
+        out.append((x, y))
+    return out
+
+
+def extract_black_obstacles_from_mask(
+    mask_png_path: str,
+    mapping_json_path: str,
+    min_area_px: int = 30,
+    simplify_px: float = 2.0,
+) -> List[Polygon]:
+    """Extract solid-black regions (columns, lifts, stairs) from an aligned
+    mask PNG and return them as world-coordinate Shapely polygons.
+
+    These polygons are intended to be passed to :func:`route_pipes` as
+    ``obstacles`` so that pipe routing avoids navigating through them.
+    """
+    import json as _json
+
+    if not mask_png_path or not os.path.exists(mask_png_path):
+        return []
+    if not mapping_json_path or not os.path.exists(mapping_json_path):
+        return []
+
+    img = cv2.imread(mask_png_path, cv2.IMREAD_COLOR)
+    if img is None:
+        return []
+
+    # Pure / near-pure black: all three channels below threshold.
+    # The Gemini prompt asks for solid (0,0,0) but JPEG/PNG resampling may
+    # leave faint anti-aliasing, so allow a small slack.
+    b, g, r = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+    black_mask = ((b < 40) & (g < 40) & (r < 40)).astype(np.uint8) * 255
+
+    if black_mask.max() == 0:
+        return []
+
+    # Close tiny gaps so a hatched column becomes one blob.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(black_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    with open(mapping_json_path, "r", encoding="utf-8") as f:
+        mapping = _json.load(f)
+
+    polys: List[Polygon] = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area_px:
+            continue
+        if simplify_px > 0:
+            cnt = cv2.approxPolyDP(cnt, simplify_px, True)
+        if len(cnt) < 3:
+            continue
+        pts_px = cnt.reshape(-1, 2)
+        world_pts = _pixel_polygon_to_world(pts_px, mapping)
+        try:
+            p = Polygon(world_pts)
+            if not p.is_valid:
+                p = make_valid(p)
+            if p.is_empty or p.area <= 0:
+                continue
+            # make_valid can return a GeometryCollection; keep only polygons.
+            geoms = getattr(p, "geoms", [p])
+            for g_ in geoms:
+                if isinstance(g_, Polygon) and not g_.is_empty:
+                    polys.append(g_)
+        except Exception as e:
+            logger.debug("extract_black_obstacles_from_mask: skipped contour: %s", e)
+
+    logger.info(
+        "extract_black_obstacles_from_mask: %d black-region obstacles from %s",
+        len(polys), mask_png_path,
+    )
+    return polys
+
+
 def extract_text_lines_world(dxf_path: str) -> List[Dict]:
     """Extract all text entities from DXF with world coordinates.
 
@@ -845,6 +943,7 @@ def route_pipes(
     source: Tuple[float, float],
     branch_spacing: float | None = None,
     valid_regions: List[Polygon] | None = None,
+    obstacles: List[Polygon] | None = None,
 ) -> Tuple[List[Tuple[Tuple[Tuple[float, float], Tuple[float, float]], str]], List[Tuple[float, float]]]:
     """Orthogonal pipe routing: straight header → straight branches through sprinklers.
 
@@ -862,12 +961,54 @@ def route_pipes(
        disconnected components via internal L-paths.
     5. BFS tree, subtree sizing, arm injection, labelling.
 
+    ``obstacles`` is an optional list of polygons representing forbidden
+    zones (e.g. columns, lifts, staircases extracted from the black
+    regions of the aligned mask). Any pipe edge whose segment crosses an
+    obstacle is removed and reconnection L-paths are forced to detour
+    around them.
+
     Returns ``(pipe_segments, snapped_sprinklers)``.
     """
     if not sprinklers:
         return [], []
 
-    safe_area = unary_union(valid_regions).buffer(1.0 / WORLD_TO_M) if valid_regions else None
+    # Routing safe area: only black-mask obstacles (columns / lifts / stairs)
+    # block pipes. Walls between rooms are NOT obstacles, so we don't
+    # constrain pipes to stay inside room polygons. The safe area is a
+    # generous bounding envelope around all sprinklers/rooms, with real
+    # obstacles subtracted below.
+    env_pts: List[Tuple[float, float]] = [(s[0], s[1]) for s in sprinklers]
+    env_pts.append((source[0], source[1]))
+    if valid_regions:
+        for reg in valid_regions:
+            minx_, miny_, maxx_, maxy_ = reg.bounds
+            env_pts.append((minx_, miny_))
+            env_pts.append((maxx_, maxy_))
+    if env_pts:
+        env_pad = 5.0 / WORLD_TO_M
+        env_minx = min(p[0] for p in env_pts) - env_pad
+        env_miny = min(p[1] for p in env_pts) - env_pad
+        env_maxx = max(p[0] for p in env_pts) + env_pad
+        env_maxy = max(p[1] for p in env_pts) + env_pad
+        safe_area = box(env_minx, env_miny, env_maxx, env_maxy)
+    else:
+        safe_area = None
+
+    # Carve obstacles (columns / lifts / stairs) out of the safe area so
+    # that all subsequent `safe_area.contains(seg)` checks reject any
+    # pipe segment that would cross them. We buffer the obstacles by a
+    # small clearance so pipes don't graze their edges.
+    obstacle_union = None
+    if obstacles:
+        try:
+            OBSTACLE_CLEARANCE_M = 0.10  # 10 cm clearance from columns/lifts/stairs
+            obs_buf = OBSTACLE_CLEARANCE_M / WORLD_TO_M
+            obstacle_union = unary_union(obstacles).buffer(obs_buf)
+            if safe_area is not None:
+                safe_area = safe_area.difference(obstacle_union)
+        except Exception as e:
+            logger.warning("route_pipes: failed to apply obstacles: %s", e)
+            obstacle_union = None
 
     source = (round(source[0], 4), round(source[1], 4))
     original_sprinklers = [(round(s[0], 4), round(s[1], 4)) for s in sprinklers]
@@ -1020,10 +1161,92 @@ def route_pipes(
 
     # ── 4. CLIP OUT-OF-BOUNDS PIPES & RECONNECT ──────────────────
     if safe_area:
+        # Bounds of obstacles for orthogonal detour candidates.
+        obstacle_bounds: list[tuple[float, float, float, float]] = []
+        if obstacle_union is not None:
+            try:
+                geoms = list(getattr(obstacle_union, "geoms", [obstacle_union]))
+                for g_ in geoms:
+                    if g_ and not g_.is_empty:
+                        obstacle_bounds.append(g_.bounds)
+            except Exception as e:  # pragma: no cover
+                logger.debug("route_pipes: obstacle bounds collection failed: %s", e)
+
+        def _segment_ok(a, b) -> bool:
+            if a == b:
+                return True
+            seg_ = LineString([a, b])
+            return safe_area.contains(seg_) or safe_area.covers(seg_)
+
+        def _polyline_ok(pts) -> bool:
+            try:
+                path_ = LineString(pts)
+            except Exception:
+                return False
+            return safe_area.contains(path_) or safe_area.covers(path_)
+
+        def _try_detour(a, b):
+            """Return list of [(p,q), ...] orthogonal edges replacing edge a-b
+            that fully stay inside ``safe_area`` (so they avoid obstacles and
+            stay inside the floor plan), or None if no detour found.
+            Tries axis-aligned L and Z detours around each obstacle's bbox.
+            """
+            if a == b:
+                return None
+            CLEAR_M = 0.20  # 20 cm of clearance when going around obstacles
+            pad = CLEAR_M / WORLD_TO_M
+
+            best_edges: list = []
+            best_len = float("inf")
+
+            # 1) Simple L-detours via the two axis-aligned corners.
+            for corner in ((a[0], b[1]), (b[0], a[1])):
+                if _polyline_ok([a, corner, b]):
+                    L = abs(corner[0] - a[0]) + abs(corner[1] - a[1]) \
+                        + abs(b[0] - corner[0]) + abs(b[1] - corner[1])
+                    if L < best_len:
+                        best_len = L
+                        best_edges = [(a, corner), (corner, b)]
+
+            # 2) Z-detours that hug each obstacle's bounding box.
+            for (minx, miny, maxx, maxy) in obstacle_bounds:
+                # Try going around the left, right, top, bottom of the
+                # obstacle bbox using two corner via-points.
+                via_xs = (minx - pad, maxx + pad)
+                via_ys = (miny - pad, maxy + pad)
+                # Vertical-axis detours (go to side of obstacle, then up/down, then to b).
+                for vx in via_xs:
+                    pts = [a, (vx, a[1]), (vx, b[1]), b]
+                    if _polyline_ok(pts):
+                        L = sum(abs(pts[i + 1][0] - pts[i][0]) + abs(pts[i + 1][1] - pts[i][1])
+                                for i in range(len(pts) - 1))
+                        if L < best_len:
+                            best_len = L
+                            best_edges = [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+                # Horizontal-axis detours.
+                for vy in via_ys:
+                    pts = [a, (a[0], vy), (b[0], vy), b]
+                    if _polyline_ok(pts):
+                        L = sum(abs(pts[i + 1][0] - pts[i][0]) + abs(pts[i + 1][1] - pts[i][1])
+                                for i in range(len(pts) - 1))
+                        if L < best_len:
+                            best_len = L
+                            best_edges = [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+
+            return best_edges or None
+
+        # Replace any pipe segment that crosses an obstacle / leaves the
+        # floor plan with an orthogonal detour when possible; otherwise
+        # drop it and rely on the component reconnection pass below.
         for u, v in list(G.edges()):
-            seg = LineString([u, v])
-            if not safe_area.contains(seg) and not safe_area.covers(seg):
-                G.remove_edge(u, v)
+            if _segment_ok(u, v):
+                continue
+            G.remove_edge(u, v)
+            detour = _try_detour(u, v) if obstacle_union is not None else None
+            if detour:
+                for a, b in detour:
+                    if a != b:
+                        G.add_edge(a, b)
 
         for node in list(G.nodes()):
             if node != source and node not in sprinkler_set and G.degree(node) == 0:
@@ -1052,6 +1275,16 @@ def route_pipes(
                             best_dist, best_edges, best_ci = d, [(uu, c1), (c1, vv)], ci
                         elif safe_area.contains(p2) or safe_area.covers(p2):
                             best_dist, best_edges, best_ci = d, [(uu, c2), (c2, vv)], ci
+                        elif obstacle_union is not None:
+                            # Try a Z-detour around obstacles before falling back.
+                            zdet = _try_detour(uu, vv)
+                            if zdet:
+                                zlen = sum(
+                                    abs(e_[0][0] - e_[1][0]) + abs(e_[0][1] - e_[1][1])
+                                    for e_ in zdet
+                                )
+                                if zlen < best_dist:
+                                    best_dist, best_edges, best_ci = zlen, zdet, ci
 
             if best_edges:
                 for e in best_edges:
@@ -1060,6 +1293,9 @@ def route_pipes(
                 comps[0] = comps[0].union(comps[best_ci])
                 comps.pop(best_ci)
             else:
+                # Last-resort fallback: connect via the closest pair but
+                # ONLY if the resulting L-path stays inside safe_area
+                # (and therefore avoids obstacles).
                 fb_dist = float("inf")
                 fb_edges: list = []
                 fb_ci = -1
@@ -1067,9 +1303,11 @@ def route_pipes(
                     for uu in main:
                         for vv in comps[ci]:
                             d = Point(uu).distance(Point(vv))
-                            if d < fb_dist:
+                            if d >= fb_dist:
+                                continue
+                            corner = (vv[0], uu[1])
+                            if _polyline_ok([uu, corner, vv]):
                                 fb_dist = d
-                                corner = (vv[0], uu[1])
                                 fb_edges = [(uu, corner), (corner, vv)]
                                 fb_ci = ci
                 if fb_edges:
@@ -1079,13 +1317,105 @@ def route_pipes(
                     comps[0] = comps[0].union(comps[fb_ci])
                     comps.pop(fb_ci)
                 else:
+                    # Cannot connect without crossing an obstacle / leaving
+                    # the floor plan — leave the orphaned component alone.
+                    logger.warning(
+                        "route_pipes: %d orphan component(s) could not be "
+                        "connected to source without crossing an obstacle.",
+                        len(comps) - 1,
+                    )
                     break
+
+    # Split axis-aligned edges in G that geometrically pass through other
+    # nodes already in G. Reconnection L-paths and Z-detours can create
+    # long edges that span across intermediate nodes (header junctions,
+    # arm endpoints, sprinklers), which would later show up as visually
+    # overlapping parallel pipe segments. By inserting the intermediate
+    # nodes into those edges here — before BFS — the resulting tree uses
+    # the shorter sub-edges and no two emitted segments overlap.
+    try:
+        AXIS_EPS = 1e-3  # mm tolerance for "on the same axis line"
+        SPLIT_PAD = 1.0  # world units == mm; ignore nodes essentially at endpoints
+        changed = True
+        max_passes = 4
+        splits_total = 0
+        while changed and max_passes > 0:
+            changed = False
+            max_passes -= 1
+            for u, v in list(G.edges()):
+                if abs(u[0] - v[0]) < AXIS_EPS:  # vertical
+                    axis, other = 1, (u[0] + v[0]) * 0.5
+                elif abs(u[1] - v[1]) < AXIS_EPS:  # horizontal
+                    axis, other = 0, (u[1] + v[1]) * 0.5
+                else:
+                    continue
+                lo = min(u[axis], v[axis])
+                hi = max(u[axis], v[axis])
+                if hi - lo < SPLIT_PAD * 2:
+                    continue
+                inside: list = []
+                for n in G.nodes():
+                    if n == u or n == v:
+                        continue
+                    if abs(n[1 - axis] - other) > AXIS_EPS:
+                        continue
+                    if lo + SPLIT_PAD < n[axis] < hi - SPLIT_PAD:
+                        inside.append(n)
+                if not inside:
+                    continue
+                inside.sort(key=lambda n: n[axis])
+                if u[axis] > v[axis]:
+                    inside.reverse()
+                G.remove_edge(u, v)
+                prev = u
+                for n in inside:
+                    G.add_edge(prev, n)
+                    prev = n
+                G.add_edge(prev, v)
+                splits_total += len(inside)
+                changed = True
+        logger.info("route_pipes: G edge-splitting inserted %d node(s) into edges.", splits_total)
+    except Exception as e:  # pragma: no cover
+        logger.debug("route_pipes: G edge-splitting pass failed: %s", e)
 
     # ── 2. BFS tree from source ───────────────────────────────────
     try:
         directed_tree = nx.bfs_tree(G, source=source)
     except Exception:
         return [], original_sprinklers
+
+    # If obstacle-clipping left orphan components that contain sprinklers,
+    # still emit pipes inside each such component (rooted at the sprinkler
+    # closest to the global source). Without this, drawings whose rooms are
+    # separated by walls produce zero pipes even though obstacle-free local
+    # routing is possible.
+    try:
+        orphan_components = 0
+        orphan_sprinklers = 0
+        for comp in nx.connected_components(G):
+            if source in comp:
+                continue
+            comp_sprinklers = [n for n in comp if n in sprinkler_set]
+            if not comp_sprinklers:
+                continue
+            root = min(
+                comp_sprinklers,
+                key=lambda n: abs(n[0] - source[0]) + abs(n[1] - source[1]),
+            )
+            sub_tree = nx.bfs_tree(G.subgraph(comp), source=root)
+            directed_tree.add_nodes_from(sub_tree.nodes())
+            directed_tree.add_edges_from(sub_tree.edges())
+            orphan_components += 1
+            orphan_sprinklers += len(comp_sprinklers)
+        if orphan_components:
+            logger.info(
+                "route_pipes: emitted local trees for %d orphan component(s) "
+                "covering %d sprinkler(s).",
+                orphan_components,
+                orphan_sprinklers,
+            )
+    except Exception as e:  # pragma: no cover
+        logger.debug("route_pipes: orphan sub-tree emission failed: %s", e)
 
     # ── 3. Map nodes to room regions ──────────────────────────────
     node_to_region: Dict = {}
@@ -1475,6 +1805,9 @@ def place_sprinklers_from_rooms_json(
     world_to_m: float = 0.001,
     source_labels: List[str] | None = None,
     debug_png_path: str | None = None,
+    mask_png_path: str | None = None,
+    mapping_json_path: str | None = None,
+    obstacles: List[Polygon] | None = None,
 ) -> Tuple[
     List[Tuple[float, float]],
     List[Tuple[Tuple[Tuple[float, float], Tuple[float, float]], str]],
@@ -1482,6 +1815,11 @@ def place_sprinklers_from_rooms_json(
     List[Polygon],
 ]:
     """Place sprinklers for all rooms and route pipes.
+
+    If ``obstacles`` is provided, pipes will be routed around them.
+    Alternatively, supply ``mask_png_path`` + ``mapping_json_path`` to
+    auto-extract obstacles (columns / lifts / staircases — the black
+    regions in the aligned mask).
 
     Returns ``(sprinkler_coords, pipe_segments, sources, regions)``.
     """
@@ -1614,7 +1952,11 @@ def place_sprinklers_from_rooms_json(
         source = center
 
     # Route pipes
-    pipe_segments, snapped_sprinklers = route_pipes(all_points, source, valid_regions=all_regions)
+    if obstacles is None and mask_png_path and mapping_json_path:
+        obstacles = extract_black_obstacles_from_mask(mask_png_path, mapping_json_path)
+    pipe_segments, snapped_sprinklers = route_pipes(
+        all_points, source, valid_regions=all_regions, obstacles=obstacles,
+    )
 
     logger.info(
         "place_sprinklers_from_rooms_json sprinklers=%d pipes=%d source=(%.1f, %.1f) hazards=%s",
@@ -1688,6 +2030,9 @@ def route_pipes_for_sprinklers(
     world_to_m: float = 0.001,
     source_labels: List[str] | None = None,
     override_source: Tuple[float, float] | None = None,
+    mask_png_path: str | None = None,
+    mapping_json_path: str | None = None,
+    obstacles: List[Polygon] | None = None,
 ) -> Tuple[
     List[Tuple[Tuple[Tuple[float, float], Tuple[float, float]], str]],
     List[Tuple[float, float]],
@@ -1696,6 +2041,9 @@ def route_pipes_for_sprinklers(
     """Route pipes connecting existing sprinkler points.
 
     If *override_source* is provided it is used directly, skipping auto-detection.
+    If ``obstacles`` is provided (or ``mask_png_path``+``mapping_json_path``
+    are supplied to auto-extract them), pipes will be routed around the
+    black-coloured regions of the aligned mask (columns / lifts / stairs).
     Returns ``(pipe_segments, snapped_sprinklers, sources)``.
     """
     _set_runtime_config(spacing_m=spacing_m, wall_buffer_m=wall_buffer_m, world_to_m=world_to_m)
@@ -1749,11 +2097,16 @@ def route_pipes_for_sprinklers(
         else:
             source = center
 
-    pipe_segments, snapped_sprinklers = route_pipes(sprinkler_coords, source, valid_regions=all_regions)
+    if obstacles is None and mask_png_path and mapping_json_path:
+        obstacles = extract_black_obstacles_from_mask(mask_png_path, mapping_json_path)
+    pipe_segments, snapped_sprinklers = route_pipes(
+        sprinkler_coords, source, valid_regions=all_regions, obstacles=obstacles,
+    )
 
     logger.info(
-        "route_pipes_for_sprinklers sprinklers=%d pipes=%d source=(%.1f, %.1f)",
+        "route_pipes_for_sprinklers sprinklers=%d pipes=%d source=(%.1f, %.1f) obstacles=%d",
         len(snapped_sprinklers), len(pipe_segments), source[0], source[1],
+        len(obstacles) if obstacles else 0,
     )
 
     return pipe_segments, snapped_sprinklers, [source]
