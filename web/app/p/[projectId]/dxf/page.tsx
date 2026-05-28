@@ -279,6 +279,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   const [sourceSelectMode, setSourceSelectMode] = useState(false);
   const [detectedSources, setDetectedSources] = useState<PipeSource[]>([]);
   const [chosenSource, setChosenSource] = useState<PipeSource | null>(null);
+  const [showSourceRegionChoice, setShowSourceRegionChoice] = useState(false);
+  const [pendingSourceChoice, setPendingSourceChoice] = useState<PipeSource | null>(null);
   /** After the user picks a source we enter region-select mode: they draw a
    *  polygon that constrains which sprinklers are routed for this source. */
   const [regionSelectMode, setRegionSelectMode] = useState(false);
@@ -679,13 +681,13 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
   }, [bgIdx]);
 
   // Lock viewer navigation while editing/selecting so drag only affects markers.
-  // Zoom (wheel) stays enabled in every tool so the user can always zoom in/out;
-  // only pan/rotate are disabled outside pan mode (or while picking a source).
+  // Zoom (wheel) stays enabled in every tool so the user can always zoom in/out.
+  // Source picking uses double-click, so keep pan enabled in pan mode.
   useEffect(() => {
     const viewer = viewerRef.current;
     if (!viewer) return;
 
-    const navigationEnabled = (tool === "pan") && !sourceSelectMode;
+    const navigationEnabled = (tool === "pan");
     const controls = (viewer.GetControls?.() ?? (viewer as any).controls ?? (viewer as any)._controls) as any;
     if (controls) {
       // Keep the controls instance itself enabled so wheel-zoom always works.
@@ -695,7 +697,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       if ("enableRotate" in controls) controls.enableRotate = navigationEnabled;
       if ("enableDamping" in controls && !navigationEnabled) controls.enableDamping = false;
     }
-  }, [tool, sourceSelectMode]);
+  }, [tool]);
 
   function fitView() {
     const viewer = viewerRef.current;
@@ -3584,7 +3586,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     const el = containerRef.current;
     if (!el) return;
 
-    const onPointerDown = (evt: PointerEvent) => {
+    const onDoubleClick = async (evt: MouseEvent) => {
       if (!canEdit || isRoutingPipes) return;
       const tgt = evt.target as Element | null;
       if (tgt && tgt.closest && tgt.closest("[data-ui-overlay]")) return;
@@ -3600,21 +3602,16 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
         return;
       }
       setChosenSource(source);
-      // Move into region-polygon drawing mode immediately.
-      setSourceSelectMode(false);
-      setRegionSelectMode(true);
-      setRegionPolygon([]);
-      setRegionPreview(null);
-      setRegionClosed(false);
+      setPendingSourceChoice(source);
+      setShowSourceRegionChoice(true);
       setPipeMsg(
-        `Source selected at (${source.x.toFixed(1)}, ${source.y.toFixed(1)}). ` +
-        `Now draw a polygon region: click to add vertices, double-click or press Enter to close, Esc to cancel.`,
+        `Source selected at (${source.x.toFixed(1)}, ${source.y.toFixed(1)}). Choose region selection in the popup.`,
       );
     };
 
-    el.addEventListener("pointerdown", onPointerDown, true);
+    el.addEventListener("dblclick", onDoubleClick, true);
     return () => {
-      el.removeEventListener("pointerdown", onPointerDown, true);
+      el.removeEventListener("dblclick", onDoubleClick, true);
     };
   }, [sourceSelectMode, detectedSources, canEdit, isRoutingPipes, selectedFloorId]);
 
@@ -3847,6 +3844,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       await loadPipesData(selectedFloorId || null);
       setShowPipes(true);
       setChosenSource(source);
+      setShowSourceRegionChoice(false);
+      setPendingSourceChoice(null);
       setSourceSelectMode(false);
       setDetectedSources([]);
       setRegionSelectMode(false);
@@ -3873,6 +3872,43 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     await routePipesFromSource(chosenSource, regionPolygon);
   }
 
+  async function handleSourceRegionChoice(selectRegion: boolean) {
+    const source = pendingSourceChoice || chosenSource;
+    if (!source) {
+      setShowSourceRegionChoice(false);
+      setPipeMsg("Select a source first.");
+      return;
+    }
+
+    if (selectRegion) {
+      setShowSourceRegionChoice(false);
+      setPendingSourceChoice(null);
+      setSourceSelectMode(false);
+      setRegionSelectMode(true);
+      setRegionPolygon([]);
+      setRegionPreview(null);
+      setRegionClosed(false);
+      setPipeMsg(
+        `Source selected at (${source.x.toFixed(1)}, ${source.y.toFixed(1)}). ` +
+        `Now draw a polygon region: click to add vertices, double-click or press Enter to close, Esc to cancel.`,
+      );
+      return;
+    }
+
+    setShowSourceRegionChoice(false);
+    setPendingSourceChoice(null);
+    setSourceSelectMode(false);
+    setRegionSelectMode(false);
+    setRegionPolygon([]);
+    setRegionPreview(null);
+    setRegionClosed(false);
+    setDetectedSources([]);
+    setPipeMsg(
+      `Source selected at (${source.x.toFixed(1)}, ${source.y.toFixed(1)}). Routing full floor plan...`,
+    );
+    await routePipesFromSource(source, null);
+  }
+
   async function clearCurrentPipes() {
     if (!canEdit) return;
     if (!hasPipeData) {
@@ -3897,6 +3933,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       }
 
       setPipesData({ pipes: [], sources: [] });
+      setShowSourceRegionChoice(false);
+      setPendingSourceChoice(null);
       setSourceSelectMode(false);
       setDetectedSources([]);
       setChosenSource(null);
@@ -3916,6 +3954,8 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
     if (!canEdit) return;
 
     if (sourceSelectMode || regionSelectMode) {
+      setShowSourceRegionChoice(false);
+      setPendingSourceChoice(null);
       setSourceSelectMode(false);
       setDetectedSources([]);
       setChosenSource(null);
@@ -3945,14 +3985,16 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
       if (sources.length === 1) {
         const only = sources[0];
         setChosenSource(only);
-        setPipeMsg("One source detected and selected. Click Route with Source.");
+        setPendingSourceChoice(only);
+        setShowSourceRegionChoice(true);
+        setPipeMsg("One source detected. Choose region selection in the popup.");
         return;
       }
 
       setPipeMsg(
         sources.length > 0
-          ? "Select a source on drawing, then click Route with Source."
-          : "No source detected. Click anywhere on drawing to pick a custom source.",
+          ? "Double-click a detected source on the drawing."
+          : "No source detected. Double-click anywhere on drawing to pick a custom source.",
       );
     } catch (e: any) {
       setPipeMsg(e?.message || "Failed to detect sources.");
@@ -5022,7 +5064,7 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
             {sourceSelectMode
               ? (chosenSource
                 ? `Pipe source selected at (${chosenSource.x.toFixed(1)}, ${chosenSource.y.toFixed(1)}). Click Route with Source.`
-                : "Pipe source mode: click detected source, or click anywhere to place custom source.")
+                : "Pipe source mode: drag/pan as needed, then double-click a detected source (or double-click anywhere for custom source).")
               : tool === "add"
               ? `Add mode: click to place ${addType.replace("_", " ")}.`
               : tool === "erase"
@@ -5139,6 +5181,92 @@ export default function DxfViewerPage({ params }: { params: Promise<{ projectId:
             </div>
           );
         })()}
+
+        {showSourceRegionChoice ? (
+          <div
+            data-ui-overlay="source-region-choice-backdrop"
+            onPointerDown={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              position: "absolute",
+              inset: 0,
+              zIndex: 30,
+              background: "rgba(15, 23, 42, 0.45)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: 16,
+            }}
+          >
+            <div
+              data-ui-overlay="source-region-choice-modal"
+              style={{
+                width: "min(460px, 94vw)",
+                background: "#ffffff",
+                border: "1px solid #E8EAED",
+                borderRadius: 10,
+                boxShadow: "0 10px 26px rgba(0,0,0,0.25)",
+                padding: 16,
+                color: "#111827",
+              }}
+            >
+              <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 8 }}>Source Selected</div>
+              <div style={{ fontSize: 13, color: "#374151", lineHeight: 1.45, marginBottom: 14 }}>
+                Do you want to select a region for this source?
+              </div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
+                <button
+                  onClick={() => {
+                    setShowSourceRegionChoice(false);
+                    setPendingSourceChoice(null);
+                    setChosenSource(null);
+                    setPipeMsg("Source selection cancelled.");
+                  }}
+                  disabled={isRoutingPipes}
+                  style={{
+                    ...btnStyle,
+                    background: "#F3F4F6",
+                    borderColor: "#D1D5DB",
+                    color: "#111827",
+                    opacity: isRoutingPipes ? 0.6 : 1,
+                    cursor: isRoutingPipes ? "not-allowed" : "pointer",
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => handleSourceRegionChoice(false)}
+                  disabled={isRoutingPipes}
+                  style={{
+                    ...btnStyle,
+                    background: "#B42318",
+                    borderColor: "#7A1810",
+                    color: "#fff",
+                    opacity: isRoutingPipes ? 0.6 : 1,
+                    cursor: isRoutingPipes ? "not-allowed" : "pointer",
+                  }}
+                >
+                  No, Route Full Floor
+                </button>
+                <button
+                  onClick={() => handleSourceRegionChoice(true)}
+                  disabled={isRoutingPipes}
+                  style={{
+                    ...btnStyle,
+                    background: "#2D6A4F",
+                    borderColor: "#1F4A37",
+                    color: "#fff",
+                    opacity: isRoutingPipes ? 0.6 : 1,
+                    cursor: isRoutingPipes ? "not-allowed" : "pointer",
+                  }}
+                >
+                  Yes, Select Region
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
 
         {pipeMsg ? (
           <div
