@@ -1264,14 +1264,12 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
                                world_to_m=opts.world_to_m, world_bbox=world_bbox)
 
         # Write sprinkler pipes into the DXF if they exist.
-        # Important: do not mix project-level and per-floor-plan pipe files,
-        # otherwise stale/global segments can appear offset in exports.
+        # Export always uses project-level routing data for consistency.
         from app.pipeline.sprinkler_routing import write_sprinklers_to_dxf
         all_pipe_segments = []
         all_pipe_sources = []
 
-        # Deduplicate by normalized coordinates + diameter to avoid
-        # overlapping duplicate labels when both aggregate and per-block files exist.
+        # Deduplicate by normalized coordinates + diameter.
         seg_seen = set()
         src_seen = set()
 
@@ -1298,27 +1296,40 @@ def save_project_layout(project_id: str, user=Depends(get_current_user)):
             src_seen.add(s)
             all_pipe_sources.append(s)
 
-        if fp_rows:
-            # Per-floor-plan pipes are authoritative once floor blocks exist.
-            for fp_row in fp_rows:
-                fp_pipes_path = os.path.join(project_dir(project_id), f"sprinkler_pipes_{fp_row['block_index']}.json")
-                if os.path.exists(fp_pipes_path):
+        pipes_json_path = os.path.join(project_dir(project_id), "sprinkler_pipes.json")
+        pipes_data = {"pipes": [], "sources": []}
+
+        # Backfill legacy projects that only have per-floor-plan pipe files.
+        # Export still reads from project-level data after this migration step.
+        if not os.path.exists(pipes_json_path):
+            merged_pipes = []
+            merged_sources = []
+            pdir = project_dir(project_id)
+            for name in sorted(os.listdir(pdir)):
+                if not (name.startswith("sprinkler_pipes_") and name.endswith(".json")):
+                    continue
+                fp_pipes_path = os.path.join(pdir, name)
+                try:
                     with open(fp_pipes_path, "r", encoding="utf-8") as pf:
-                        fp_pipes = json.load(pf)
-                    for p in fp_pipes.get("pipes", []):
-                        _add_segment(p["from"], p["to"], p.get("diameter", "32mm"))
-                    for s in fp_pipes.get("sources", []):
-                        _add_source((s["x"], s["y"]))
-        else:
-            # Single-plan mode: use project-level pipes.
-            pipes_json_path = os.path.join(project_dir(project_id), "sprinkler_pipes.json")
-            if os.path.exists(pipes_json_path):
-                with open(pipes_json_path, "r", encoding="utf-8") as pf:
-                    pipes_data = json.load(pf)
-                for p in pipes_data.get("pipes", []):
-                    _add_segment(p["from"], p["to"], p.get("diameter", "32mm"))
-                for s in pipes_data.get("sources", []):
-                    _add_source((s["x"], s["y"]))
+                        fp_data = json.load(pf) or {}
+                except (OSError, ValueError):
+                    continue
+                if isinstance(fp_data.get("pipes"), list):
+                    merged_pipes.extend(fp_data["pipes"])
+                if isinstance(fp_data.get("sources"), list):
+                    merged_sources.extend(fp_data["sources"])
+
+            if merged_pipes or merged_sources:
+                pipes_data = _merge_pipes_file(pipes_json_path, merged_pipes, merged_sources)
+
+        if os.path.exists(pipes_json_path):
+            with open(pipes_json_path, "r", encoding="utf-8") as pf:
+                pipes_data = json.load(pf) or {"pipes": [], "sources": []}
+
+        for p in pipes_data.get("pipes", []):
+            _add_segment(p["from"], p["to"], p.get("diameter", "32mm"))
+        for s in pipes_data.get("sources", []):
+            _add_source((s["x"], s["y"]))
 
         sprinkler_dets = [(float(d["x"]), float(d["y"])) for d in dets_export if d["dtype"] == "sprinkler"]
         if sprinkler_dets or all_pipe_segments:
@@ -2021,5 +2032,9 @@ def route_pipes_floor_plan(project_id: str, fp_id: str, payload: dict = None, us
     new_sources = [{"x": s[0], "y": s[1]} for s in sources]
     pipes_json_path = os.path.join(pdir, f"sprinkler_pipes_{fp['block_index']}.json")
     pipes_data = _merge_pipes_file(pipes_json_path, new_pipes, new_sources)
+
+    # Keep project-level routing data in sync; DXF/DWG export reads this file.
+    project_pipes_json_path = os.path.join(pdir, "sprinkler_pipes.json")
+    _merge_pipes_file(project_pipes_json_path, new_pipes, new_sources)
 
     return pipes_data
